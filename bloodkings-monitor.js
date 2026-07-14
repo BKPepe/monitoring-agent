@@ -39,8 +39,8 @@ export default {
 };
 
 async function runMonitoring(env) {
-  const apiUrl = env.NODE_API_URL;
-  const apiKey = env.NODE_API_KEY;
+  const apiUrl = env.API_URL;
+  const apiKey = env.API_KEY;
 
   if (!apiUrl || !apiKey) {
     return { error: 'Chybi NODE_API_URL nebo NODE_API_KEY.' };

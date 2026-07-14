@@ -10,6 +10,8 @@ compatibility_date = "2024-01-01"
 [triggers]
 crons = ["*/5 * * * *"]
 
-# Secrets (set via wrangler CLI or Cloudflare Dashboard, never in this file):
-#   wrangler secret put NODE_API_URL
-#   wrangler secret put NODE_API_KEY
+# Secrets are managed via GitHub Actions (see .github/workflows/deploy-worker.yml)
+# and synced to Cloudflare automatically on every push to main.
+# Manual setup (one-time only if not using GH Actions deploy):
+#   wrangler secret put API_URL
+#   wrangler secret put API_KEY

@@ -1,0 +1,40 @@
+# Cloudflare Worker Deploy
+#
+# Automatically deploys the Worker and syncs secrets from GitHub to Cloudflare
+# on every push to main. No manual wrangler commands needed.
+#
+# Required repository secrets:
+#   API_URL                - Node API endpoint
+#   API_KEY                - API authentication key
+#   CLOUDFLARE_API_TOKEN   - CF API token (Workers Scripts:Edit permission)
+#   CLOUDFLARE_ACCOUNT_ID  - Your Cloudflare account ID
+
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy Worker & sync secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          API_URL: ${{ secrets.API_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          npx wrangler@latest deploy
+
+          # Sync secrets: GitHub secrets → Cloudflare Worker secrets
+          echo "$API_URL" | npx wrangler@latest secret put API_URL
+          echo "$API_KEY" | npx wrangler@latest secret put API_KEY
