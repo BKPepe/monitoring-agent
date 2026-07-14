@@ -14,27 +14,80 @@
 const CHECK_TIMEOUT_MS = 8000;
 const SUPPORTED_TYPES = ['web'];
 
-/**
- * Build a human-readable location string from Cloudflare's request metadata.
- * Uses ASN, city, country from the CF object on incoming requests.
- * Falls back to 'Cloudflare Edge' for scheduled (cron) invocations.
- */
-function buildLocation(request) {
-  if (!request || !request.cf) return '🌐 Cloudflare Edge';
-  const cf = request.cf;
-  const flag = countryFlag(cf.country);
-  const city = cf.city || '';
-  const country = cf.country || '';
-  const asn = cf.asn ? `AS${cf.asn}` : '';
-  const org = cf.asOrganization ? cf.asOrganization.split(' ').slice(0, 3).join(' ') : '';
-  const asnStr = asn && org ? `${asn} ${org}` : asn || org;
-  const geo = [city, country].filter(Boolean).join(', ');
-  return `${flag} ${geo}${asnStr ? ` (${asnStr})` : ''}`.trim() || '🌐 Cloudflare Edge';
-}
+// IATA data center code → city name mapping (Cloudflare major PoPs)
+const COLO_CITY = {
+  AMS:'Amsterdam',ARN:'Stockholm',ATL:'Atlanta',BCN:'Barcelona',BEG:'Belgrade',
+  BER:'Berlin',BKK:'Bangkok',BOM:'Mumbai',BRU:'Brussels',BUH:'Bucharest',
+  CDG:'Paris',CWB:'Curitiba',DEL:'New Delhi',DFW:'Dallas',DUB:'Dublin',
+  DUS:'Düsseldorf',EWR:'Newark',EZE:'Buenos Aires',FCO:'Rome',FRA:'Frankfurt',
+  GIG:'Rio de Janeiro',GRU:'São Paulo',HAM:'Hamburg',HKG:'Hong Kong',
+  IAD:'Washington DC',IAH:'Houston',ICN:'Seoul',IST:'Istanbul',JNB:'Johannesburg',
+  KHI:'Karachi',KIX:'Osaka',LAX:'Los Angeles',LHR:'London',LIM:'Lima',
+  LIS:'Lisbon',MAA:'Chennai',MAD:'Madrid',MAN:'Manchester',MEL:'Melbourne',
+  MEX:'Mexico City',MIA:'Miami',MNL:'Manila',MRS:'Marseille',MUC:'Munich',
+  NRT:'Tokyo',ORD:'Chicago',OSL:'Oslo',OTP:'Bucharest',PHX:'Phoenix',
+  PNQ:'Pune',PRG:'Prague',QRO:'Queretaro',RUH:'Riyadh',SCL:'Santiago',
+  SEA:'Seattle',SFO:'San Francisco',SIN:'Singapore',SJC:'San Jose',
+  SOF:'Sofia',SYD:'Sydney',TLV:'Tel Aviv',TPE:'Taipei',VIE:'Vienna',
+  WAW:'Warsaw',YUL:'Montreal',YVR:'Vancouver',YYZ:'Toronto',ZRH:'Zürich',
+};
 
 function countryFlag(code) {
   if (!code || code.length !== 2) return '🌐';
   return String.fromCodePoint(...[...code.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
+}
+
+/**
+ * Detect location from Cloudflare's own trace endpoint.
+ * Returns e.g. "🇩🇪 Frankfurt, DE (AS13335 Cloudflare, Inc)"
+ */
+async function detectLocation() {
+  try {
+    // Cloudflare trace gives us the PoP (colo) and country of THIS worker invocation
+    const traceResp = await fetch('https://cloudflare.com/cdn-cgi/trace', {
+      signal: AbortSignal.timeout(4000)
+    });
+    const traceText = await traceResp.text();
+    const kv = Object.fromEntries(
+      traceText.trim().split('\n').map(l => l.split('='))
+    );
+    const colo    = kv['colo'] || '';
+    const country = kv['loc']  || '';
+    const city    = COLO_CITY[colo] || colo;
+    const flag    = countryFlag(country);
+
+    // Also try ipinfo for ASN (best-effort)
+    let asnStr = 'Cloudflare';
+    try {
+      const ipResp = await fetch('https://ipinfo.io/json', {
+        headers: { 'User-Agent': 'MonitorAgent/1.0' },
+        signal: AbortSignal.timeout(3000)
+      });
+      const ipData = await ipResp.json();
+      const org = ipData.org || '';   // e.g. "AS13335 Cloudflare, Inc"
+      if (org) asnStr = org.replace(/^AS\d+\s*/, '').split(',')[0].trim() || asnStr;
+      const asn = org.match(/^AS(\d+)/)?.[1];
+      if (asn) asnStr = `AS${asn} ${asnStr}`;
+    } catch (_) {}
+
+    const geo = [city, country].filter(Boolean).join(', ');
+    return `${flag} ${geo} (${asnStr})`.trim();
+  } catch (e) {
+    return '🌐 Cloudflare Edge';
+  }
+}
+
+/**
+ * Build location from incoming request's cf object (for /run HTTP handler).
+ */
+function locationFromRequest(request) {
+  if (!request?.cf) return null;
+  const { asn, asOrganization, country, city } = request.cf;
+  const flag    = countryFlag(country);
+  const geo     = [city, country].filter(Boolean).join(', ');
+  const orgName = asOrganization ? asOrganization.split(' ').slice(0, 3).join(' ') : '';
+  const asnStr  = asn ? `AS${asn}${orgName ? ' ' + orgName : ''}` : orgName;
+  return `${flag} ${geo}${asnStr ? ' (' + asnStr + ')' : ''}`.trim() || null;
 }
 
 export default {
@@ -42,8 +95,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/run') {
-      const location = buildLocation(request);
-      const result = await runMonitoring(env, location);
+      const location = locationFromRequest(request) || await detectLocation();
+      const result   = await runMonitoring(env, location);
       return new Response(JSON.stringify(result, null, 2), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -54,10 +107,12 @@ export default {
     }), { headers: { 'Content-Type': 'application/json' } });
   },
 
-  // Scheduled cron handler
+  // Scheduled cron handler – no request object, detect location via CF trace
   async scheduled(event, env, ctx) {
-    // No request object available on cron – location will be generic
-    ctx.waitUntil(runMonitoring(env, '🌐 Cloudflare Edge'));
+    ctx.waitUntil((async () => {
+      const location = await detectLocation();
+      await runMonitoring(env, location);
+    })());
   }
 };
 
@@ -83,7 +138,6 @@ async function runMonitoring(env, location) {
   }
 
   const supported = monitors.filter(m => SUPPORTED_TYPES.includes(m.type));
-
   if (supported.length === 0) {
     return { status: 'ok', message: 'No HTTP monitors to check.', total: monitors.length };
   }
@@ -104,7 +158,7 @@ async function runMonitoring(env, location) {
       status: 'ok',
       location,
       checked: results.length,
-      skipped: monitors.length - results.length,
+      skipped: monitors.length - supported.length,
       server_response: data
     };
   } catch (e) {
@@ -127,10 +181,9 @@ async function checkMonitor(monitor) {
     });
     clearTimeout(timer);
     const rt = Date.now() - startMs;
-    if (resp.status >= 200 && resp.status < 400) {
-      return { id: monitor.id, status: 'up', response_time: rt, error: null };
-    }
-    return { id: monitor.id, status: 'down', response_time: rt, error: `HTTP ${resp.status}` };
+    return resp.status >= 200 && resp.status < 400
+      ? { id: monitor.id, status: 'up',   response_time: rt, error: null }
+      : { id: monitor.id, status: 'down', response_time: rt, error: `HTTP ${resp.status}` };
   } catch (e) {
     return {
       id: monitor.id,
