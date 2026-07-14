@@ -1,0 +1,101 @@
+# Generic HTTP Monitoring Agent
+#
+# Fetches a list of monitors from a compatible node API endpoint,
+# performs HTTP availability checks, and posts results back.
+#
+# Required repository secrets:
+#   API_URL  - Base URL of the node API (e.g. https://example.com/node_api.php)
+#   API_KEY  - Authentication key for the API
+
+name: Monitor Agent
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: HTTP Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Run HTTP checks
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          python3 << 'PYTHON'
+          import os, sys, json, time, urllib.request, urllib.error
+
+          API_URL = os.environ.get('API_URL', '')
+          API_KEY = os.environ.get('API_KEY', '')
+          LOCATION = 'GitHub Actions (EU West)'
+          TIMEOUT  = 8
+
+          if not API_URL or not API_KEY:
+              print("ERROR: Missing API_URL or API_KEY secrets.")
+              sys.exit(1)
+
+          # Fetch monitor list
+          try:
+              req = urllib.request.Request(f"{API_URL}?action=get_monitors&key={API_KEY}")
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  monitors = json.loads(r.read().decode()).get('monitors', [])
+          except Exception as e:
+              print(f"ERROR: Could not fetch monitors: {e}")
+              sys.exit(1)
+
+          print(f"Fetched {len(monitors)} monitors")
+
+          # Run HTTP checks (web type only)
+          results = []
+          for m in monitors:
+              if m.get('type') != 'web':
+                  continue
+              url = m['target']
+              if not url.startswith(('http://', 'https://')):
+                  url = 'https://' + url
+              start = time.time()
+              try:
+                  req = urllib.request.Request(url, headers={
+                      'User-Agent': 'MonitorAgent/1.0 (GitHub-Actions)'
+                  })
+                  with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                      code = r.getcode()
+                      rt   = int((time.time() - start) * 1000)
+                      ok   = 200 <= code < 400
+                      results.append({
+                          'id': m['id'], 'status': 'up' if ok else 'down',
+                          'response_time': rt, 'error': None if ok else f'HTTP {code}'
+                      })
+                      print(f"  {'OK' if ok else 'DOWN'} {m['name']} ({rt}ms)")
+              except urllib.error.HTTPError as e:
+                  rt = int((time.time() - start) * 1000)
+                  results.append({'id': m['id'], 'status': 'down', 'response_time': rt, 'error': f'HTTP {e.code}'})
+                  print(f"  DOWN {m['name']}: HTTP {e.code} ({rt}ms)")
+              except Exception as e:
+                  rt = int((time.time() - start) * 1000)
+                  results.append({'id': m['id'], 'status': 'down', 'response_time': rt, 'error': str(e)[:80]})
+                  print(f"  DOWN {m['name']}: {e} ({rt}ms)")
+
+          if not results:
+              print("No web monitors to check. Done.")
+              sys.exit(0)
+
+          # Post results
+          payload = json.dumps({'location': LOCATION, 'results': results}).encode()
+          try:
+              req = urllib.request.Request(
+                  f"{API_URL}?action=post_results&key={API_KEY}",
+                  data=payload,
+                  headers={'Content-Type': 'application/json'}
+              )
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  resp = json.loads(r.read().decode())
+                  print(f"Posted: {resp.get('message', 'OK')}")
+          except Exception as e:
+              print(f"ERROR: Failed to post results: {e}")
+              sys.exit(1)
+          PYTHON
