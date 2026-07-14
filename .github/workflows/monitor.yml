@@ -31,20 +31,38 @@ jobs:
 
           API_URL = os.environ.get('API_URL', '')
           API_KEY = os.environ.get('API_KEY', '')
-          LOCATION = 'GitHub Actions (EU West)'
           TIMEOUT  = 8
 
           if not API_URL or not API_KEY:
               print("ERROR: Missing API_URL or API_KEY secrets.")
               sys.exit(1)
 
+          # Detect runner location via ASN lookup (ipinfo.io - free, no key needed)
+          LOCATION = 'GitHub Actions'
+          try:
+              with urllib.request.urlopen('https://ipinfo.io/json', timeout=5) as r:
+                  geo = json.loads(r.read().decode())
+                  city    = geo.get('city', '')
+                  country = geo.get('country', '')
+                  org     = geo.get('org', '')   # e.g. "AS36459 GitHub"
+                  asn_raw = org.split(' ')[0] if org else ''
+                  org_name = ' '.join(org.split(' ')[1:4]) if org else ''
+                  # Build country flag from 2-letter code
+                  flag = ''.join(chr(0x1F1E6 + ord(c) - 65) for c in country) if len(country) == 2 else '🌐'
+                  geo_str = ', '.join(filter(None, [city, country]))
+                  asn_str = f'{asn_raw} {org_name}'.strip() if asn_raw else ''
+                  LOCATION = f'{flag} {geo_str} ({asn_str})'.strip() if geo_str else 'GitHub Actions'
+                  print(f'Runner location: {LOCATION}')
+          except Exception as e:
+              print(f'Location detection failed ({e}), using default.')
+
           def api_request(url, data=None):
               """Make an API request; on HTTP error print diagnosis without exposing URLs."""
               req = urllib.request.Request(
                   url,
                   data=data,
-                  headers={'Content-Type': 'application/json', 'User-Agent': 'MonitorAgent/1.0'}
-                  if data else {'User-Agent': 'MonitorAgent/1.0'}
+                  headers={'Content-Type': 'application/json', 'User-Agent': 'MonitorAgent/1.0'} if data
+                  else {'User-Agent': 'MonitorAgent/1.0'}
               )
               try:
                   with urllib.request.urlopen(req, timeout=15) as r:
@@ -56,7 +74,6 @@ jobs:
                   except Exception:
                       pass
                   print(f"ERROR: HTTP {e.code} from API.")
-                  # Only show body if it looks like JSON (from our PHP, not raw HTML)
                   if body.strip().startswith('{'):
                       print(f"  API response: {body[:200]}")
                   if e.code == 403:
