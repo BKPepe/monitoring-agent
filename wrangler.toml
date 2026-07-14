@@ -1,0 +1,15 @@
+# Cloudflare Worker - HTTP Monitoring Agent
+# Deploy: wrangler deploy (from this directory)
+# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "bloodkings-monitor"
+main = "bloodkings-monitor.js"
+compatibility_date = "2024-01-01"
+
+# Cron trigger: every 5 minutes
+[triggers]
+crons = ["*/5 * * * *"]
+
+# Secrets (set via wrangler CLI or Cloudflare Dashboard, never in this file):
+#   wrangler secret put NODE_API_URL
+#   wrangler secret put NODE_API_KEY
