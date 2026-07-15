@@ -2,8 +2,8 @@
 # Deploy: wrangler deploy (from this directory)
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
 
-name = "bloodkings-monitor"
-main = "bloodkings-monitor.js"
+name = "cloudflare-monitor-agent"
+main = "cloudflare-agent.js"
 compatibility_date = "2024-01-01"
 
 # Cron trigger: every 5 minutes

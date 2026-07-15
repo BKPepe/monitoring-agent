@@ -1,18 +1,17 @@
 /**
- * HTTP Monitoring Agent - Cloudflare Worker
+ * HTTP / cPanel Monitoring Agent - Cloudflare Worker
  *
  * 1. Fetches monitor list from node_api.php?action=get_monitors
- * 2. Performs HTTP availability checks
+ * 2. Performs HTTP availability checks (including cPanel resource usage)
  * 3. Posts results back to node_api.php?action=post_results
  *
- * Supports only HTTP/HTTPS monitors (type=web).
- * TCP ports, game servers etc. require a VPS-based agent.
+ * Supports HTTP/HTTPS websites (type=web) and cPanel resource monitors (type=cpanel).
  *
  * Deploy: wrangler deploy (from this directory)
  */
 
 const CHECK_TIMEOUT_MS = 8000;
-const SUPPORTED_TYPES = ['web'];
+const SUPPORTED_TYPES = ['web', 'cpanel'];
 
 // IATA data center code → city name mapping (Cloudflare major PoPs)
 const COLO_CITY = {
@@ -39,7 +38,7 @@ function countryFlag(code) {
 
 /**
  * Detect location from Cloudflare's own trace endpoint.
- * Returns e.g. "🇩🇪 Frankfurt, DE (AS13335 Cloudflare, Inc)"
+ * Returns e.g. "🇩🇪 Frankfurt, DE (AS13335 Cloudflare)"
  */
 async function detectLocation() {
   try {
@@ -56,24 +55,10 @@ async function detectLocation() {
     const city    = COLO_CITY[colo] || colo;
     const flag    = countryFlag(country);
 
-    // Also try ipinfo for ASN (best-effort)
-    let asnStr = 'Cloudflare';
-    try {
-      const ipResp = await fetch('https://ipinfo.io/json', {
-        headers: { 'User-Agent': 'MonitorAgent/1.0' },
-        signal: AbortSignal.timeout(3000)
-      });
-      const ipData = await ipResp.json();
-      const org = ipData.org || '';   // e.g. "AS13335 Cloudflare, Inc"
-      if (org) asnStr = org.replace(/^AS\d+\s*/, '').split(',')[0].trim() || asnStr;
-      const asn = org.match(/^AS(\d+)/)?.[1];
-      if (asn) asnStr = `AS${asn} ${asnStr}`;
-    } catch (_) {}
-
     const geo = [city, country].filter(Boolean).join(', ');
-    return `${flag} ${geo} (${asnStr})`.trim();
+    return `${flag} ${geo} (AS13335 Cloudflare)`.trim();
   } catch (e) {
-    return '🌐 Cloudflare Edge';
+    return '🌐 Cloudflare Edge (AS13335 Cloudflare)';
   }
 }
 
@@ -177,13 +162,41 @@ async function checkMonitor(monitor) {
     const resp = await fetch(url, {
       redirect: 'follow',
       signal: controller.signal,
-      headers: { 'User-Agent': 'MonitorAgent/1.0 (Cloudflare-Worker)' }
+      headers: { 'User-Agent': 'MonitorAgent/1.0 (Cloudflare-Worker-Agent)' }
     });
     clearTimeout(timer);
     const rt = Date.now() - startMs;
-    return resp.status >= 200 && resp.status < 400
-      ? { id: monitor.id, status: 'up',   response_time: rt, error: null }
-      : { id: monitor.id, status: 'down', response_time: rt, error: `HTTP ${resp.status}` };
+    
+    if (resp.status >= 200 && resp.status < 400) {
+      if (monitor.type === 'cpanel') {
+        try {
+          const bodyData = await resp.json();
+          if (bodyData && bodyData.status === 'ok') {
+            return {
+              id: monitor.id,
+              status: 'up',
+              response_time: rt,
+              error: null,
+              details: {
+                disk: bodyData.disk,
+                memory: bodyData.memory,
+                processes: bodyData.processes,
+                database: bodyData.database,
+                bandwidth: bodyData.bandwidth,
+                postgresql: bodyData.postgresql
+              }
+            };
+          } else {
+            return { id: monitor.id, status: 'down', response_time: rt, error: 'Chyba v cPanel JSON: ' + (bodyData ? bodyData.message : 'Neznámá chyba') };
+          }
+        } catch (jsonErr) {
+          return { id: monitor.id, status: 'down', response_time: rt, error: 'Chyba parsování JSON statistik: ' + jsonErr.message };
+        }
+      }
+      return { id: monitor.id, status: 'up', response_time: rt, error: null };
+    } else {
+      return { id: monitor.id, status: 'down', response_time: rt, error: `HTTP ${resp.status}` };
+    }
   } catch (e) {
     return {
       id: monitor.id,
