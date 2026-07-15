@@ -2,7 +2,7 @@
 # Deploy: wrangler deploy (from this directory)
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
 
-name = "cloudflare-monitor-agent"
+name = "bloodkings-monitor"
 main = "cloudflare-agent.js"
 compatibility_date = "2024-01-01"
 
