@@ -1,0 +1,40 @@
+# Blood Kings Status Monitoring - Docker Agent
+#
+# Nasazení Python agenta jako kontejneru, který hlásí metriky HOSTITELE
+# (ne kontejneru). Toho je dosaženo takto:
+#   - pid: host            -> /proc v kontejneru patří hostiteli (CPU, RAM, procesy)
+#   - network_mode: host   -> /proc/net/tcp ukazuje naslouchající porty hostitele
+#   - /:/host:ro           -> zaplnění disku a /etc/os-release se čte z /host
+#
+# Použití:
+#   1. Zkopírujte tento soubor a agent.py na server do jedné složky.
+#   2. Vyplňte STATUS_API_URL a STATUS_AGENT_KEY níže (klíč najdete v administraci).
+#   3. Spusťte: docker compose -f docker-compose.agent.yml up -d
+#
+# Poznámka: automatické aktualizace agenta jsou v Docker režimu vypnuté -
+# skript je do kontejneru připojen read-only. Aktualizaci provedete stažením
+# nové verze agent.py ze serveru a restartem kontejneru.
+
+services:
+  bloodkings-agent:
+    image: python:3-alpine
+    container_name: bloodkings-agent
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    environment:
+      STATUS_API_URL: "https://status.example.com/status/agent_api.php"
+      STATUS_AGENT_KEY: "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE"
+      DOCKER_MODE: "1"
+      # Interval hlášení v sekundách (výchozí 300 = 5 minut)
+      AGENT_INTERVAL: "300"
+    volumes:
+      - /:/host:ro
+      - ./agent.py:/opt/agent/agent.py:ro
+    working_dir: /opt/agent
+    # Smyčka nahrazuje cron: agent se spouští opakovaně v zadaném intervalu
+    command: >
+      sh -c "while true; do
+        python3 /opt/agent/agent.py;
+        sleep $${AGENT_INTERVAL:-300};
+      done"
