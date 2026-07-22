@@ -41,8 +41,36 @@ if [ -f "$ScriptPath/agent.cfg" ]; then
     done < "$ScriptPath/agent.cfg"
 fi
 
-AGENT_VERSION="1.3.0"
+# Zpracování příkazu pro automatickou registraci: ./agent.sh --register REGISTRATION_TOKEN [API_URL]
+if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
+    REG_TOKEN="$2"
+    if [ -z "$REG_TOKEN" ]; then
+        echo "Použití: $0 --register REGISTRATION_TOKEN [API_URL]"
+        exit 1
+    fi
+    if [ -n "$3" ]; then
+        API_URL="$3"
+    fi
+    HOSTNAME_VAL=$(hostname 2>/dev/null || echo "Linux-Server")
+    echo "Registruji nového agenta na $API_URL..."
+    RESP=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"register\", \"token\":\"$REG_TOKEN\", \"hostname\":\"$HOSTNAME_VAL\", \"agent_type\":\"bash\"}" "$API_URL")
+    NEW_KEY=$(echo "$RESP" | sed -n 's/.*"agent_key":"\([^"]*\)".*/\1/p')
+    if [ -n "$NEW_KEY" ]; then
+        echo "API_URL=\"$API_URL\"" > "$ScriptPath/agent.cfg"
+        echo "AGENT_KEY=\"$NEW_KEY\"" >> "$ScriptPath/agent.cfg"
+        echo "OK: Agent byl úspěšně zaregistrován a nastavení bylo uloženo do $ScriptPath/agent.cfg (AGENT_KEY=$NEW_KEY)"
+        exit 0
+    else
+        echo "CHYBA při registraci: $RESP"
+        exit 1
+    fi
+fi
+
+AGENT_VERSION="1.7.0"
 LOG_FILE="$ScriptPath/agent.log"
+NET_STATE_FILE="$ScriptPath/agent_net.state"
+DISKIO_STATE_FILE="$ScriptPath/agent_diskio.state"
+FORKRATE_STATE_FILE="$ScriptPath/agent_forkrate.state"
 
 log_message() {
     local msg="$1"
@@ -73,26 +101,38 @@ stat1=$(read_cpu_stat)
 sleep 1
 stat2=$(read_cpu_stat)
 
-cpu=$(awk -v s1="$stat1" -v s2="$stat2" '
+cpu_steal_out=$(awk -v s1="$stat1" -v s2="$stat2" '
 BEGIN {
     split(s1, a1);
     split(s2, a2);
-    
+
+    iowait1 = a1[6] + 0;
     idle1 = a1[5] + a1[6];
     total1 = a1[2]+a1[3]+a1[4]+a1[5]+a1[6]+a1[7]+a1[8];
-    
+    steal1 = a1[9] + 0;
+
+    iowait2 = a2[6] + 0;
     idle2 = a2[5] + a2[6];
     total2 = a2[2]+a2[3]+a2[4]+a2[5]+a2[6]+a2[7]+a2[8];
-    
+    steal2 = a2[9] + 0;
+
     idle_delta = idle2 - idle1;
     total_delta = total2 - total1;
-    
+    steal_delta = steal2 - steal1;
+    iowait_delta = iowait2 - iowait1;
+
     if (total_delta == 0) {
-        print 0.0;
+        print "0.0 0.0 0.0";
     } else {
-        printf "%.1f", (1.0 - idle_delta / total_delta) * 100;
+        cpu_pct = (1.0 - idle_delta / total_delta) * 100;
+        steal_pct = (steal_delta / total_delta) * 100;
+        iowait_pct = (iowait_delta / total_delta) * 100;
+        printf "%.1f %.1f %.1f", cpu_pct, steal_pct, iowait_pct;
     }
 }')
+cpu=$(echo "$cpu_steal_out" | awk '{print $1}')
+cpu_steal=$(echo "$cpu_steal_out" | awk '{print $2}')
+iowait=$(echo "$cpu_steal_out" | awk '{print $3}')
 
 # 2. RAM Usage (%)
 ram=$(awk '
@@ -113,11 +153,188 @@ END {
     }
 }' /proc/meminfo)
 
+# 2.5 Swap Usage (%)
+swap=$(awk '
+/^SwapTotal:/ { total=$2 }
+/^SwapFree:/ { free=$2 }
+END {
+    if (!total || total == 0) {
+        print 0.0;
+    } else {
+        printf "%.1f", ((total - free) / total) * 100;
+    }
+}' /proc/meminfo)
+
+# 2.6 Load average (1/5/15 min)
+load_out="null null null"
+if [ -f /proc/loadavg ]; then
+    load_out=$(awk '{print $1" "$2" "$3}' /proc/loadavg)
+fi
+load1=$(echo "$load_out" | awk '{print $1}')
+load5=$(echo "$load_out" | awk '{print $2}')
+load15=$(echo "$load_out" | awk '{print $3}')
+
 # 3. HDD Usage (%)
 hdd=$(df -P / | tail -n 1 | awk '{print $5}' | tr -d '%')
 if [ -z "$hdd" ]; then
     hdd=0.0
 fi
+
+# 3.05 Inode Usage (%) - stejný df, jen s -i (inode počty místo bloků)
+inode_usage=$(df -iP / 2>/dev/null | tail -n 1 | awk '{print $5}' | tr -d '%')
+inode_usage_json="null"
+if [ -n "$inode_usage" ]; then
+    inode_usage_json="$inode_usage"
+fi
+
+# 3.1 Disk I/O (KB/s čtení/zápis) - stejný tick/tock princip jako propustnost sítě níže.
+# /proc/diskstats je celojaderný čítač (ne per-pid-namespace), funguje i v Dockeru s pid: host.
+disk_sectors=$(awk '
+$3 ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme[0-9]+n[0-9]+)$/ {
+    read_total += $6;
+    write_total += $10;
+}
+END { printf "%.0f,%.0f", read_total+0, write_total+0 }
+' /proc/diskstats 2>/dev/null)
+if [ -z "$disk_sectors" ]; then
+    disk_sectors="0,0"
+fi
+disk_read_sectors=$(echo "$disk_sectors" | cut -d',' -f1)
+disk_write_sectors=$(echo "$disk_sectors" | cut -d',' -f2)
+
+disk_io_read=""
+disk_io_write=""
+now_ts_io=$(date +%s)
+if [ -f "$DISKIO_STATE_FILE" ]; then
+    prev_io_ts=$(cut -d',' -f1 "$DISKIO_STATE_FILE" 2>/dev/null)
+    prev_read=$(cut -d',' -f2 "$DISKIO_STATE_FILE" 2>/dev/null)
+    prev_write=$(cut -d',' -f3 "$DISKIO_STATE_FILE" 2>/dev/null)
+    if [ -n "$prev_io_ts" ] && [ -n "$prev_read" ] && [ -n "$prev_write" ]; then
+        elapsed_io=$((now_ts_io - prev_io_ts))
+        delta_read=$((disk_read_sectors - prev_read))
+        delta_write=$((disk_write_sectors - prev_write))
+        if [ "$elapsed_io" -gt 0 ] && [ "$delta_read" -ge 0 ] && [ "$delta_write" -ge 0 ]; then
+            disk_io_read=$(awk -v d="$delta_read" -v e="$elapsed_io" 'BEGIN { printf "%.1f", (d * 512 / e) / 1024 }')
+            disk_io_write=$(awk -v d="$delta_write" -v e="$elapsed_io" 'BEGIN { printf "%.1f", (d * 512 / e) / 1024 }')
+        fi
+    fi
+fi
+echo "$now_ts_io,$disk_read_sectors,$disk_write_sectors" > "$DISKIO_STATE_FILE" 2>/dev/null || true
+disk_io_read_json="null"
+[ -n "$disk_io_read" ] && disk_io_read_json="$disk_io_read"
+disk_io_write_json="null"
+[ -n "$disk_io_write" ] && disk_io_write_json="$disk_io_write"
+
+# 3.5 Propustnost sítě (KB/s, RX+TX) a síťové chyby/zahozené pakety - potřebuje 2 vzorky,
+# proto se mezi běhy ukládá kumulativní počet bajtů/chyb a čas; první běh vrací null.
+net_stats=$(awk '
+NR > 2 {
+    line = $0;
+    colon = index(line, ":");
+    if (colon == 0) next;
+    iface = substr(line, 1, colon - 1);
+    gsub(/^[ \t]+|[ \t]+$/, "", iface);
+    if (iface == "lo" || iface ~ /^veth/ || iface ~ /^docker/ || iface ~ /^br-/) next;
+    n = split(substr(line, colon + 1), f, " ");
+    total += (f[1] + 0) + (f[9] + 0);
+    errs += (f[3] + 0) + (f[4] + 0) + (f[11] + 0) + (f[12] + 0);
+}
+END { printf "%.0f,%.0f", total, errs }
+' /proc/net/dev 2>/dev/null)
+if [ -z "$net_stats" ]; then
+    net_stats="0,0"
+fi
+net_bytes=$(echo "$net_stats" | cut -d',' -f1)
+net_errs_total=$(echo "$net_stats" | cut -d',' -f2)
+
+net=""
+net_errors=""
+now_ts=$(date +%s)
+if [ -f "$NET_STATE_FILE" ]; then
+    prev_ts=$(cut -d',' -f1 "$NET_STATE_FILE" 2>/dev/null)
+    prev_bytes=$(cut -d',' -f2 "$NET_STATE_FILE" 2>/dev/null)
+    prev_errs=$(cut -d',' -f3 "$NET_STATE_FILE" 2>/dev/null)
+    if [ -n "$prev_ts" ] && [ -n "$prev_bytes" ] && [ "$net_bytes" -gt 0 ]; then
+        elapsed=$((now_ts - prev_ts))
+        delta=$((net_bytes - prev_bytes))
+        if [ "$elapsed" -gt 0 ] && [ "$delta" -ge 0 ]; then
+            net=$(awk -v d="$delta" -v e="$elapsed" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
+        fi
+        if [ -n "$prev_errs" ]; then
+            delta_errs=$((net_errs_total - prev_errs))
+            [ "$delta_errs" -ge 0 ] && net_errors="$delta_errs"
+        fi
+    fi
+fi
+echo "$now_ts,$net_bytes,$net_errs_total" > "$NET_STATE_FILE" 2>/dev/null || true
+
+net_json="null"
+if [ -n "$net" ]; then
+    net_json="$net"
+fi
+net_errors_json="null"
+if [ -n "$net_errors" ]; then
+    net_errors_json="$net_errors"
+fi
+
+# 3.6 Fork rate - nové procesy od posledního běhu (delta, ne rychlost za sekundu).
+# /proc/stat řádek "processes" je kumulativní čítač forků od bootu.
+total_forks=$(awk '/^processes / { print $2 }' /proc/stat 2>/dev/null)
+fork_rate_json="null"
+if [ -n "$total_forks" ]; then
+    if [ -f "$FORKRATE_STATE_FILE" ]; then
+        prev_forks=$(cat "$FORKRATE_STATE_FILE" 2>/dev/null)
+        if [ -n "$prev_forks" ]; then
+            delta_forks=$((total_forks - prev_forks))
+            [ "$delta_forks" -ge 0 ] && fork_rate_json="$delta_forks"
+        fi
+    fi
+    echo "$total_forks" > "$FORKRATE_STATE_FILE" 2>/dev/null || true
+fi
+
+# 3.7 Teplota (°C) - nejvyšší mezi dostupnými thermal zónami. Na většině VPS null,
+# tepelné senzory hostitele se přes virtualizaci obvykle nevystavují.
+temperature_json="null"
+if [ -d /sys/class/thermal ]; then
+    max_temp_millideg=$(for z in /sys/class/thermal/thermal_zone*/temp; do
+        [ -r "$z" ] && cat "$z" 2>/dev/null
+    done | awk '$1 > 0 && $1 < 150000 { if ($1 > max) max = $1 } END { if (max) print max }')
+    if [ -n "$max_temp_millideg" ]; then
+        temperature_json=$(awk -v m="$max_temp_millideg" 'BEGIN { printf "%.1f", m / 1000 }')
+    fi
+fi
+
+# 3.8 Systémová identita (hostname/kernel/timezone/reboot-required/virtualizace/cloud)
+sys_hostname=$(hostname 2>/dev/null || echo "")
+sys_kernel=$(uname -r 2>/dev/null || echo "")
+sys_timezone=""
+if [ -f /etc/timezone ]; then
+    sys_timezone=$(cat /etc/timezone 2>/dev/null)
+elif [ -L /etc/localtime ]; then
+    sys_timezone=$(readlink /etc/localtime 2>/dev/null | sed 's#.*zoneinfo/##')
+fi
+reboot_required_json="false"
+[ -f /var/run/reboot-required ] && reboot_required_json="true"
+virtualization_json="null"
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    virt=$(systemd-detect-virt 2>/dev/null)
+    [ -n "$virt" ] && [ "$virt" != "none" ] && virtualization_json="\"$virt\""
+fi
+cloud_provider_json="null"
+dmi_text=""
+for dmi_file in /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/bios_vendor; do
+    [ -r "$dmi_file" ] && dmi_text="$dmi_text $(cat "$dmi_file" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+done
+case "$dmi_text" in
+    *amazon*) cloud_provider_json="\"AWS\"" ;;
+    *google*) cloud_provider_json="\"Google Cloud\"" ;;
+    *microsoft*) cloud_provider_json="\"Azure\"" ;;
+    *digitalocean*) cloud_provider_json="\"DigitalOcean\"" ;;
+    *hetzner*) cloud_provider_json="\"Hetzner\"" ;;
+    *vultr*) cloud_provider_json="\"Vultr\"" ;;
+    *linode*) cloud_provider_json="\"Linode\"" ;;
+    *scaleway*) cloud_provider_json="\"Scaleway\"" ;;
+esac
 
 # 4. Uptime (sekundy)
 uptime=0
@@ -175,7 +392,7 @@ smart=$(get_smart_status)
 ports_list=""
 if [ -f /proc/net/tcp ]; then
     ports_raw=$(awk '
-    NR > 1 && $4 == "0A" {
+    NR > 1 && ($4 == "0A" || $4 == "07") {
         split($2, addr, ":");
         hex = addr[2];
         dec = 0;
@@ -188,7 +405,7 @@ if [ -f /proc/net/tcp ]; then
         if (port > 0 && port < 65536) {
             print port;
         }
-    }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -un)
+    }' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null | sort -un)
     
     for p in $ports_raw; do
         if [ -z "$ports_list" ]; then
@@ -225,6 +442,31 @@ while read -r proc; do
     fi
 done <<EOF
 $(ps -eo comm 2>/dev/null | tail -n +2 | sort -u)
+EOF
+
+# 7.1 Zombie procesy a TOP RAM procesy (přes 'ps', stejná závislost jako výše).
+# TOP CPU procesy se v bash verzi nepočítají - přesné "právě teď" řazení by
+# vyžadovalo dvojité procházení /proc pro každý PID (drahé/pomalé v shellu);
+# pro plný přehled procesů použijte Python agenta. Zombie a TOP RAM jsou levné
+# (jeden běh 'ps'), proto zůstávají i v bash verzi.
+zombie_count_json="null"
+zc=$(ps -eo stat= 2>/dev/null | grep -c '^Z')
+[ -n "$zc" ] && zombie_count_json="$zc"
+
+top_ram_json=""
+while read -r rline; do
+    [ -z "$rline" ] && continue
+    rname=$(echo "$rline" | awk '{print $1}')
+    rrss_kb=$(echo "$rline" | awk '{print $2}')
+    [ -z "$rrss_kb" ] && continue
+    rname_clean=$(echo -n "$rname" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    rram_mb=$(awk -v k="$rrss_kb" 'BEGIN { printf "%.1f", k/1024 }')
+    if [ -n "$top_ram_json" ]; then
+        top_ram_json="$top_ram_json, "
+    fi
+    top_ram_json="$top_ram_json{\"name\": \"$rname_clean\", \"ram_mb\": $rram_mb}"
+done <<EOF
+$(ps -eo comm,rss --sort=-rss 2>/dev/null | tail -n +2 | head -n 5)
 EOF
 
 # 7.5 Zjištění TeamSpeak statistik (telnet query na localhost)
@@ -371,6 +613,108 @@ for q_port in 10011 8219; do
     fi
 done
 
+# 7.6 TeamSpeak proces (PID/CPU/RAM/vlákna/otevřené FD) - detekce restartu (změna PID
+# mezi hlášeními) se dělá na serveru (agent_api.php), agent jen hlásí aktuální stav.
+ts3_pid=""
+if command -v pgrep >/dev/null 2>&1; then
+    ts3_pid=$(pgrep -x ts3server | head -n1)
+else
+    for p in /proc/[0-9]*; do
+        if [ -r "$p/comm" ] && [ "$(cat "$p/comm" 2>/dev/null)" = "ts3server" ]; then
+            ts3_pid=$(basename "$p")
+            break
+        fi
+    done
+fi
+
+ts3_process_json="null"
+if [ -n "$ts3_pid" ] && [ -d "/proc/$ts3_pid" ]; then
+    clk_tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    read_ts3_stat() {
+        raw=$(cat "/proc/$ts3_pid/stat" 2>/dev/null)
+        echo "$raw" | sed 's/^[0-9]* (.*) //'
+    }
+    ts3_stat1=$(read_ts3_stat)
+    sleep 1
+    ts3_stat2=$(read_ts3_stat)
+
+    ts3_cpu=$(awk -v s1="$ts3_stat1" -v s2="$ts3_stat2" -v tck="$clk_tck" '
+    BEGIN {
+        n1 = split(s1, a1);
+        n2 = split(s2, a2);
+        if (n1 < 13 || n2 < 13) { print 0.0; exit; }
+        delta = (a2[12] + a2[13]) - (a1[12] + a1[13]);
+        if (tck == 0) tck = 100;
+        printf "%.1f", (delta / tck) * 100;
+    }')
+
+    ts3_uptime=0
+    if [ -f /proc/uptime ] && [ -n "$ts3_stat2" ]; then
+        host_uptime=$(awk '{print $1}' /proc/uptime)
+        ts3_uptime=$(awk -v s2="$ts3_stat2" -v hu="$host_uptime" -v tck="$clk_tck" '
+        BEGIN {
+            n2 = split(s2, a2);
+            if (n2 < 20) { print 0; exit; }
+            if (tck == 0) tck = 100;
+            u = hu - (a2[20] / tck);
+            if (u < 0) u = 0;
+            printf "%.0f", u;
+        }')
+    fi
+
+    ts3_ram_mb="0"
+    ts3_threads="0"
+    if [ -f "/proc/$ts3_pid/status" ]; then
+        ts3_ram_mb=$(awk '/^VmRSS:/ { printf "%.1f", $2/1024 }' "/proc/$ts3_pid/status")
+        ts3_threads=$(awk '/^Threads:/ { print $2 }' "/proc/$ts3_pid/status")
+    fi
+    [ -z "$ts3_ram_mb" ] && ts3_ram_mb="0"
+    [ -z "$ts3_threads" ] && ts3_threads="0"
+
+    ts3_fds="0"
+    if [ -d "/proc/$ts3_pid/fd" ]; then
+        ts3_fds=$(ls "/proc/$ts3_pid/fd" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    ts3_process_json="{\"pid\": $ts3_pid, \"cpu\": $ts3_cpu, \"ram_mb\": $ts3_ram_mb, \"threads\": $ts3_threads, \"open_fds\": $ts3_fds, \"uptime_sec\": $ts3_uptime}"
+fi
+
+# 7.7 Service Discovery - detekce běžících služeb (process + port + config + active)
+discovered_json=""
+detect_svc() {
+    local name="$1" stype="$2" port="$3" proc="$4" cfg="$5"
+    local conf=0 ev="" miss=""
+    # Process (30)
+    if [ -n "$proc" ] && echo ",$process_list," | grep -qi ",$proc,"; then
+        conf=$((conf+30)); ev="${ev}\"process\","
+    elif [ -n "$proc" ]; then miss="${miss}\"process\","; fi
+    # Port (25)
+    if [ -n "$port" ] && echo ",$ports_json," | grep -q ", $port,"; then
+        conf=$((conf+25)); ev="${ev}\"port\","
+    elif [ -n "$port" ]; then miss="${miss}\"port\","; fi
+    # Config (25)
+    if [ -n "$cfg" ] && [ -e "$cfg" ]; then
+        conf=$((conf+25)); ev="${ev}\"config\","
+    elif [ -n "$cfg" ]; then miss="${miss}\"config\","; fi
+    # Active (19) - port listening = active
+    if [ -n "$port" ] && echo ",$ports_json," | grep -q ", $port,"; then
+        conf=$((conf+19)); ev="${ev}\"active_verify\","
+    else miss="${miss}\"active_verify\","; fi
+    [ $conf -gt 99 ] && conf=99
+    [ $conf -lt 25 ] && return
+    ev="${ev%,}"; miss="${miss%,}"
+    local entry="{\"name\": \"$name\", \"type\": \"$stype\", \"port\": ${port:-null}, \"confidence\": $conf, \"evidence\": [$ev], \"missing\": [$miss]}"
+    if [ -z "$discovered_json" ]; then discovered_json="$entry"; else discovered_json="$discovered_json, $entry"; fi
+}
+detect_svc "TeamSpeak" "teamspeak" 10011 "ts3server" ""
+detect_svc "Minecraft" "minecraft" 25565 "java" ""
+detect_svc "Nginx" "nginx" 80 "nginx" "/etc/nginx/nginx.conf"
+detect_svc "Docker" "docker" "" "dockerd" "/var/run/docker.sock"
+detect_svc "PostgreSQL" "postgresql" 5432 "postgres" "/etc/postgresql"
+detect_svc "AdGuard Home" "adguard" 3000 "AdGuardHome" ""
+detect_svc "WireGuard" "wireguard" 51820 "" "/etc/wireguard"
+detect_svc "Mosquitto" "mosquitto" 1883 "mosquitto" "/etc/mosquitto/mosquitto.conf"
+
 # 8. Sestavení JSON payloadu
 payload=$(cat <<EOF
 {
@@ -379,18 +723,46 @@ payload=$(cat <<EOF
   "version": "$AGENT_VERSION",
   "os": "$os_version",
   "cpu": $cpu,
+  "cpu_steal": $cpu_steal,
+  "iowait": $iowait,
   "ram": $ram,
+  "swap": $swap,
   "hdd": $hdd,
+  "inode_usage": $inode_usage_json,
+  "load1": $load1,
+  "load5": $load5,
+  "load15": $load15,
+  "disk_io_read": $disk_io_read_json,
+  "disk_io_write": $disk_io_write_json,
+  "net": $net_json,
+  "net_errors": $net_errors_json,
+  "fork_rate": $fork_rate_json,
+  "temperature": $temperature_json,
   "uptime": $uptime,
   "smart": "$smart",
   "ports": [$ports_json],
   "processes": [$process_list],
-  "teamspeak_servers": [$ts3_json_list]
+  "teamspeak_servers": [$ts3_json_list],
+  "ts3_process": $ts3_process_json,
+  "zombie_count": $zombie_count_json,
+  "top_cpu_processes": null,
+  "top_ram_processes": [$top_ram_json],
+  "hostname": "$sys_hostname",
+  "kernel": "$sys_kernel",
+  "timezone": "$sys_timezone",
+  "reboot_required": $reboot_required_json,
+  "cloud_provider": $cloud_provider_json,
+  "virtualization": $virtualization_json,
+  "discovered_services": [$discovered_json]
 }
 EOF
 )
 
-log_message "Metriky - OS: $os_version, CPU: $cpu%, RAM: $ram%, HDD: $hdd%, Uptime: ${uptime}s, SMART: $smart, Porty: [$ports_json]"
+net_log="N/A (první běh)"
+if [ -n "$net" ]; then
+    net_log="${net} KB/s"
+fi
+log_message "Metriky - OS: $os_version, CPU: $cpu% (steal $cpu_steal%), RAM: $ram% (swap $swap%), HDD: $hdd%, Load: $load1/$load5/$load15, Síť: $net_log, Uptime: ${uptime}s, SMART: $smart, Porty: [$ports_json]"
 log_message "Odesílám data na $API_URL..."
 
 http_code=""

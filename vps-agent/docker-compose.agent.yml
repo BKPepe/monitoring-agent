@@ -3,7 +3,8 @@
 # Nasazení Python agenta jako kontejneru, který hlásí metriky HOSTITELE
 # (ne kontejneru). Toho je dosaženo takto:
 #   - pid: host            -> /proc v kontejneru patří hostiteli (CPU, RAM, procesy)
-#   - network_mode: host   -> /proc/net/tcp ukazuje naslouchající porty hostitele
+#   - network_mode: host   -> /proc/net/tcp a /proc/net/dev ukazují porty a
+#                             síťovou propustnost hostitele, ne kontejneru
 #   - /:/host:ro           -> zaplnění disku a /etc/os-release se čte z /host
 #
 # Použití:

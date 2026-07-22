@@ -13,7 +13,7 @@ $AGENT_KEY = "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE"
 $AUTO_UPDATE = "0" # Nastavte na "1" pro povolení automatických aktualizací agenta ze serveru
 # ===========================
 
-$AGENT_VERSION = "1.3.0"
+$AGENT_VERSION = "1.7.0"
 
 # Načtení z Environment proměnných
 if ($env:STATUS_API_URL) { $API_URL = $env:STATUS_API_URL }
@@ -40,6 +40,7 @@ if (Test-Path $CfgPath) {
 }
 
 $LogFile = Join-Path $ScriptPath "agent.log"
+$NetStateFile = Join-Path $ScriptPath "agent_net.state"
 
 function Write-AgentLog {
     param([string]$Message)
@@ -93,6 +94,74 @@ try {
     }
 } catch {}
 
+# --- Swap (stránkovací soubor): využití v % ---
+$swap = 0.0
+try {
+    $pageFiles = Get-CimInstance -ClassName Win32_PageFileUsage
+    if ($pageFiles) {
+        $totalAllocated = ($pageFiles | Measure-Object -Property AllocatedBaseSize -Sum).Sum
+        $totalUsed = ($pageFiles | Measure-Object -Property CurrentUsage -Sum).Sum
+        if ($totalAllocated -gt 0) { $swap = [math]::Round(($totalUsed / $totalAllocated) * 100, 1) }
+    }
+} catch {}
+
+# --- Load average a CPU steal time nejsou na Windows k dispozici (nejde o Linux
+# koncepty s přímým ekvivalentem) - záměrně se nedopočítávají ani nenahrazují
+# odhadem, jen se pošlou jako $null.
+$load1 = $null; $load5 = $null; $load15 = $null
+$cpuSteal = $null
+
+# --- Disk I/O (KB/s čtení/zápis), průměr za 1s vzorek přes výkonnostní čítače ---
+$diskIoRead = $null
+$diskIoWrite = $null
+try {
+    $ioCounters = Get-Counter '\PhysicalDisk(_Total)\Disk Read Bytes/sec', '\PhysicalDisk(_Total)\Disk Write Bytes/sec' -SampleInterval 1 -MaxSamples 2 -ErrorAction Stop
+    $readAvg = ($ioCounters.CounterSamples | Where-Object { $_.Path -like '*read bytes*' } | Measure-Object -Property CookedValue -Average).Average
+    $writeAvg = ($ioCounters.CounterSamples | Where-Object { $_.Path -like '*write bytes*' } | Measure-Object -Property CookedValue -Average).Average
+    if ($null -ne $readAvg) { $diskIoRead = [math]::Round($readAvg / 1024, 1) }
+    if ($null -ne $writeAvg) { $diskIoWrite = [math]::Round($writeAvg / 1024, 1) }
+} catch {}
+
+# --- Síť: propustnost (KB/s, RX+TX) a nové chyby/zahozené pakety od posledního běhu ---
+# Potřebuje 2 vzorky, proto se mezi běhy ukládá kumulativní počet bajtů/chyb a čas
+# do stavového souboru vedle skriptu; první běh proto vrací $null.
+$net = $null
+$netErrors = $null
+try {
+    $now = Get-Date
+    $totalBytes = 0
+    $totalErrors = 0
+    $adapters = Get-NetAdapterStatistics -ErrorAction Stop | Where-Object { $_.Name -notmatch '^(Loopback|vEthernet|Docker|WSL)' }
+    foreach ($a in $adapters) {
+        $totalBytes += [int64]$a.ReceivedBytes + [int64]$a.SentBytes
+        $totalErrors += [int64]$a.ReceivedPacketErrors + [int64]$a.OutboundPacketErrors + [int64]$a.ReceivedDiscardedPackets + [int64]$a.OutboundDiscardedPackets
+    }
+
+    $prev = $null
+    if (Test-Path $NetStateFile) {
+        try {
+            $parts = (Get-Content $NetStateFile -Raw).Trim().Split(",")
+            if ($parts.Count -ge 3) {
+                $prev = @{ Ts = [double]$parts[0]; Bytes = [int64]$parts[1]; Errors = [int64]$parts[2] }
+            } elseif ($parts.Count -eq 2) {
+                $prev = @{ Ts = [double]$parts[0]; Bytes = [int64]$parts[1]; Errors = $totalErrors }
+            }
+        } catch {}
+    }
+
+    "$($now.ToFileTimeUtc()),$totalBytes,$totalErrors" | Set-Content -Path $NetStateFile -Encoding ASCII -ErrorAction SilentlyContinue
+
+    if ($prev) {
+        $elapsedSec = ($now.ToFileTimeUtc() - $prev.Ts) / 10000000.0
+        $deltaBytes = $totalBytes - $prev.Bytes
+        if ($elapsedSec -gt 0 -and $deltaBytes -ge 0) {
+            $net = [math]::Round(($deltaBytes / $elapsedSec) / 1024, 1)
+        }
+        $deltaErrors = $totalErrors - $prev.Errors
+        if ($deltaErrors -ge 0) { $netErrors = $deltaErrors }
+    }
+} catch {}
+
 # --- Uptime v sekundách ---
 $uptime = 0
 try {
@@ -105,6 +174,61 @@ try {
 $os_version = "Windows"
 try {
     if ($os_info -and $os_info.Caption) { $os_version = $os_info.Caption.Trim() }
+} catch {}
+
+# --- Systémová identita (hostname/kernel/timezone/cloud/virtualizace) ---
+# reboot_required, iowait, inode usage, zombie count, fork rate a teplota jsou
+# Linux/proc specifické koncepty bez čistého windowsího ekvivalentu - posílají
+# se jako $null (viz payload níže), ne odhadované.
+$sys_hostname = $env:COMPUTERNAME
+$sys_kernel = $null
+try {
+    if ($os_info -and $os_info.BuildNumber) { $sys_kernel = "Build $($os_info.BuildNumber)" }
+} catch {}
+$sys_timezone = $null
+try {
+    $sys_timezone = [System.TimeZoneInfo]::Local.Id
+} catch {}
+$cloud_provider = $null
+$virtualization = $null
+try {
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    $manufacturer = ($cs.Manufacturer | Out-String).Trim().ToLower()
+    $model = ($cs.Model | Out-String).Trim().ToLower()
+    if ($manufacturer -match "amazon") { $cloud_provider = "AWS" }
+    elseif ($manufacturer -match "google") { $cloud_provider = "Google Cloud" }
+    elseif ($model -match "hvm domu|xen") { $cloud_provider = "AWS" }
+    if ($model -match "virtual machine" -and $manufacturer -match "microsoft") { $virtualization = "Hyper-V" }
+    elseif ($manufacturer -match "vmware") { $virtualization = "VMware" }
+    elseif ($model -match "kvm" -or $manufacturer -match "qemu") { $virtualization = "KVM" }
+    elseif ($manufacturer -match "xen") { $virtualization = "Xen" }
+} catch {}
+
+# --- TOP procesy dle CPU a RAM ---
+# CPU% je dopočítáno ze stejné dvouvzorkové techniky jako u ts3server níže
+# (TotalProcessorTime před/po 1s), ne z kumulativního $proc.CPU od startu procesu.
+$topCpuProcesses = @()
+$topRamProcesses = @()
+try {
+    $cpuCores = [Environment]::ProcessorCount
+    $procSample1 = Get-Process -ErrorAction Stop | Select-Object Id, ProcessName, TotalProcessorTime, WorkingSet64
+    Start-Sleep -Seconds 1
+    $procSample2 = Get-Process -ErrorAction Stop | Select-Object Id, ProcessName, TotalProcessorTime, WorkingSet64
+    $sample1ById = @{}
+    foreach ($p in $procSample1) { $sample1ById[$p.Id] = $p.TotalProcessorTime }
+
+    $cpuRanked = foreach ($p in $procSample2) {
+        if ($sample1ById.ContainsKey($p.Id)) {
+            $deltaMs = ($p.TotalProcessorTime - $sample1ById[$p.Id]).TotalMilliseconds
+            if ($deltaMs -gt 0 -and $cpuCores -gt 0) {
+                [PSCustomObject]@{ name = $p.ProcessName; cpu = [math]::Round(($deltaMs / 1000.0 / $cpuCores) * 100, 1) }
+            }
+        }
+    }
+    $topCpuProcesses = $cpuRanked | Sort-Object -Property cpu -Descending | Select-Object -First 5
+
+    $topRamProcesses = $procSample2 | Sort-Object -Property WorkingSet64 -Descending | Select-Object -First 5 |
+        ForEach-Object { [PSCustomObject]@{ name = $_.ProcessName; ram_mb = [math]::Round($_.WorkingSet64 / 1MB, 1) } }
 } catch {}
 
 # --- SMART stav disků ---
@@ -138,21 +262,99 @@ try {
     $processes = Get-Process | Select-Object -ExpandProperty ProcessName -Unique
 } catch {}
 
+# --- TeamSpeak proces (PID/CPU/RAM/vlákna/handles) ---
+# Detekce restartu (změna PID mezi hlášeními) se dělá na serveru (agent_api.php),
+# agent jen hlásí aktuální stav. "open_fds" je zde HandleCount (nejbližší windowsí
+# obdoba počtu otevřených soketů/souborů - Windows nemá přímo /proc/<pid>/fd).
+$ts3Process = $null
+try {
+    $proc = Get-Process -Name "ts3server" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($proc) {
+        $cpuTime1 = $proc.TotalProcessorTime
+        Start-Sleep -Seconds 1
+        $proc.Refresh()
+        $cpuTime2 = $proc.TotalProcessorTime
+        $cpuCores = [Environment]::ProcessorCount
+        $cpuDeltaMs = ($cpuTime2 - $cpuTime1).TotalMilliseconds
+        $ts3Cpu = 0.0
+        if ($cpuCores -gt 0) { $ts3Cpu = [math]::Round(($cpuDeltaMs / 1000.0 / $cpuCores) * 100, 1) }
+
+        $ts3Process = @{
+            pid = $proc.Id
+            cpu = $ts3Cpu
+            ram_mb = [math]::Round($proc.WorkingSet64 / 1MB, 1)
+            threads = $proc.Threads.Count
+            open_fds = $proc.HandleCount
+            uptime_sec = [int]((Get-Date) - $proc.StartTime).TotalSeconds
+        }
+    }
+} catch {}
+
+# --- Service Discovery ---
+$discoveredServices = @()
+$detectors = @(
+    @{ Name = "TeamSpeak"; Type = "teamspeak"; Port = 10011; Proc = "ts3server"; Cfg = @() },
+    @{ Name = "Minecraft"; Type = "minecraft"; Port = 25565; Proc = "java"; Cfg = @() },
+    @{ Name = "Nginx"; Type = "nginx"; Port = 80; Proc = "nginx"; Cfg = @("C:\nginx\conf\nginx.conf") },
+    @{ Name = "Docker"; Type = "docker"; Port = $null; Proc = "dockerd"; Cfg = @("C:\ProgramData\Docker") },
+    @{ Name = "PostgreSQL"; Type = "postgresql"; Port = 5432; Proc = "postgres"; Cfg = @("C:\Program Files\PostgreSQL") },
+    @{ Name = "AdGuard Home"; Type = "adguard"; Port = 3000; Proc = "AdGuardHome"; Cfg = @() },
+    @{ Name = "Mosquitto"; Type = "mosquitto"; Port = 1883; Proc = "mosquitto"; Cfg = @("C:\Program Files\mosquitto\mosquitto.conf") }
+)
+foreach ($det in $detectors) {
+    $conf = 0; $evidence = @(); $missing = @()
+    if ($det.Proc -and $processes -contains $det.Proc) { $conf += 30; $evidence += "process" } elseif ($det.Proc) { $missing += "process" }
+    if ($det.Port -and $ports -contains $det.Port) { $conf += 25; $evidence += "port" } elseif ($det.Port) { $missing += "port" }
+    $cfgFound = $false
+    foreach ($cp in $det.Cfg) { if (Test-Path $cp) { $cfgFound = $true; break } }
+    if ($cfgFound) { $conf += 25; $evidence += "config" } elseif ($det.Cfg.Count -gt 0) { $missing += "config" }
+    if ($det.Port -and $ports -contains $det.Port) { $conf += 19; $evidence += "active_verify" } else { $missing += "active_verify" }
+    if ($conf -gt 99) { $conf = 99 }
+    if ($conf -ge 25) {
+        $discoveredServices += @{ name = $det.Name; type = $det.Type; port = $det.Port; confidence = $conf; evidence = $evidence; missing = $missing }
+    }
+}
+
 $payload = @{
     agent_key = $AGENT_KEY
     agent_type = "powershell"
     version = $AGENT_VERSION
     os = $os_version
     cpu = $cpu
+    cpu_steal = $cpuSteal
+    iowait = $null
     ram = $ram
+    swap = $swap
     hdd = $hdd
+    inode_usage = $null
+    load1 = $load1
+    load5 = $load5
+    load15 = $load15
+    disk_io_read = $diskIoRead
+    disk_io_write = $diskIoWrite
+    net = $net
+    net_errors = $netErrors
+    fork_rate = $null
+    temperature = $null
     uptime = $uptime
     smart = $smart
     ports = @($ports)
     processes = @($processes)
+    ts3_process = $ts3Process
+    zombie_count = $null
+    top_cpu_processes = @($topCpuProcesses)
+    top_ram_processes = @($topRamProcesses)
+    hostname = $sys_hostname
+    kernel = $sys_kernel
+    timezone = $sys_timezone
+    reboot_required = $null
+    cloud_provider = $cloud_provider
+    virtualization = $virtualization
+    discovered_services = $discoveredServices
 } | ConvertTo-Json -Depth 4
 
-Write-AgentLog "Metriky - OS: $os_version, CPU: $cpu%, RAM: $ram%, HDD: $hdd%, Uptime: ${uptime}s, SMART: $smart"
+$netLog = if ($null -ne $net) { "$net KB/s" } else { "N/A (první běh)" }
+Write-AgentLog "Metriky - OS: $os_version, CPU: $cpu%, RAM: $ram%, swap $swap%, HDD: $hdd%, Sit: $netLog, Uptime: ${uptime}s, SMART: $smart"
 Write-AgentLog "Odesílám data na $API_URL..."
 
 try {
