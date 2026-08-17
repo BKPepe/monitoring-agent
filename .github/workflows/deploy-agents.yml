@@ -1,0 +1,73 @@
+# Self-deploy of the VPS/OpenWrt agents to the hosting.
+#
+# Until now the agents reached production only through the `monitoring` repo:
+# its deploy copies them out of the `agents` submodule into /status/ before the
+# FTP upload. That works, but a fix pushed HERE stayed undeployed until someone
+# also bumped the submodule over there - and self-updating routers kept
+# downloading the old file the whole time. This workflow uploads the agent
+# files straight from this repo, so the submodule bump remains a bookkeeping
+# step, not a deployment prerequisite.
+#
+# The monitoring deploy still copies the agents too (belt and braces); both
+# uploads are idempotent and the state files are separate (state-name below),
+# so neither deploy clobbers the other's change detection.
+name: Deploy Agents to cPanel
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vps-agent/agent.sh'
+      - 'vps-agent/agent.py'
+      - 'vps-agent/agent.ps1'
+      - 'vps-agent/agent_openwrt.sh'
+      - '.github/workflows/deploy-agents.yml'
+  # Manual re-run without a code change (e.g. after fixing the secrets).
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail loudly when the secrets are missing - a silent skip would look
+      # exactly like a successful deploy in the Actions overview.
+      - name: Check FTP secrets are configured
+        env:
+          # Same fallback names the monitoring repo's deploy accepts.
+          FTP_SERVER: ${{ secrets.FTP_SERVER || secrets.server || secrets.FTP_server }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME || secrets.username || secrets.FTP_username }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD || secrets.FTP_password }}
+        run: |
+          if [ -z "$FTP_SERVER" ] || [ -z "$FTP_USERNAME" ] || [ -z "$FTP_PASSWORD" ]; then
+            echo "::error::Missing FTP secrets. Add FTP_SERVER, FTP_USERNAME and FTP_PASSWORD"
+            echo "::error::(same values as in the monitoring repo) under Settings -> Secrets -> Actions."
+            exit 1
+          fi
+
+      # Only the four agent files leave this repo - the routers' self-update
+      # fetches exactly these paths from /status/. Uploading README or the
+      # probe worker there would just litter the webroot.
+      - name: Stage agent files
+        run: |
+          set -e
+          mkdir -p deploy
+          for f in agent.sh agent.py agent.ps1 agent_openwrt.sh; do
+            cp "vps-agent/$f" "deploy/$f"
+            test -s "deploy/$f" || { echo "MISSING or empty: $f"; exit 1; }
+          done
+
+      - name: Upload via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.4.0
+        with:
+          server: ${{ secrets.FTP_SERVER || secrets.server || secrets.FTP_server }}
+          username: ${{ secrets.FTP_USERNAME || secrets.username || secrets.FTP_username }}
+          password: ${{ secrets.FTP_PASSWORD || secrets.FTP_password }}
+          protocol: ftps
+          timeout: 60000
+          local-dir: deploy/
+          server-dir: public_html/status/
+          # Separate state file: the monitoring repo's deploy syncs the same
+          # directory and must keep its own change detection intact.
+          state-name: .ftp-deploy-agents-state.json

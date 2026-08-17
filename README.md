@@ -56,3 +56,17 @@ above), authenticated with a per-monitor `AGENT_KEY` issued by the dashboard's
 admin panel. See `apps/status/README.md` for full installation instructions for
 each variant, and the "Self-Updates" section for how the opt-in auto-update flow
 (checksum-verified, atomic replace) works across all four.
+
+### Deployment (self-deploy to the dashboard hosting)
+
+`.github/workflows/deploy-agents.yml` uploads the four agent files to
+`public_html/status/` on every push that touches them, so self-updating routers
+and servers get a fix as soon as it lands here — no `monitoring`-repo submodule
+bump needed for the rollout (the bump remains as bookkeeping, and that repo's
+deploy still copies the agents too; the two uploads keep separate FTP state
+files and don't fight).
+
+One-time setup: add the same `FTP_SERVER`, `FTP_USERNAME` and `FTP_PASSWORD`
+secrets the `monitoring` repo uses under **Settings → Secrets and variables →
+Actions**. The workflow fails loudly when they're missing instead of
+pretending it deployed.
