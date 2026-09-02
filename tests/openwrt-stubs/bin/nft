@@ -1,0 +1,14 @@
+#!/bin/sh
+[ "$1 $2" = "list ruleset" ] || exit 1
+cat <<'M'
+table inet fw4 {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iifname "lo" accept comment "!fw4: Accept traffic from loopback"
+		ct state established,related counter packets 150 bytes 1000 accept comment "!fw4: Allow inbound established and related flows"
+		iifname "br-lan" counter packets 50 bytes 500 accept
+		counter packets 5 bytes 200 drop comment "!fw4: Drop excess packets"
+		tcp dport 22 counter packets 3 bytes 100 reject
+	}
+}
+M

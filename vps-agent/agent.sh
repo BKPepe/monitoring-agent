@@ -8,8 +8,23 @@
 # Pokud chcete, můžete tyto hodnoty nechat zde, nebo vytvořit soubor 'agent.cfg' ve stejné složce
 API_URL="http://localhost/status/agent_api.php"
 AGENT_KEY="ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE"
+_env_remote_actions="$REMOTE_ACTIONS_ENABLED"
+_env_allowed_actions="$ALLOWED_ACTIONS"
 AUTO_UPDATE="0" # Nastavte na "1" pro povolení automatických aktualizací agenta ze serveru
+HEAVY_OP_INTERVAL_HOURS="24" # How often the expensive checks rerun (SMART, USB, service discovery)
+REMOTE_ACTIONS_ENABLED="0"   # "1" enables HMAC-signed remote actions from the server
+ALLOWED_ACTIONS="restart_service,reboot_server"
 # ===========================
+
+# Numeric output must not depend on the host locale: with a comma-decimal
+# locale `sort -rn` scrambles the top-process lists. It also keeps tool output
+# untranslated, which the parsers below rely on.
+export LC_ALL=C
+# The bare REMOTE_ACTIONS_ENABLED / ALLOWED_ACTIONS env names were the only
+# ones read before this version; they were captured above the defaults so
+# existing systemd units and Docker files keep working.
+[ -n "$_env_remote_actions" ] && REMOTE_ACTIONS_ENABLED="$_env_remote_actions"
+[ -n "$_env_allowed_actions" ] && ALLOWED_ACTIONS="$_env_allowed_actions"
 
 # Načtení z Environment proměnných
 if [ -n "$STATUS_API_URL" ]; then
@@ -21,6 +36,9 @@ fi
 if [ -n "$STATUS_AUTO_UPDATE" ]; then
     AUTO_UPDATE="$STATUS_AUTO_UPDATE"
 fi
+[ -n "$STATUS_HEAVY_OP_INTERVAL_HOURS" ] && HEAVY_OP_INTERVAL_HOURS="$STATUS_HEAVY_OP_INTERVAL_HOURS"
+[ -n "$STATUS_REMOTE_ACTIONS_ENABLED" ] && REMOTE_ACTIONS_ENABLED="$STATUS_REMOTE_ACTIONS_ENABLED"
+[ -n "$STATUS_ALLOWED_ACTIONS" ] && ALLOWED_ACTIONS="$STATUS_ALLOWED_ACTIONS"
 
 # Načtení z externí konfigurace 'agent.cfg'
 ScriptPath=$(dirname "$(readlink -f "$0")" 2>/dev/null || dirname "$0")
@@ -36,6 +54,14 @@ if [ -f "$ScriptPath/agent.cfg" ]; then
                 AGENT_KEY="$val"
             elif [ "$key" = "AUTO_UPDATE" ]; then
                 AUTO_UPDATE="$val"
+            # These three were env-only before, i.e. unreachable from cron's
+            # empty environment even though the docs pointed at agent.cfg.
+            elif [ "$key" = "HEAVY_OP_INTERVAL_HOURS" ]; then
+                HEAVY_OP_INTERVAL_HOURS="$val"
+            elif [ "$key" = "REMOTE_ACTIONS_ENABLED" ]; then
+                REMOTE_ACTIONS_ENABLED="$val"
+            elif [ "$key" = "ALLOWED_ACTIONS" ]; then
+                ALLOWED_ACTIONS="$val"
             fi
         fi
     done < "$ScriptPath/agent.cfg"
@@ -53,7 +79,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
     HOSTNAME_VAL=$(hostname 2>/dev/null || echo "Linux-Server")
     echo "Registruji nového agenta na $API_URL..."
-    RESP=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"register\", \"token\":\"$REG_TOKEN\", \"hostname\":\"$HOSTNAME_VAL\", \"agent_type\":\"bash\"}" "$API_URL")
+    RESP=$(curl -s -m 20 -X POST -H "Content-Type: application/json" -d "{\"action\":\"register\", \"token\":\"$REG_TOKEN\", \"hostname\":\"$HOSTNAME_VAL\", \"agent_type\":\"bash\"}" "$API_URL")
     NEW_KEY=$(echo "$RESP" | sed -n 's/.*"agent_key":"\([^"]*\)".*/\1/p')
     if [ -n "$NEW_KEY" ]; then
         echo "API_URL=\"$API_URL\"" > "$ScriptPath/agent.cfg"
@@ -66,13 +92,17 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.0.1"
+AGENT_VERSION="0.1.0"
 LOG_FILE="$ScriptPath/agent.log"
-NET_STATE_FILE="$ScriptPath/agent_net.state"
-DISKIO_STATE_FILE="$ScriptPath/agent_diskio.state"
-FORKRATE_STATE_FILE="$ScriptPath/agent_forkrate.state"
+# One state file for every between-run delta (CPU, disk I/O, network, forks,
+# TS3 CPU), written once per run next to the script. It used to be four files,
+# one of them in /tmp where it outlived reboots and produced negative deltas.
+# Plus one cache for the expensive checks (see HEAVY_OP_INTERVAL_HOURS).
+STATE_FILE="$ScriptPath/agent.state"
+HEAVY_CACHE_FILE="$ScriptPath/agent-heavy.cache"
 
 VERBOSE="0"
+DRY_RUN="0"
 [ -t 1 ] && VERBOSE="1"
 for arg in "$@"; do
     case "$arg" in
@@ -83,6 +113,7 @@ for arg in "$@"; do
             echo "Moznosti:"
             echo "  --register TOKEN [API_URL]   Zaregistruje agenta na zadany monitoring server"
             echo "  --update, --auto-update      Vynuti kontrolu a aktualizaci agenta ze serveru"
+            echo "  --dry-run, --print           Sesbira data a vypise JSON, neodesila (i bez klice)"
             echo "  --verbose, -v                Zobrazi podrobny prubeh sberu dat a odesilani"
             echo "  --version, -V                Zobrazi verzi agenta"
             echo "  --help, -h                   Zobrazi tuto napovedu"
@@ -103,71 +134,118 @@ for arg in "$@"; do
         --verbose|-v)
             VERBOSE="1"
             ;;
+        --dry-run|--print)
+            DRY_RUN="1"
+            VERBOSE="1"
+            ;;
     esac
 done
 
+# Escapes one string for a JSON value: backslash, quote, and the control
+# characters a process name may legally contain (a tab would break the whole
+# report, and the server rejects invalid JSON with a 400).
 json_str() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g' | tr '\n' ' '
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g; s/\t/ /g' | tr -d '\000-\010\013\014\016-\037' | tr '\n' ' '
 }
 
 log_message() {
     local msg="$1"
     local ts
-    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1
     if [ "$VERBOSE" = "1" ]; then
-        echo "$ts - $msg"
+        # In --dry-run stdout is the JSON payload; keep the chatter on stderr
+        # so `agent.sh --dry-run | python3 -m json.tool` just works.
+        if [ "$DRY_RUN" = "1" ]; then echo "$ts - $msg" >&2; else echo "$ts - $msg"; fi
     fi
     echo "$ts - $msg" >> "$LOG_FILE" 2>/dev/null || echo "$ts - $msg" >> /tmp/status-agent.log 2>/dev/null || true
 }
 
+# Debug lines used to reach the log file unconditionally - five per run, one
+# carrying the whole port list - so agent.log grew about 250 MB a year with
+# no rotation. They are written only with --verbose now.
 log_debug() {
-    log_message "$1"
+    [ "$VERBOSE" = "1" ] && log_message "$1"
+    return 0
 }
 
-if [ "$AGENT_KEY" = "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE" ]; then
+# And the log stays bounded: above 1 MB keep the last 500 lines.
+bk_trim_log() {
+    local size
+    size=$(stat -c %s "$LOG_FILE" 2>/dev/null)
+    if [ -n "$size" ] && [ "$size" -gt 1048576 ] 2>/dev/null; then
+        tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null
+    fi
+}
+bk_trim_log
+
+if [ "$AGENT_KEY" = "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE" ] && [ "$DRY_RUN" != "1" ]; then
     log_message "CHYBA: Nebyl nastaven AGENT_KEY. Upravte skript nebo 'agent.cfg'."
     exit 1
 fi
 
 log_debug "Získávám systémové statistiky (BASH)..."
 
-# 1. CPU Usage (math from /proc/stat over state file delta)
-CPU_STATE_FILE="/tmp/status-agent-vps-cpu.state"
-now_ts=$(date +%s)
-stat_now=$(grep '^cpu ' /proc/stat)
-# Nezmereno = null, ne nula. Kdyz se /proc/stat neprecte, neznamena to
-# nulove vytizeni - znamena to, ze nevime.
-cpu="null"; cpu_steal="null"; iowait="null"
-if [ -f "$CPU_STATE_FILE" ]; then
-    prev_stat=$(cut -d'|' -f2- "$CPU_STATE_FILE" 2>/dev/null)
-    if [ -n "$prev_stat" ]; then
-        cpu_steal_out=$(awk -v s1="$prev_stat" -v s2="$stat_now" '
-        BEGIN {
-            split(s1, a1); split(s2, a2);
-            iowait1 = a1[6] + 0; idle1 = a1[5] + a1[6];
-            total1 = a1[2]+a1[3]+a1[4]+a1[5]+a1[6]+a1[7]+a1[8];
-            steal1 = a1[9] + 0;
-
-            iowait2 = a2[6] + 0; idle2 = a2[5] + a2[6];
-            total2 = a2[2]+a2[3]+a2[4]+a2[5]+a2[6]+a2[7]+a2[8];
-            steal2 = a2[9] + 0;
-
-            idle_delta = idle2 - idle1; total_delta = total2 - total1;
-            steal_delta = steal2 - steal1; iowait_delta = iowait2 - iowait1;
-
-            if (total_delta <= 0) { print "0.0 0.0 0.0"; } else {
-                cpu_pct = (1.0 - idle_delta / total_delta) * 100;
-                steal_pct = (steal_delta / total_delta) * 100;
-                iowait_pct = (iowait_delta / total_delta) * 100;
-                printf "%.1f %.1f %.1f", cpu_pct, steal_pct, iowait_pct;
-            }
-        }')
-        cpu=$(echo "$cpu_steal_out" | awk '{print $1}')
-        cpu_steal=$(echo "$cpu_steal_out" | awk '{print $2}')
-        iowait=$(echo "$cpu_steal_out" | awk '{print $3}')
+# One run at a time: a stalled report (server down, hung disk) must not let
+# cron stack a new agent on top of it every minute.
+if command -v flock >/dev/null 2>&1; then
+    if exec 9>"$ScriptPath/.agent.lock" 2>/dev/null; then
+        flock -n 9 || { log_message "Predchozi beh jeste bezi, tento koncim."; exit 0; }
     fi
 fi
-echo "${now_ts}|${stat_now}" > "$CPU_STATE_FILE" 2>/dev/null || true
+
+bk_now() { printf '%(%s)T' -1; }
+now_ts=$(bk_now)
+
+# Previous-run state, read as plain key=value lines - never eval'ed.
+st_boot_id=""; st_cpu=""; st_diskio=""; st_net=""; st_forks=""; st_ts3=""
+if [ -f "$STATE_FILE" ]; then
+    while IFS='=' read -r st_k st_v; do
+        case "$st_k" in
+            boot_id) st_boot_id="$st_v" ;;
+            cpu) st_cpu="$st_v" ;;
+            diskio) st_diskio="$st_v" ;;
+            net) st_net="$st_v" ;;
+            forks) st_forks="$st_v" ;;
+            ts3) st_ts3="$st_v" ;;
+        esac
+    done < "$STATE_FILE"
+fi
+# Kernel counters restart at zero after a reboot; a delta against the previous
+# boot came out negative - or, for CPU, as a fabricated 0.0. The saved state is
+# trusted only within the same boot.
+cur_boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+if [ -n "$st_boot_id" ] && [ "$st_boot_id" != "$cur_boot_id" ]; then
+    st_cpu=""; st_diskio=""; st_net=""; st_forks=""; st_ts3=""
+fi
+
+# 1. CPU usage from the /proc/stat delta against the previous run.
+stat_now=$(grep '^cpu ' /proc/stat 2>/dev/null)
+# Not measured = null, not zero: the first run, the run after a reboot and an
+# unreadable /proc/stat alike.
+cpu="null"; cpu_steal="null"; iowait="null"
+prev_stat="${st_cpu#*|}"
+if [ -n "$st_cpu" ] && [ -n "$prev_stat" ] && [ -n "$stat_now" ]; then
+    cpu_steal_out=$(awk -v s1="$prev_stat" -v s2="$stat_now" '
+    BEGIN {
+        split(s1, a1); split(s2, a2);
+        iowait1 = a1[6] + 0; idle1 = a1[5] + a1[6];
+        total1 = a1[2]+a1[3]+a1[4]+a1[5]+a1[6]+a1[7]+a1[8];
+        steal1 = a1[9] + 0;
+        iowait2 = a2[6] + 0; idle2 = a2[5] + a2[6];
+        total2 = a2[2]+a2[3]+a2[4]+a2[5]+a2[6]+a2[7]+a2[8];
+        steal2 = a2[9] + 0;
+        idle_delta = idle2 - idle1; total_delta = total2 - total1;
+        steal_delta = steal2 - steal1; iowait_delta = iowait2 - iowait1;
+        # No output when the counters did not advance or went backwards -
+        # the caller keeps null instead of a 0.0 nobody measured.
+        if (total_delta > 0) {
+            printf "%.1f %.1f %.1f", (1.0 - idle_delta / total_delta) * 100, (steal_delta / total_delta) * 100, (iowait_delta / total_delta) * 100;
+        }
+    }')
+    [ -n "$cpu_steal_out" ] && read -r cpu cpu_steal iowait <<< "$cpu_steal_out"
+fi
+new_st_cpu=""
+[ -n "$stat_now" ] && new_st_cpu="${now_ts}|${stat_now}"
 
 # 2. RAM Usage (%) & MB breakdown
 eval $(awk '
@@ -196,12 +274,13 @@ swap=$(awk '
 /^SwapTotal:/ { total=$2 }
 /^SwapFree:/ { free=$2 }
 END {
-    if (!total || total == 0) {
-        print 0.0;
-    } else {
+    # No swap configured is "not applicable" - null, like the other agents -
+    # not 0.0 % of nothing.
+    if (total > 0) {
         printf "%.1f", ((total - free) / total) * 100;
     }
 }' /proc/meminfo)
+[ -z "$swap" ] && swap="null"
 
 # 2.6 Load average (1/5/15 min)
 load_out="null null null"
@@ -266,43 +345,37 @@ if [ -n "$inode_usage" ]; then
     inode_usage_json="$inode_usage"
 fi
 
-# 3.1 Disk I/O (KB/s čtení/zápis) - stejný tick/tock princip jako propustnost sítě níže.
-# /proc/diskstats je celojaderný čítač (ne per-pid-namespace), funguje i v Dockeru s pid: host.
+# 3.1 Disk I/O (KB/s read/write) - the same tick/tock principle as network
+# throughput. /proc/diskstats is a whole-kernel counter (not per pid
+# namespace), so it works in Docker with pid: host too.
 disk_sectors=$(awk '
 $3 ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme[0-9]+n[0-9]+)$/ {
-    read_total += $6;
-    write_total += $10;
+    matched++; read_total += $6; write_total += $10;
 }
-END { printf "%.0f,%.0f", read_total+0, write_total+0 }
+END { if (matched) printf "%.0f,%.0f", read_total, write_total }
 ' /proc/diskstats 2>/dev/null)
-if [ -z "$disk_sectors" ]; then
-    disk_sectors="0,0"
-fi
-disk_read_sectors=$(echo "$disk_sectors" | cut -d',' -f1)
-disk_write_sectors=$(echo "$disk_sectors" | cut -d',' -f2)
-
-disk_io_read=""
-disk_io_write=""
-now_ts_io=$(date +%s)
-if [ -f "$DISKIO_STATE_FILE" ]; then
-    prev_io_ts=$(cut -d',' -f1 "$DISKIO_STATE_FILE" 2>/dev/null)
-    prev_read=$(cut -d',' -f2 "$DISKIO_STATE_FILE" 2>/dev/null)
-    prev_write=$(cut -d',' -f3 "$DISKIO_STATE_FILE" 2>/dev/null)
-    if [ -n "$prev_io_ts" ] && [ -n "$prev_read" ] && [ -n "$prev_write" ]; then
-        elapsed_io=$((now_ts_io - prev_io_ts))
-        delta_read=$((disk_read_sectors - prev_read))
-        delta_write=$((disk_write_sectors - prev_write))
-        if [ "$elapsed_io" -gt 0 ] && [ "$delta_read" -ge 0 ] && [ "$delta_write" -ge 0 ]; then
-            disk_io_read=$(awk -v d="$delta_read" -v e="$elapsed_io" 'BEGIN { printf "%.1f", (d * 512 / e) / 1024 }')
-            disk_io_write=$(awk -v d="$delta_write" -v e="$elapsed_io" 'BEGIN { printf "%.1f", (d * 512 / e) / 1024 }')
+# No matching device (mmcblk / dm-only hosts, containers without diskstats):
+# nothing was measured, so no rate - not a 0.0 KB/s.
+disk_io_read_json="null"
+disk_io_write_json="null"
+new_st_diskio=""
+if [ -n "$disk_sectors" ]; then
+    disk_read_sectors=${disk_sectors%,*}
+    disk_write_sectors=${disk_sectors#*,}
+    if [ -n "$st_diskio" ]; then
+        IFS=',' read -r prev_io_ts prev_read prev_write <<< "$st_diskio"
+        if [ -n "$prev_io_ts" ] && [ -n "$prev_read" ] && [ -n "$prev_write" ]; then
+            elapsed_io=$((now_ts - prev_io_ts))
+            delta_read=$((disk_read_sectors - prev_read))
+            delta_write=$((disk_write_sectors - prev_write))
+            if [ "$elapsed_io" -gt 0 ] && [ "$delta_read" -ge 0 ] && [ "$delta_write" -ge 0 ]; then
+                disk_io_read_json=$(awk -v d="$delta_read" -v e="$elapsed_io" 'BEGIN { printf "%.1f", (d * 512 / e) / 1024 }')
+                disk_io_write_json=$(awk -v d="$delta_write" -v e="$elapsed_io" 'BEGIN { printf "%.1f", (d * 512 / e) / 1024 }')
+            fi
         fi
     fi
+    new_st_diskio="$now_ts,$disk_read_sectors,$disk_write_sectors"
 fi
-echo "$now_ts_io,$disk_read_sectors,$disk_write_sectors" > "$DISKIO_STATE_FILE" 2>/dev/null || true
-disk_io_read_json="null"
-[ -n "$disk_io_read" ] && disk_io_read_json="$disk_io_read"
-disk_io_write_json="null"
-[ -n "$disk_io_write" ] && disk_io_write_json="$disk_io_write"
 
 # 3.5 Propustnost sítě (KB/s, RX+TX) a síťové chyby/zahozené pakety - potřebuje 2 vzorky,
 # proto se mezi běhy ukládá kumulativní počet bajtů/chyb a čas; první běh vrací null.
@@ -320,55 +393,41 @@ NR > 2 {
 }
 END { printf "%.0f,%.0f", total, errs }
 ' /proc/net/dev 2>/dev/null)
-if [ -z "$net_stats" ]; then
-    net_stats="0,0"
-fi
-net_bytes=$(echo "$net_stats" | cut -d',' -f1)
-net_errs_total=$(echo "$net_stats" | cut -d',' -f2)
-
-net=""
-net_errors=""
-now_ts=$(date +%s)
-if [ -f "$NET_STATE_FILE" ]; then
-    prev_ts=$(cut -d',' -f1 "$NET_STATE_FILE" 2>/dev/null)
-    prev_bytes=$(cut -d',' -f2 "$NET_STATE_FILE" 2>/dev/null)
-    prev_errs=$(cut -d',' -f3 "$NET_STATE_FILE" 2>/dev/null)
-    if [ -n "$prev_ts" ] && [ -n "$prev_bytes" ] && [ "$net_bytes" -gt 0 ]; then
-        elapsed=$((now_ts - prev_ts))
-        delta=$((net_bytes - prev_bytes))
-        if [ "$elapsed" -gt 0 ] && [ "$delta" -ge 0 ]; then
-            net=$(awk -v d="$delta" -v e="$elapsed" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
-        fi
-        if [ -n "$prev_errs" ]; then
-            delta_errs=$((net_errs_total - prev_errs))
-            [ "$delta_errs" -ge 0 ] && net_errors="$delta_errs"
+# An unreadable /proc/net/dev is "unknown", not a silent 0 B/s.
+net_json="null"
+net_errors_json="null"
+new_st_net=""
+if [ -n "$net_stats" ]; then
+    net_bytes=${net_stats%,*}
+    net_errs_total=${net_stats#*,}
+    if [ -n "$st_net" ] && [ "$net_bytes" -gt 0 ] 2>/dev/null; then
+        IFS=',' read -r prev_ts prev_bytes prev_errs <<< "$st_net"
+        if [ -n "$prev_ts" ] && [ -n "$prev_bytes" ]; then
+            elapsed=$((now_ts - prev_ts))
+            delta=$((net_bytes - prev_bytes))
+            if [ "$elapsed" -gt 0 ] && [ "$delta" -ge 0 ]; then
+                net_json=$(awk -v d="$delta" -v e="$elapsed" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
+            fi
+            if [ -n "$prev_errs" ]; then
+                delta_errs=$((net_errs_total - prev_errs))
+                [ "$delta_errs" -ge 0 ] && net_errors_json="$delta_errs"
+            fi
         fi
     fi
-fi
-echo "$now_ts,$net_bytes,$net_errs_total" > "$NET_STATE_FILE" 2>/dev/null || true
-
-net_json="null"
-if [ -n "$net" ]; then
-    net_json="$net"
-fi
-net_errors_json="null"
-if [ -n "$net_errors" ]; then
-    net_errors_json="$net_errors"
+    new_st_net="$now_ts,$net_bytes,$net_errs_total"
 fi
 
 # 3.6 Fork rate - nové procesy od posledního běhu (delta, ne rychlost za sekundu).
 # /proc/stat řádek "processes" je kumulativní čítač forků od bootu.
 total_forks=$(awk '/^processes / { print $2 }' /proc/stat 2>/dev/null)
 fork_rate_json="null"
+new_st_forks=""
 if [ -n "$total_forks" ]; then
-    if [ -f "$FORKRATE_STATE_FILE" ]; then
-        prev_forks=$(cat "$FORKRATE_STATE_FILE" 2>/dev/null)
-        if [ -n "$prev_forks" ]; then
-            delta_forks=$((total_forks - prev_forks))
-            [ "$delta_forks" -ge 0 ] && fork_rate_json="$delta_forks"
-        fi
+    if [ -n "$st_forks" ]; then
+        delta_forks=$((total_forks - st_forks))
+        [ "$delta_forks" -ge 0 ] && fork_rate_json="$delta_forks"
     fi
-    echo "$total_forks" > "$FORKRATE_STATE_FILE" 2>/dev/null || true
+    new_st_forks="$total_forks"
 fi
 
 # 3.65 TCP Retransmissions & Conntrack Count
@@ -400,45 +459,44 @@ if [ -d /sys/class/thermal ]; then
     fi
 fi
 
-# 3.8 Systémová identita (kešovaná v RAM pro eliminaci zbytečných procesů)
-ID_CACHE_FILE="/tmp/status-agent-vps-identity.cache"
-if [ -f "$ID_CACHE_FILE" ]; then
-    eval $(cat "$ID_CACHE_FILE" 2>/dev/null)
-else
-    sys_hostname=$(hostname 2>/dev/null || echo "")
-    sys_kernel=$(uname -r 2>/dev/null || echo "")
-    sys_timezone=""
-    if [ -f /etc/timezone ]; then
-        sys_timezone=$(cat /etc/timezone 2>/dev/null)
-    elif [ -L /etc/localtime ]; then
-        sys_timezone=$(readlink /etc/localtime 2>/dev/null | sed 's#.*zoneinfo/##')
-    fi
-    virtualization_json="null"
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        virt=$(systemd-detect-virt 2>/dev/null)
-        [ -n "$virt" ] && [ "$virt" != "none" ] && virtualization_json="\"$virt\""
-    fi
-    cloud_provider_json="null"
-    dmi_text=""
-    for dmi_file in /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/bios_vendor; do
-        [ -r "$dmi_file" ] && dmi_text="$dmi_text $(cat "$dmi_file" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
-    done
-    case "$dmi_text" in
-        *amazon*) cloud_provider_json="\"AWS\"" ;;
-        *google*) cloud_provider_json="\"Google Cloud\"" ;;
-        *microsoft*) cloud_provider_json="\"Azure\"" ;;
-        *digitalocean*) cloud_provider_json="\"DigitalOcean\"" ;;
-        *hetzner*) cloud_provider_json="\"Hetzner\"" ;;
-        *vultr*) cloud_provider_json="\"Vultr\"" ;;
-        *linode*) cloud_provider_json="\"Linode\"" ;;
-        *scaleway*) cloud_provider_json="\"Scaleway\"" ;;
-    esac
-    printf "sys_hostname='%s'\nsys_kernel='%s'\nsys_timezone='%s'\nvirtualization_json='%s'\ncloud_provider_json='%s'\n" \
-        "$sys_hostname" "$sys_kernel" "$sys_timezone" "$virtualization_json" "$cloud_provider_json" > "$ID_CACHE_FILE" 2>/dev/null || true
-    log_message "Načtena identita VPS: hostname=$sys_hostname kernel=$sys_kernel"
+# 3.8 System identity - computed every run. It is four cheap reads, and the
+# old cache in /tmp was eval'ed as root: a local user who created that file
+# first got a shell as the cron user.
+sys_hostname=$(hostname 2>/dev/null || echo "")
+sys_kernel=$(uname -r 2>/dev/null || echo "")
+sys_timezone=""
+if [ -f /etc/timezone ]; then
+    sys_timezone=$(cat /etc/timezone 2>/dev/null)
+elif [ -L /etc/localtime ]; then
+    sys_timezone=$(readlink /etc/localtime 2>/dev/null | sed 's#.*zoneinfo/##')
 fi
-reboot_required_json="false"
-[ -f /var/run/reboot-required ] && reboot_required_json="true"
+virtualization_json="null"
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    virt=$(systemd-detect-virt 2>/dev/null)
+    [ -n "$virt" ] && [ "$virt" != "none" ] && virtualization_json="\"$(json_str "$virt")\""
+fi
+cloud_provider_json="null"
+dmi_text=""
+for dmi_file in /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/bios_vendor; do
+    [ -r "$dmi_file" ] && dmi_text="$dmi_text $(tr '[:upper:]' '[:lower:]' < "$dmi_file" 2>/dev/null)"
+done
+case "$dmi_text" in
+    *amazon*) cloud_provider_json="\"AWS\"" ;;
+    *google*) cloud_provider_json="\"Google Cloud\"" ;;
+    *microsoft*) cloud_provider_json="\"Azure\"" ;;
+    *digitalocean*) cloud_provider_json="\"DigitalOcean\"" ;;
+    *hetzner*) cloud_provider_json="\"Hetzner\"" ;;
+    *vultr*) cloud_provider_json="\"Vultr\"" ;;
+    *linode*) cloud_provider_json="\"Linode\"" ;;
+    *scaleway*) cloud_provider_json="\"Scaleway\"" ;;
+esac
+# /var/run/reboot-required is a Debian/Ubuntu convention; anywhere else its
+# absence proves nothing, so the answer is null rather than a fabricated false.
+reboot_required_json="null"
+if [ -f /etc/debian_version ]; then
+    reboot_required_json="false"
+    [ -f /var/run/reboot-required ] && reboot_required_json="true"
+fi
 
 # 3b. Procesy, ktere nejvic zapisuji
 #
@@ -452,20 +510,27 @@ top_io_json="[]"
 io_accounting_json="false"
 if [ -r /proc/1/io ]; then
     io_accounting_json="true"
-    top_io_json=$(
-        for pid_dir in /proc/[0-9]*; do
-            pid=${pid_dir#/proc/}
-            [ -r "$pid_dir/io" ] || continue
-            wb=$(awk '/^write_bytes:/ {print $2}' "$pid_dir/io" 2>/dev/null)
-            [ -n "$wb" ] || continue
-            [ "$wb" -gt 0 ] 2>/dev/null || continue
-            name=$(awk '/^Name:/ {print $2}' "$pid_dir/status" 2>/dev/null)
-            [ -n "$name" ] || continue
-            echo "$wb|$pid|$name"
-        done | sort -t'|' -k1 -rn | head -5 | awk -F'|' '
-            { printf "%s{\"pid\":%s,\"name\":\"%s\",\"write_bytes\":%s}", (n++ ? "," : "["), $2, $3, $1 }
-            END { printf "%s", (n ? "]" : "[]") }'
-    )
+    # One awk over every readable /proc/<pid>/io instead of two forks per
+    # process - on a 300-process host that was ~600 forks a minute, the single
+    # biggest cost of this script. Readability is checked with the builtin
+    # test first so awk never trips over a file it cannot open.
+    io_files=()
+    for f in /proc/[0-9]*/io; do [ -r "$f" ] && io_files+=("$f"); done
+    if [ "${#io_files[@]}" -gt 0 ]; then
+        top_io_json=$(awk '
+            FNR == 1 { pid = FILENAME; sub(/^\/proc\//, "", pid); sub(/\/io$/, "", pid) }
+            /^write_bytes:/ {
+                wb = $2 + 0;
+                if (wb > 0) {
+                    cf = "/proc/" pid "/comm"; name = "";
+                    if ((getline name < cf) > 0) { close(cf) }
+                    if (name != "") print wb "|" pid "|" name;
+                }
+            }' "${io_files[@]}" 2>/dev/null | sort -t'|' -k1,1 -rn | head -5 | awk -F'|' '
+            { n = $3; gsub(/\\/, "\\\\", n); gsub(/"/, "\\\"", n); gsub(/[\t]/, " ", n);
+              printf "%s{\"pid\":%s,\"name\":\"%s\",\"write_bytes\":%s}", (c++ ? "," : "["), $2, n, $1 }
+            END { printf "%s", (c ? "]" : "[]") }')
+    fi
 fi
 [ -z "$top_io_json" ] && top_io_json="[]"
 
@@ -501,12 +566,26 @@ get_smart_status() {
             echo "OK (Nebyly detekovány fyzické disky)"
             return
         fi
+        sm_failed=""; sm_unknown=""
         for d in $drives; do
-            if ! smartctl -H "/dev/$d" 2>/dev/null | grep -q "PASSED"; then
-                echo "WARNING (Disk /dev/$d selhal v SMART)"
-                return
-            fi
+            sm_out=$(timeout 20 smartctl -H -n standby "/dev/$d" 2>/dev/null); sm_rc=$?
+            # Exit-status bit 3 is "DISK FAILING" (smartctl(8); 124 is timeout's
+            # own code). ATA drives print PASSED/FAILED, SCSI/SAS ones
+            # "SMART Health Status: OK" or a failure text.
+            if [ "$sm_rc" -ne 124 ] && [ $((sm_rc & 8)) -ne 0 ]; then sm_failed="$sm_failed $d"; continue; fi
+            case "$sm_out" in
+                *FAILED*) sm_failed="$sm_failed $d" ;;
+                *"Health Status: OK"*|*PASSED*) : ;;
+                *"Health Status:"*) sm_failed="$sm_failed $d" ;;
+                # No verdict: virtio disk, unsupported bridge, not root, standby.
+                # Reporting that as WARNING painted healthy VPS disks red for months.
+                *) sm_unknown="$sm_unknown $d" ;;
+            esac
         done
+        # A failing disk wins even when another gave no verdict - an early
+        # return on the first silent drive used to hide the failing one behind it.
+        if [ -n "$sm_failed" ]; then echo "WARNING (Disk /dev/${sm_failed# } selhal v SMART)"; return; fi
+        if [ -n "$sm_unknown" ]; then echo "N/A (SMART nedostupné pro /dev/$(echo "${sm_unknown# }" | sed 's| |, /dev/|g'))"; return; fi
         echo "OK"
     else
         echo "N/A (smartctl chybí)"
@@ -523,147 +602,71 @@ get_os_version() {
     echo "$(uname -s) $(uname -r)"
 }
 os_version=$(get_os_version)
-smart=$(get_smart_status)
 
-# 6. Aktivní naslouchající porty
-ports_list=""
+# 6. Listening ports - straight out of awk, joined once.
+ports_json=""
 if [ -f /proc/net/tcp ]; then
-    ports_raw=$(awk '
+    ports_json=$(awk '
     NR > 1 && ($4 == "0A" || $4 == "07") {
-        split($2, addr, ":");
-        hex = addr[2];
-        dec = 0;
-        for (i=1; i<=length(hex); i++) {
-            c = substr(hex, i, 1);
-            val = index("0123456789abcdef", tolower(c)) - 1;
-            dec = dec * 16 + val;
-        }
-        port = dec;
-        if (port > 0 && port < 65536) {
-            print port;
-        }
-    }' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null | sort -un)
-    
-    for p in $ports_raw; do
-        if [ -z "$ports_list" ]; then
-            ports_list="$p"
-        else
-            ports_list="$ports_list, $p"
-        fi
-    done
+        split($2, addr, ":"); hex = addr[2]; dec = 0;
+        for (i = 1; i <= length(hex); i++) { dec = dec * 16 + index("0123456789abcdef", tolower(substr(hex, i, 1))) - 1 }
+        if (dec > 0 && dec < 65536) print dec;
+    }' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null | sort -un | awk '{ printf "%s%s", (n++ ? ", " : ""), $1 }')
 fi
 
-ports_json=""
-IFS=',' read -r -a ports_arr <<< "$ports_list"
-for p in "${ports_arr[@]}"; do
-    p_trim=$(echo -n "$p" | tr -d '[:space:]')
-    if [ -n "$p_trim" ]; then
-        if [ -z "$ports_json" ]; then
-            ports_json="$p_trim"
-        else
-            ports_json="$ports_json, $p_trim"
-        fi
-    fi
-done
+# 7. One process snapshot for everything below - the process list, zombies,
+# the top-CPU/RAM lists and the TS3 PID. It used to be four separate `ps` runs
+# plus a fork or two per listed process. `comm` goes last so a name with
+# spaces ("tmux: server") cannot shift the numeric columns.
+bk_ps_raw=$(ps -eo pid=,ppid=,stat=,%cpu=,rss=,comm= 2>/dev/null)
 
-# 7. Běžící procesy
 process_list=""
-while read -r proc; do
-    proc_clean=$(echo -n "$proc" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    if [ -n "$proc_clean" ]; then
-        if [ -z "$process_list" ]; then
-            process_list="\"$proc_clean\""
-        else
-            process_list="$process_list, \"$proc_clean\""
-        fi
-    fi
-done <<EOF
-$(ps -eo comm 2>/dev/null | tail -n +2 | sort -u)
-EOF
-
-# 7.1 Zombie procesy a TOP RAM procesy (přes 'ps', stejná závislost jako výše).
-# TOP CPU procesy se v bash verzi nepočítají - přesné "právě teď" řazení by
-# vyžadovalo dvojité procházení /proc pro každý PID (drahé/pomalé v shellu);
-# pro plný přehled procesů použijte Python agenta. Zombie a TOP RAM jsou levné
-# (jeden běh 'ps'), proto zůstávají i v bash verzi.
 zombie_count_json="null"
-zc=$(ps -eo stat= 2>/dev/null | grep -c '^Z')
-[ -n "$zc" ] && zombie_count_json="$zc"
+if [ -n "$bk_ps_raw" ]; then
+    process_list=$(printf '%s\n' "$bk_ps_raw" | awk '
+        { name = $6; for (i = 7; i <= NF; i++) name = name " " $i; print name }' | sort -u | awk '
+        { n = $0; gsub(/\\/, "\\\\", n); gsub(/"/, "\\\"", n); gsub(/[\t]/, " ", n);
+          printf "%s\"%s\"", (c++ ? ", " : ""), n }')
+    # ps answered, so a count of zero zombies is a measurement here.
+    zombie_count_json=$(printf '%s\n' "$bk_ps_raw" | awk '$3 ~ /^Z/ { z++ } END { print (z ? z : 0) }')
+fi
 
-# Mereni nesmi byt videt ve vysledku mereni.
-#
-# `ps` a pomocne procesy agenta se objevovaly v zebricku jako bezni zradci
-# CPU - na OpenWrt routeru koncil sampler dokonce na prvnim miste, takze panel
-# "co v tu chvili bezelo" odpovidal, ze spicku zpusobil nas vlastni agent.
-#
-# Filtruje se podle PID, ne podle jmena: rucne spusteny `top` nebo `ps`, ktery
-# opravdu zere CPU, ma zustat videt. Nase jsou jen tenhle skript a to, co
-# prave spustil.
-# Mereni nesmi byt videt ve vysledku mereni.
-#
-# `ps` a pomocne procesy agenta koncily v zebricku jako bezni zradci CPU - na
-# routeru dokonce na prvnim miste, takze panel "co v tu chvili bezelo"
-# odpovidal, ze spicku zpusobil nas vlastni agent.
-#
-# Rodicovstvi se cte ze STEJNEHO snimku, ve kterem se meri. Dohledavat ho
-# potom uz nejde: `ps` uvnitr $(...) skonci driv, nez se dostaneme k filtrovani,
-# takze `ps -o ppid= -p <pid>` nevrati nic a proces by prosel jako cizi.
-# Overeno v kontejneru - prvni dve verze tohohle filtru presne takhle selhaly.
-#
-# Filtruje se podle PID, ne podle jmena: rucne spusteny `top`, ktery opravdu
-# zere CPU, ma zustat videt.
-bk_ps_snapshot=$(ps -eo pid,ppid,comm,%cpu,rss 2>/dev/null | tail -n +2 | awk -v self="$$" '
-    { ppid[$1] = $2; line[$1] = $0 }
-    END {
-        for (p in line) {
-            q = p; depth = 0; ours = 0;
-            # Strop na osmi krocich: init ma PPID 0 a cyklus tam skonci sam,
-            # ale poskozeny snimek nesmi zacyklit agenta.
-            while (q != "" && q != "0" && depth < 8) {
-                if (q == self) { ours = 1; break }
-                q = ppid[q]; depth++;
+# The agent's own process tree must not show up in its own ranking (the
+# sampler used to top the list on routers). Parentage comes from the same
+# snapshot; a later lookup would find the helpers already gone.
+bk_ps_snapshot=""
+if [ -n "$bk_ps_raw" ]; then
+    bk_ps_snapshot=$(printf '%s\n' "$bk_ps_raw" | awk -v self="$$" '
+        { ppid[$1] = $2; line[$1] = $0 }
+        END {
+            for (p in line) {
+                q = p; depth = 0; ours = 0;
+                while (q != "" && q != "0" && depth < 8) {
+                    if (q == self) { ours = 1; break }
+                    q = ppid[q]; depth++;
+                }
+                if (!ours) print line[p];
             }
-            if (!ours) print line[p];
-        }
-    }')
+        }')
+fi
 
-top_cpu_json=""
-while read -r cline; do
-    [ -z "$cline" ] && continue
-    cname=$(echo "$cline" | awk '{print $3}')
-    ccpu=$(echo "$cline" | awk '{print $4}')
-    crss_kb=$(echo "$cline" | awk '{print $5}')
-    [ -z "$ccpu" ] && continue
-    cname_clean=$(echo -n "$cname" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    # Obe hodnoty do obou zebricku - jinak ma kazda radka v tabulce jednu
-    # bunku prazdnou. Chybejici hodnota zustava null, ne nula.
-    cram_mb="null"
-    [ -n "$crss_kb" ] && cram_mb=$(awk -v k="$crss_kb" 'BEGIN { printf "%.1f", k/1024 }')
-    if [ -n "$top_cpu_json" ]; then
-        top_cpu_json="$top_cpu_json, "
-    fi
-    top_cpu_json="$top_cpu_json{\"name\": \"$cname_clean\", \"cpu\": $ccpu, \"ram_mb\": $cram_mb}"
-done <<EOF
-$(printf '%s\n' "$bk_ps_snapshot" | sort -k4 -rn | head -n 5)
-EOF
-
-top_ram_json=""
-while read -r rline; do
-    [ -z "$rline" ] && continue
-    rname=$(echo "$rline" | awk '{print $3}')
-    rcpu=$(echo "$rline" | awk '{print $4}')
-    rrss_kb=$(echo "$rline" | awk '{print $5}')
-    [ -z "$rrss_kb" ] && continue
-    rname_clean=$(echo -n "$rname" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    rram_mb=$(awk -v k="$rrss_kb" 'BEGIN { printf "%.1f", k/1024 }')
-    [ -z "$rcpu" ] && rcpu="null"
-    if [ -n "$top_ram_json" ]; then
-        top_ram_json="$top_ram_json, "
-    fi
-    top_ram_json="$top_ram_json{\"name\": \"$rname_clean\", \"ram_mb\": $rram_mb, \"cpu\": $rcpu}"
-done <<EOF
-$(printf '%s\n' "$bk_ps_snapshot" | sort -k5 -rn | head -n 5)
-EOF
+# Top lists built inside awk - no per-line forks. Both values in both lists so
+# no cell in the table stays empty; a value ps did not give is null, never 0.
+bk_top_json() {  # $1 = sort column: 4 = %cpu, 5 = rss
+    printf '%s\n' "$bk_ps_snapshot" | sort -k"$1","$1" -rn | head -n 5 | awk '
+        NF >= 6 {
+            name = $6; for (i = 7; i <= NF; i++) name = name " " $i;
+            gsub(/\\/, "\\\\", name); gsub(/"/, "\\\"", name); gsub(/[\t]/, " ", name);
+            cpu = ($4 ~ /^[0-9.]+$/) ? $4 : "null";
+            ram = ($5 ~ /^[0-9]+$/) ? sprintf("%.1f", $5 / 1024) : "null";
+            printf "%s{\"name\": \"%s\", \"cpu\": %s, \"ram_mb\": %s}", (c++ ? ", " : ""), name, cpu, ram
+        }'
+}
+top_cpu_json=""; top_ram_json=""
+if [ -n "$bk_ps_snapshot" ]; then
+    top_cpu_json=$(bk_top_json 4)
+    top_ram_json=$(bk_top_json 5)
+fi
 
 # 7.5 Zjištění TeamSpeak statistik (telnet query na localhost)
 ts3_json_list=""
@@ -671,12 +674,12 @@ for q_port in 10011 8219; do
     # Kontrola zda port naslouchá
     if [[ ", $ports_json," =~ ", $q_port," ]] || [[ "$ports_json" =~ ^$q_port, ]] || [[ "$ports_json" =~ ,$q_port$ ]] || [ "$ports_json" = "$q_port" ]; then
         if exec 3<>/dev/tcp/127.0.0.1/$q_port; then
-            read -r line <&3
-            read -r line <&3
+            read -r -t 5 line <&3
+            read -r -t 5 line <&3
             echo -e "serverlist\nquit" >&3
             
             response=""
-            while read -r line <&3; do
+            while read -r -t 5 line <&3; do
                 response="$response $line"
                 if [[ "$line" =~ error\ id= ]]; then
                     break
@@ -769,12 +772,12 @@ for q_port in 10011 8219; do
                 for v_port in "${udp_arr[@]}"; do
                     if [ -n "$v_port" ]; then
                         if exec 3<>/dev/tcp/127.0.0.1/$q_port; then
-                            read -r line <&3
-                            read -r line <&3
+                            read -r -t 5 line <&3
+                            read -r -t 5 line <&3
                             echo -e "use port=$v_port\nserverinfo\nquit" >&3
                             
                             response=""
-                            while read -r line <&3; do
+                            while read -r -t 5 line <&3; do
                                 response="$response $line"
                                 if [[ "$line" =~ error\ id= ]]; then
                                     break
@@ -812,66 +815,50 @@ done
 # 7.6 TeamSpeak proces (PID/CPU/RAM/vlákna/otevřené FD) - detekce restartu (změna PID
 # mezi hlášeními) se dělá na serveru (agent_api.php), agent jen hlásí aktuální stav.
 ts3_pid=""
-if command -v pgrep >/dev/null 2>&1; then
-    ts3_pid=$(pgrep -x ts3server | head -n1)
-else
-    for p in /proc/[0-9]*; do
-        if [ -r "$p/comm" ] && [ "$(cat "$p/comm" 2>/dev/null)" = "ts3server" ]; then
-            ts3_pid=$(basename "$p")
-            break
-        fi
-    done
+if [ -n "$bk_ps_raw" ]; then
+    ts3_pid=$(printf '%s\n' "$bk_ps_raw" | awk '$6 == "ts3server" { print $1; exit }')
 fi
 
 ts3_process_json="null"
+new_st_ts3=""
 if [ -n "$ts3_pid" ] && [ -d "/proc/$ts3_pid" ]; then
     clk_tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
-    read_ts3_stat() {
-        raw=$(cat "/proc/$ts3_pid/stat" 2>/dev/null)
-        echo "$raw" | sed 's/^[0-9]* (.*) //'
-    }
-    ts3_stat1=$(read_ts3_stat)
-    sleep 1
-    ts3_stat2=$(read_ts3_stat)
-
-    ts3_cpu=$(awk -v s1="$ts3_stat1" -v s2="$ts3_stat2" -v tck="$clk_tck" '
-    BEGIN {
-        n1 = split(s1, a1);
-        n2 = split(s2, a2);
-        if (n1 < 13 || n2 < 13) { print 0.0; exit; }
-        delta = (a2[12] + a2[13]) - (a1[12] + a1[13]);
-        if (tck == 0) tck = 100;
-        printf "%.1f", (delta / tck) * 100;
-    }')
-
-    ts3_uptime=0
-    if [ -f /proc/uptime ] && [ -n "$ts3_stat2" ]; then
-        host_uptime=$(awk '{print $1}' /proc/uptime)
-        ts3_uptime=$(awk -v s2="$ts3_stat2" -v hu="$host_uptime" -v tck="$clk_tck" '
-        BEGIN {
-            n2 = split(s2, a2);
-            if (n2 < 20) { print 0; exit; }
-            if (tck == 0) tck = 100;
-            u = hu - (a2[20] / tck);
-            if (u < 0) u = 0;
-            printf "%.0f", u;
-        }')
+    ts3_stat=$(sed 's/^[0-9]* (.*) //' "/proc/$ts3_pid/stat" 2>/dev/null)
+    # CPU as a delta against the previous run of the same PID, like the host
+    # CPU - the 1-second sleep this used to take made every run a second longer.
+    ts3_cpu="null"
+    ts3_ticks=""
+    if [ -n "$ts3_stat" ]; then
+        ts3_ticks=$(awk -v s="$ts3_stat" 'BEGIN { n = split(s, a); if (n >= 13) print a[12] + a[13] }')
+        if [ -n "$ts3_ticks" ] && [ -n "$st_ts3" ]; then
+            IFS=',' read -r prev_ts3_pid prev_ts3_ticks prev_ts3_ts <<< "$st_ts3"
+            if [ "$prev_ts3_pid" = "$ts3_pid" ] && [ -n "$prev_ts3_ticks" ] && [ -n "$prev_ts3_ts" ]; then
+                ts3_cpu=$(awk -v t1="$prev_ts3_ticks" -v t2="$ts3_ticks" -v s1="$prev_ts3_ts" -v s2="$now_ts" -v tck="$clk_tck" '
+                BEGIN { dt = s2 - s1; if (tck <= 0) tck = 100; if (dt > 0 && t2 >= t1) printf "%.1f", ((t2 - t1) / tck) / dt * 100 }')
+                [ -z "$ts3_cpu" ] && ts3_cpu="null"
+            fi
+        fi
+        [ -n "$ts3_ticks" ] && new_st_ts3="$ts3_pid,$ts3_ticks,$now_ts"
     fi
-
-    ts3_ram_mb="0"
-    ts3_threads="0"
-    if [ -f "/proc/$ts3_pid/status" ]; then
+    ts3_uptime="null"
+    if [ -n "$ts3_stat" ] && [ -r /proc/uptime ]; then
+        host_uptime=$(awk '{print $1}' /proc/uptime)
+        ts3_uptime=$(awk -v s2="$ts3_stat" -v hu="$host_uptime" -v tck="$clk_tck" '
+        BEGIN { n = split(s2, a); if (n >= 20) { if (tck <= 0) tck = 100; u = hu - (a[20] / tck); if (u < 0) u = 0; printf "%.0f", u } }')
+        [ -z "$ts3_uptime" ] && ts3_uptime="null"
+    fi
+    # Unreadable /proc entries (not root) are unknown, not zero.
+    ts3_ram_mb="null"; ts3_threads="null"; ts3_fds="null"
+    if [ -r "/proc/$ts3_pid/status" ]; then
         ts3_ram_mb=$(awk '/^VmRSS:/ { printf "%.1f", $2/1024 }' "/proc/$ts3_pid/status")
         ts3_threads=$(awk '/^Threads:/ { print $2 }' "/proc/$ts3_pid/status")
+        [ -z "$ts3_ram_mb" ] && ts3_ram_mb="null"
+        [ -z "$ts3_threads" ] && ts3_threads="null"
     fi
-    [ -z "$ts3_ram_mb" ] && ts3_ram_mb="0"
-    [ -z "$ts3_threads" ] && ts3_threads="0"
-
-    ts3_fds="0"
-    if [ -d "/proc/$ts3_pid/fd" ]; then
-        ts3_fds=$(ls "/proc/$ts3_pid/fd" 2>/dev/null | wc -l | tr -d ' ')
+    if [ -r "/proc/$ts3_pid/fd" ]; then
+        ts3_fds=$(find "/proc/$ts3_pid/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+        [ -z "$ts3_fds" ] && ts3_fds="null"
     fi
-
     ts3_process_json="{\"pid\": $ts3_pid, \"cpu\": $ts3_cpu, \"ram_mb\": $ts3_ram_mb, \"threads\": $ts3_threads, \"open_fds\": $ts3_fds, \"uptime_sec\": $ts3_uptime}"
 fi
 
@@ -880,20 +867,31 @@ discovered_json=""
 detect_svc() {
     local name="$1" stype="$2" port="$3" proc="$4" cfg="$5"
     local conf=0 ev="" miss=""
+    # The process list is `"a", "b"` and the port list `22, 80` - the old
+    # patterns (`,nginx,` and `, 80,`) never matched the quotes and skipped
+    # the first port, so process evidence was never awarded on any bash agent.
+    local procs_flat=",${process_list//\"/},"
+    procs_flat=${procs_flat//, /,}
+    local ports_flat=",${ports_json//, /,},"
+    local port_hit=0
+    [ -n "$port" ] && case "$ports_flat" in *",$port,"*) port_hit=1 ;; esac
     # Process (30)
-    if [ -n "$proc" ] && echo ",$process_list," | grep -qi ",$proc,"; then
-        conf=$((conf+30)); ev="${ev}\"process\","
-    elif [ -n "$proc" ]; then miss="${miss}\"process\","; fi
+    if [ -n "$proc" ]; then
+        case "$procs_flat" in
+            *",$proc,"*) conf=$((conf+30)); ev="${ev}\"process\"," ;;
+            *) miss="${miss}\"process\"," ;;
+        esac
+    fi
     # Port (25)
-    if [ -n "$port" ] && echo ",$ports_json," | grep -q ", $port,"; then
-        conf=$((conf+25)); ev="${ev}\"port\","
-    elif [ -n "$port" ]; then miss="${miss}\"port\","; fi
+    if [ -n "$port" ]; then
+        if [ "$port_hit" = "1" ]; then conf=$((conf+25)); ev="${ev}\"port\","; else miss="${miss}\"port\","; fi
+    fi
     # Config (25)
     if [ -n "$cfg" ] && [ -e "$cfg" ]; then
         conf=$((conf+25)); ev="${ev}\"config\","
     elif [ -n "$cfg" ]; then miss="${miss}\"config\","; fi
     # Active (19) - port listening = active
-    if [ -n "$port" ] && echo ",$ports_json," | grep -q ", $port,"; then
+    if [ "$port_hit" = "1" ]; then
         conf=$((conf+19)); ev="${ev}\"active_verify\","
     else miss="${miss}\"active_verify\","; fi
     [ $conf -gt 99 ] && conf=99
@@ -902,14 +900,47 @@ detect_svc() {
     local entry="{\"name\": \"$name\", \"type\": \"$stype\", \"port\": ${port:-null}, \"confidence\": $conf, \"evidence\": [$ev], \"missing\": [$miss]}"
     if [ -z "$discovered_json" ]; then discovered_json="$entry"; else discovered_json="$discovered_json, $entry"; fi
 }
-detect_svc "TeamSpeak" "teamspeak" 10011 "ts3server" ""
-detect_svc "Minecraft" "minecraft" 25565 "java" ""
-detect_svc "Nginx" "nginx" 80 "nginx" "/etc/nginx/nginx.conf"
-detect_svc "Docker" "docker" "" "dockerd" "/var/run/docker.sock"
-detect_svc "PostgreSQL" "postgresql" 5432 "postgres" "/etc/postgresql"
-detect_svc "AdGuard Home" "adguard" 3000 "AdGuardHome" ""
-detect_svc "WireGuard" "wireguard" 51820 "" "/etc/wireguard"
-detect_svc "Mosquitto" "mosquitto" 1883 "mosquitto" "/etc/mosquitto/mosquitto.conf"
+# --- The expensive checks, on a schedule (HEAVY_OP_INTERVAL_HOURS) ---------
+# SMART wakes disks and costs 50-300 ms per drive, the discovery runs eight
+# probes, a USB count changes about never. Their last result lives in a small
+# cache next to the script and is refreshed once per interval - the way the
+# OpenWrt agent has worked since 1.5.x. This setting was advertised in --help
+# for months while nothing read it.
+heavy_due=1
+if [ -f "$HEAVY_CACHE_FILE" ]; then
+    heavy_min=$(( ${HEAVY_OP_INTERVAL_HOURS:-24} * 60 ))
+    [ "$heavy_min" -lt 1 ] 2>/dev/null && heavy_min=1
+    [ -z "$(find "$HEAVY_CACHE_FILE" -mmin +"$heavy_min" 2>/dev/null)" ] && heavy_due=0
+fi
+smart="N/A"; usb_devices_json="null"; discovered_json=""
+if [ "$heavy_due" = "1" ]; then
+    smart=$(get_smart_status)
+    if [ -d /sys/bus/usb/devices ]; then
+        # Entries like 1-1 are devices; 1-0:1.0 are interfaces (one per root hub
+        # even with nothing plugged in) and usb1 the hubs themselves - excluded.
+        usb_devices_json=$(find /sys/bus/usb/devices -mindepth 1 -maxdepth 1 -name '[0-9]*-[0-9]*' ! -name '*:*' 2>/dev/null | wc -l | tr -d ' ')
+        [ -z "$usb_devices_json" ] && usb_devices_json="null"
+    fi
+    detect_svc "TeamSpeak" "teamspeak" 10011 "ts3server" ""
+    detect_svc "Minecraft" "minecraft" 25565 "java" ""
+    detect_svc "Nginx" "nginx" 80 "nginx" "/etc/nginx/nginx.conf"
+    detect_svc "Docker" "docker" "" "dockerd" "/var/run/docker.sock"
+    detect_svc "PostgreSQL" "postgresql" 5432 "postgres" "/etc/postgresql"
+    detect_svc "AdGuard Home" "adguard" 3000 "AdGuardHome" ""
+    detect_svc "WireGuard" "wireguard" 51820 "" "/etc/wireguard"
+    detect_svc "Mosquitto" "mosquitto" 1883 "mosquitto" "/etc/mosquitto/mosquitto.conf"
+    { printf 'smart\t%s\nusb\t%s\ndiscovered\t%s\n' "$smart" "$usb_devices_json" "$discovered_json"; } > "$HEAVY_CACHE_FILE.tmp" 2>/dev/null \
+        && mv "$HEAVY_CACHE_FILE.tmp" "$HEAVY_CACHE_FILE" 2>/dev/null
+else
+    while IFS=$'\t' read -r hk hv; do
+        case "$hk" in
+            smart) smart="$hv" ;;
+            usb) usb_devices_json="$hv" ;;
+            discovered) discovered_json="$hv" ;;
+        esac
+    done < "$HEAVY_CACHE_FILE"
+fi
+[ -z "$usb_devices_json" ] && usb_devices_json="null"
 
 # 8. Sestavení JSON payloadu
 
@@ -919,7 +950,9 @@ tailscale_peers_json="null"
 if command -v tailscale >/dev/null 2>&1; then
     ts_json=$(tailscale status --json 2>/dev/null)
     if [ -n "$ts_json" ]; then
-        echo "$ts_json" | grep -q '"BackendState":"Running"' && tailscale_up_json=true || tailscale_up_json=false
+        # `tailscale status --json` is indented ("BackendState": "Running") -
+        # the old pattern without the space never matched, so this was always false.
+        echo "$ts_json" | grep -Eq '"BackendState": *"Running"' && tailscale_up_json=true || tailscale_up_json=false
         tailscale_peers_json=$(echo "$ts_json" | grep -c '"TailscaleIPs"')
         # Self je v JSONu taky - odecist
         [ "$tailscale_peers_json" -gt 0 ] 2>/dev/null && tailscale_peers_json=$((tailscale_peers_json - 1))
@@ -928,8 +961,9 @@ fi
 
 zerotier_networks_json="null"
 if command -v zerotier-cli >/dev/null 2>&1; then
-    zerotier_networks_json=$(zerotier-cli listnetworks 2>/dev/null | grep -c " OK ")
-    [ -z "$zerotier_networks_json" ] && zerotier_networks_json=0
+    # `grep -c` prints 0 on empty input, so a daemon that is down looked like
+    # "0 networks"; the count is taken only when the CLI actually answered.
+    zt_out=$(zerotier-cli listnetworks 2>/dev/null) && zerotier_networks_json=$(printf '%s\n' "$zt_out" | grep -c " OK ")
 fi
 
 ups_status_json="null"
@@ -946,16 +980,16 @@ if command -v upsc >/dev/null 2>&1; then
 fi
 
 # --- Parita s OpenWrt agentem v1.5.4: OOM, boot time, DNS latence, OpenVPN, USB ---
+# OOM kills from /proc/vmstat (kernel 4.13+): one small read, monotonic since
+# boot. The old `dmesg | grep -c` scanned the whole ring buffer every minute,
+# counted each kill twice (two log lines per event), shrank when the buffer
+# wrapped, and printed 0 when dmesg was not readable at all.
 oom_kills_json="null"
-if command -v dmesg >/dev/null 2>&1; then
-    oom_kills_json=$(dmesg 2>/dev/null | grep -ci "oom-killer\|Out of memory")
-    # Prazdny vystup znamena, ze dmesg nesel precist (prava, jaderna volba) -
-    # to neni "zadne OOM zabiti", to je "nevime".
-    [ -z "$oom_kills_json" ] && oom_kills_json="null"
-fi
+oom_line=$(awk '/^oom_kill / { print $2 }' /proc/vmstat 2>/dev/null)
+[ -n "$oom_line" ] && oom_kills_json="$oom_line"
 
 boot_time_json="null"
-[ -n "$uptime" ] && [ "$uptime" -gt 0 ] 2>/dev/null && boot_time_json=$(( $(date +%s) - uptime ))
+[ -n "$uptime" ] && [ "$uptime" -gt 0 ] 2>/dev/null && boot_time_json=$(( now_ts - uptime ))
 
 # DNS latence pres lokalni resolver (getent/nslookup s time); bez naradi null.
 dns_latency_ms_json="null"
@@ -963,9 +997,15 @@ if command -v nslookup >/dev/null 2>&1; then
     dns_t0=$(date +%s%N 2>/dev/null)
     case "$dns_t0" in *N) dns_t0="";; esac
     if [ -n "$dns_t0" ]; then
-        nslookup example.com >/dev/null 2>&1
+        # Bounded: a dead resolver used to stall the whole report for nslookup's
+        # full retry sequence. A failed lookup has no latency, so null.
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 3 nslookup example.com >/dev/null 2>&1 && dns_ok=1 || dns_ok=0
+        else
+            nslookup example.com >/dev/null 2>&1 && dns_ok=1 || dns_ok=0
+        fi
         dns_t1=$(date +%s%N)
-        dns_latency_ms_json=$(( (dns_t1 - dns_t0) / 1000000 ))
+        [ "$dns_ok" = "1" ] && dns_latency_ms_json=$(( (dns_t1 - dns_t0) / 1000000 ))
     fi
 fi
 
@@ -975,18 +1015,12 @@ if command -v pidof >/dev/null 2>&1; then
     [ -z "$openvpn_tunnels_json" ] && openvpn_tunnels_json=0
 fi
 
-usb_devices_json="null"
-if [ -d /sys/bus/usb/devices ]; then
-    usb_devices_json=$(ls /sys/bus/usb/devices 2>/dev/null | grep -c '^[0-9]*-[0-9]')
-    [ -z "$usb_devices_json" ] && usb_devices_json=0
-fi
-
 payload=$(cat <<EOF
 {
-  "agent_key": "$AGENT_KEY",
+  "agent_key": "$(json_str "$AGENT_KEY")",
   "agent_type": "bash",
   "version": "$AGENT_VERSION",
-  "os": "$os_version",
+  "os": "$(json_str "$os_version")",
   "cpu": $cpu,
   "cpu_steal": $cpu_steal,
   "iowait": $iowait,
@@ -1011,7 +1045,7 @@ payload=$(cat <<EOF
   "top_io_processes": $top_io_json,
   "io_accounting": $io_accounting_json,
   "uptime": $uptime,
-  "smart": "$smart",
+  "smart": "$(json_str "$smart")",
   "ports": [$ports_json],
   "processes": [$process_list],
   "teamspeak_servers": [$ts3_json_list],
@@ -1019,15 +1053,13 @@ payload=$(cat <<EOF
   "zombie_count": $zombie_count_json,
   "top_cpu_processes": [$top_cpu_json],
   "top_ram_processes": [$top_ram_json],
-  "hostname": "$sys_hostname",
-  "kernel": "$sys_kernel",
-  "timezone": "$sys_timezone",
+  "hostname": "$(json_str "$sys_hostname")",
+  "kernel": "$(json_str "$sys_kernel")",
+  "timezone": "$(json_str "$sys_timezone")",
   "reboot_required": $reboot_required_json,
   "cloud_provider": $cloud_provider_json,
   "tcp_retrans": $tcp_retrans_json,
   "conntrack_count": $conntrack_count_json,
-  "disk_read_kb": $disk_io_read,
-  "disk_write_kb": $disk_io_write,
   "virtualization": $virtualization_json,
   "tailscale_up": $tailscale_up_json,
   "tailscale_peers": $tailscale_peers_json,
@@ -1045,9 +1077,26 @@ payload=$(cat <<EOF
 EOF
 )
 
+# This run's counters, one atomic write, only what was actually measured.
+{
+    printf 'boot_id=%s\n' "$cur_boot_id"
+    if [ -n "$new_st_cpu" ]; then printf 'cpu=%s\n' "$new_st_cpu"; fi
+    if [ -n "$new_st_diskio" ]; then printf 'diskio=%s\n' "$new_st_diskio"; fi
+    if [ -n "$new_st_net" ]; then printf 'net=%s\n' "$new_st_net"; fi
+    if [ -n "$new_st_forks" ]; then printf 'forks=%s\n' "$new_st_forks"; fi
+    if [ -n "$new_st_ts3" ]; then printf 'ts3=%s\n' "$new_st_ts3"; fi
+} > "$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null \
+    || log_message "VAROVANI: stav se nepodarilo ulozit do $STATE_FILE - delta metriky (CPU, sit, disk) zustanou null."
+
+if [ "$DRY_RUN" = "1" ]; then
+    printf '%s\n' "$payload"
+    log_debug "Rezim --dry-run: data se neodesilaji."
+    exit 0
+fi
+
 net_log="N/A (první běh)"
-if [ -n "$net" ]; then
-    net_log="${net} KB/s"
+if [ "$net_json" != "null" ]; then
+    net_log="${net_json} KB/s"
 fi
 log_debug "Metriky - OS: $os_version, CPU: $cpu% (steal $cpu_steal%), RAM: $ram% (swap $swap%), HDD: $hdd%, Load: $load1/$load5/$load15, Síť: $net_log, Uptime: ${uptime}s, SMART: $smart, Porty: [$ports_json]"
 log_debug "Odesílám data na $API_URL..."
@@ -1056,12 +1105,12 @@ http_code=""
 body=""
 
 if command -v curl >/dev/null 2>&1; then
-    response=$(curl -s -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d "$payload" "$API_URL")
+    response=$(curl -s -m 30 --connect-timeout 10 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d "$payload" "$API_URL")
     http_code=$(echo "$response" | tail -n 1)
     body=$(echo "$response" | head -n -1)
 elif command -v wget >/dev/null 2>&1; then
     headers_file=$(mktemp /tmp/status-wget-hdr.XXXXXX 2>/dev/null || echo "/tmp/status-wget-hdr-$$")
-    body=$(wget --post-data="$payload" --header="Content-Type: application/json" --server-response -q -O - "$API_URL" 2>"$headers_file")
+    body=$(wget -T 30 -t 2 --post-data="$payload" --header="Content-Type: application/json" --server-response -q -O - "$API_URL" 2>"$headers_file")
     http_code=$(grep -E '^[[:space:]]*HTTP/' "$headers_file" | tail -n 1 | awk '{print $2}')
     rm -f "$headers_file"
 else
@@ -1098,7 +1147,7 @@ if [ "$http_code" = "200" ]; then
         act_nonce=$(echo "$body" | awk -F'"nonce":' '{print $2}' | awk -F'[,"]' '{print $2}' | tr -d '[:space:]')
 
         if [ -n "$act_id" ] && [ -n "$act_type" ] && [ -n "$act_ts" ] && [ -n "$act_sig" ]; then
-            now_ts=$(date +%s 2>/dev/null || echo 0)
+            now_ts=$(bk_now)
             time_diff=$((now_ts - act_ts))
             [ $time_diff -lt 0 ] && time_diff=$(( -time_diff ))
 
@@ -1110,7 +1159,10 @@ if [ "$http_code" = "200" ]; then
                         if command -v openssl >/dev/null 2>&1; then
                             calc_sig=$(echo -n "$calc_str" | openssl dgst -sha256 -hmac "$AGENT_KEY" 2>/dev/null | awk '{print $NF}')
                         elif command -v python3 >/dev/null 2>&1; then
-                            calc_sig=$(python3 -c "import hmac, hashlib; print(hmac.new(b'$AGENT_KEY', b'$calc_str', hashlib.sha256).hexdigest())" 2>/dev/null)
+                            # Via the environment, not interpolated into Python source:
+                            # the nonce comes from the server and a quote in it would
+                            # have been code running as root.
+                            calc_sig=$(BK_KEY="$AGENT_KEY" BK_MSG="$calc_str" python3 -c "import hmac, hashlib, os; print(hmac.new(os.environ['BK_KEY'].encode(), os.environ['BK_MSG'].encode(), hashlib.sha256).hexdigest())" 2>/dev/null)
                         fi
 
                         if [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
@@ -1184,9 +1236,9 @@ if [ "$AUTO_UPDATE" = "1" ]; then
 
             download_ok=0
             if command -v curl >/dev/null 2>&1; then
-                curl -fsS -o "$tmp_file" "$update_url" && download_ok=1
+                curl -fsS -m 60 --connect-timeout 10 -o "$tmp_file" "$update_url" && download_ok=1
             elif command -v wget >/dev/null 2>&1; then
-                wget -q -O "$tmp_file" "$update_url" && download_ok=1
+                wget -q -T 60 -t 2 -O "$tmp_file" "$update_url" && download_ok=1
             fi
 
             if [ "$download_ok" = "1" ]; then

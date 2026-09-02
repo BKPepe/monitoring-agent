@@ -1,0 +1,9 @@
+#!/bin/sh
+case "$*" in
+  "get sqm.@queue[0].enabled") echo 1 ;;
+  "get sqm.@queue[0].download") echo 50000 ;;
+  "get sqm.@queue[0].upload") echo 10000 ;;
+  "get sqm.@queue[0].interface") echo eth0 ;;
+  "show dhcp") printf 'dhcp.@host[0]=host\ndhcp.@host[0].name=a\ndhcp.@host[1]=host\ndhcp.@host[2]=host\n' ;;
+  *) exit 1 ;;
+esac

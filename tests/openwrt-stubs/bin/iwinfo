@@ -1,0 +1,22 @@
+#!/bin/sh
+if [ $# -eq 0 ]; then
+cat <<'M'
+wlan0     ESSID: "Home"
+          Access Point: AA:BB:CC:DD:EE:FF
+          Mode: Master  Channel: 6 (2.437 GHz)  HT Mode: HT20
+          Tx-Power: 20 dBm  Link Quality: 70/70
+          Signal: -40 dBm  Noise: -95 dBm
+wlan1     ESSID: unknown
+          Access Point: 00:00:00:00:00:00
+          Mode: Unknown  Channel: unknown (unknown)
+          Tx-Power: unknown  Link Quality: unknown/70
+          Signal: unknown  Noise: unknown
+M
+exit 0; fi
+case "$1 $2" in
+  "wlan0 info") printf 'wlan0     ESSID: "Home"\n          Mode: Master  Channel: 6 (2.437 GHz)  HT Mode: HT20\n          Tx-Power: 20 dBm  Link Quality: 70/70\n          Signal: -40 dBm  Noise: -95 dBm\n          Hardware: 14C3:7915 [MediaTek MT7915E]\n' ;;
+  "wlan1 info") printf 'wlan1     ESSID: unknown\n          Mode: Unknown  Channel: unknown (unknown)\n          Tx-Power: unknown  Link Quality: unknown/70\n          Signal: unknown  Noise: unknown\n' ;;
+  "wlan0 assoclist") printf '11:22:33:44:55:66  -45 dBm / -95 dBm (SNR 50)  10 ms ago\n77:88:99:AA:BB:CC  -60 dBm / -95 dBm (SNR 35)  20 ms ago\n' ;;
+  "wlan1 assoclist") echo "No station connected" ;;
+  *) exit 1 ;;
+esac

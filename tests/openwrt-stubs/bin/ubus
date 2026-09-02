@@ -1,0 +1,8 @@
+#!/bin/sh
+# BK_STUB_NO_WAN=1 simulates a box with no netifd interface at all (access point).
+[ -n "$BK_STUB_NO_WAN" ] && exit 1
+case "$*" in
+  "call network.interface.wan status") echo '{"up":true,"proto":"dhcp","l3_device":"eth0"}' ;;
+  "call network.interface dump") echo '{"interface":[]}' ;;
+  *) exit 1 ;;
+esac

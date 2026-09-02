@@ -1,0 +1,7 @@
+#!/bin/sh
+cat <<'M'
+qdisc cake 8001: root refcnt 2 bandwidth 50Mbit diffserv3 triple-isolate nonat nowash no-ack-filter split-gso rtt 100ms raw overhead 0
+ Sent 123456789 bytes 100000 pkt (dropped 12, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+ memory used: 1Mb of 4Mb
+M

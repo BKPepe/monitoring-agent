@@ -58,7 +58,10 @@ if [ -f "$ScriptPath/agent_openwrt.cfg" ]; then
     done < "$ScriptPath/agent_openwrt.cfg"
 fi
 
-HEAVY_OP_INTERVAL_SEC=$(( ${HEAVY_OP_INTERVAL_HOURS:-24} * 3600 ))
+# A non-numeric value from agent.cfg used to abort the shell right here, before
+# the first log line.
+case "$HEAVY_OP_INTERVAL_HOURS" in ''|*[!0-9]*) HEAVY_OP_INTERVAL_HOURS=24 ;; esac
+HEAVY_OP_INTERVAL_SEC=$(( HEAVY_OP_INTERVAL_HOURS * 3600 ))
 
 if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     REG_TOKEN="$2"
@@ -85,7 +88,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.0"
+AGENT_VERSION="0.1.1"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 CPU_STATE_FILE="/tmp/status-agent-openwrt-cpu.state"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
@@ -179,14 +182,45 @@ json_val() {
 log_message() {
     ts=$(date '+%Y-%m-%d %H:%M:%S')
     if [ "$VERBOSE" = "1" ]; then
-        echo "$ts - $1"
+        # In --dry-run stdout is the JSON payload; chatter goes to stderr.
+        if [ "$DRY_RUN" = "1" ]; then echo "$ts - $1" >&2; else echo "$ts - $1"; fi
     fi
-    echo "$ts - $1" >> "$LOG_FILE" 2>/dev/null || echo "$ts - $1" >> /tmp/status-agent-openwrt.log 2>/dev/null || true
+    echo "$ts - $1" >> "$LOG_FILE" 2>/dev/null || true
+    # /tmp is RAM on OpenWrt and this file used to grow without limit (about
+    # a megabyte a day) until the tmpfs was full and dhcp.leases could not be
+    # written. Above 64 KB keep the last 32 KB.
+    _log_size=$(stat -c %s "$LOG_FILE" 2>/dev/null)
+    case "$_log_size" in ''|*[!0-9]*) _log_size=0 ;; esac
+    if [ "$_log_size" -gt 65536 ]; then
+        tail -c 32768 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null
+    fi
 }
 
+# Progress chatter reaches the file only with --verbose; errors and actions always.
 log_debug() {
-    log_message "$1"
+    [ "$VERBOSE" = "1" ] && log_message "$1"
+    return 0
 }
+
+# One run at a time. A report stalled on a dead server or a stuck modem must
+# not let cron pile a fresh agent on top of it every minute until the RAM is
+# gone. mkdir is atomic; flock is not part of stock OpenWrt. A lock whose
+# owner no longer exists (kill -9, power loss with /tmp on flash) is reclaimed.
+BK_LOCK_DIR="/tmp/status-agent-openwrt.lock"
+if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
+    _lock_pid=$(cat "$BK_LOCK_DIR/pid" 2>/dev/null)
+    # Digits only: /tmp is world-writable and "../.." in here would make the
+    # -d test true forever.
+    case "$_lock_pid" in ''|*[!0-9]*) _lock_pid="" ;; esac
+    if [ -n "$_lock_pid" ] && [ -d "/proc/$_lock_pid" ]; then
+        log_message "Predchozi beh (PID $_lock_pid) jeste bezi, tento koncim."
+        exit 0
+    fi
+    rm -rf "$BK_LOCK_DIR" 2>/dev/null
+    mkdir "$BK_LOCK_DIR" 2>/dev/null || exit 0
+fi
+echo "$$" > "$BK_LOCK_DIR/pid" 2>/dev/null
+trap 'rm -rf "$BK_LOCK_DIR"' EXIT
 
 # V rezimu --dry-run se klic nekontroluje: smysl toho rezimu je podivat se,
 # co agent na novem routeru nasbira, jeste nez ho nekdo zaregistruje.
@@ -226,7 +260,9 @@ if [ -f "$CPU_STATE_FILE" ]; then
             idle1 = a1[5] + a1[6]; total1 = a1[2]+a1[3]+a1[4]+a1[5]+a1[6]+a1[7]+a1[8];
             idle2 = a2[5] + a2[6]; total2 = a2[2]+a2[3]+a2[4]+a2[5]+a2[6]+a2[7]+a2[8];
             idle_delta = idle2 - idle1; total_delta = total2 - total1;
-            if (total_delta <= 0) { print "0.0"; } else {
+            # Counters that did not move (same tick, overlapping runs) give
+            # no output - null upstream - not a 0.0 % nobody measured.
+            if (total_delta > 0) {
                 printf "%.1f", (1.0 - idle_delta / total_delta) * 100;
             }
         }')
@@ -246,7 +282,8 @@ END {
     if (!avail) { avail = free + buffers + cached; }
     used = total - avail;
     if (used < 0) used = 0;
-    pct = (total == 0) ? "0.0" : sprintf("%.1f", (used / total) * 100);
+    if (total == 0) exit;
+    pct = sprintf("%.1f", (used / total) * 100);
     print "ram=" pct "; ram_total_mb=" total "; ram_used_mb=" used "; ram_available_mb=" avail "; ram_free_mb=" free;
 }' /proc/meminfo 2>/dev/null)
 [ -z "$ram" ] && ram="null"
@@ -374,7 +411,10 @@ else
 fi
 
 # --- 4. WAN stav (ubus network.interface.wan status) ---
-wan_up="false"; wan_proto=""; wan_uptime="null"; wan_ipv4=""; wan_gateway=""; wan_dns=""; wan_l3_device=""
+# wan_up starts EMPTY, not false: a box with no netifd interface called "wan"
+# (access point, uplink on wwan or wan_pppoe) measured nothing, and "false"
+# would make the server raise a wan_lost alert on it forever.
+wan_up=""; wan_proto=""; wan_uptime="null"; wan_ipv4=""; wan_gateway=""; wan_dns=""; wan_l3_device=""
 wan_json=$(ubus call network.interface.wan status 2>/dev/null)
 if [ -n "$wan_json" ]; then
     json_load "$wan_json"
@@ -469,11 +509,14 @@ if [ -n "$v4_bytes" ] && [ "$v4_bytes" -gt 0 ]; then
         if [ -n "$prev_ts" ] && [ -n "$prev_v4" ] && [ "$now_ts" -gt "$prev_ts" ]; then
             elapsed=$((now_ts - prev_ts))
             d_v4=$((v4_bytes - prev_v4))
-            d_v6=$((v6_bytes - prev_v6))
+            # An unreadable /proc/net/snmp6 leaves v6_bytes empty; $(( )) would
+            # quietly treat that as 0 and report a fabricated 0.0 KB/s.
+            d_v6=""
+            [ -n "$v6_bytes" ] && [ -n "$prev_v6" ] && d_v6=$((v6_bytes - prev_v6))
             if [ "$elapsed" -gt 0 ] && [ "$d_v4" -ge 0 ]; then
                 net_ipv4_kbps=$(awk -v d="$d_v4" -v e="$elapsed" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
             fi
-            if [ "$elapsed" -gt 0 ] && [ "$d_v6" -ge 0 ]; then
+            if [ -n "$d_v6" ] && [ "$elapsed" -gt 0 ] && [ "$d_v6" -ge 0 ]; then
                 net_ipv6_kbps=$(awk -v d="$d_v6" -v e="$elapsed" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
             fi
         fi
@@ -520,11 +563,13 @@ log_debug "WAN: up=$wan_up proto=$wan_proto ipv4=$wan_ipv4 gateway=$wan_gateway 
 # verzi libubox - overujeme obe varianty, at se stav WAN nikdy tise neztrati.
 case "$wan_up" in
     1|true) wan_up_json="true" ;;
-    *) wan_up_json="false" ;;
+    0|false) wan_up_json="false" ;;
+    *) wan_up_json="null" ;;
 esac
 
 # --- Deep OpenWrt Telemetry ---
-swap_pct=$(awk '/^SwapTotal:/ {total=$2} /^SwapFree:/ {free=$2} END { if (total > 0) printf "%.1f", ((total - free) / total) * 100; else print "0.0"; }' /proc/meminfo)
+# No swap configured is "not applicable" (null), like btrfs errors below - not 0.0 % of nothing.
+swap_pct=$(awk '/^SwapTotal:/ {total=$2} /^SwapFree:/ {free=$2} END { if (total > 0) printf "%.1f", ((total - free) / total) * 100; }' /proc/meminfo)
 [ -z "$swap_pct" ] && swap_pct="null"
 
 entropy="null"
@@ -577,7 +622,17 @@ else
     if command -v opkg >/dev/null 2>&1; then
         upgradable_packages=$(opkg list-upgradable 2>/dev/null | wc -l | xargs)
         installed_packages=$(opkg list-installed 2>/dev/null | wc -l | xargs)
-        echo "${upgradable_packages}|${installed_packages}" > "$OPKG_CACHE_FILE" 2>/dev/null || true
+        # Same validation as the apk branch below (the two had drifted apart):
+        # zero installed is opkg failing on its lock, and list-upgradable knows
+        # nothing until someone ran `opkg update` - the lists live in tmpfs
+        # and are gone after a reboot. Neither is a real zero.
+        case "$installed_packages" in ''|*[!0-9]*|0) installed_packages="null" ;; esac
+        case "$upgradable_packages" in ''|*[!0-9]*) upgradable_packages="null" ;; esac
+        [ -n "$(ls -A /var/opkg-lists 2>/dev/null)" ] || upgradable_packages="null"
+        if [ "$installed_packages" != "null" ]; then
+            echo "${upgradable_packages}|${installed_packages}" > "$OPKG_CACHE_FILE.tmp" 2>/dev/null \
+                && mv "$OPKG_CACHE_FILE.tmp" "$OPKG_CACHE_FILE" 2>/dev/null || true
+        fi
     elif command -v apk >/dev/null 2>&1; then
         # `apk list` pise hlavicku i prazdne radky, proto se pocitaji jen
         # radky zacinajici nazvem balicku.
@@ -603,11 +658,10 @@ fi
 
 # Bez iwinfo se pocet klientu NEZJISTUJE - drive tu zustala nula, takze
 # router bez iwinfo hlasil "0 pripojenych", i kdyz se na WiFi nikdo nedival.
+# Summed from the per-radio detail further down. Bare `iwinfo` prints no line
+# containing "assoc" at all, so the grep this used to be never matched and the
+# count was null on every router.
 wifi_clients_count="null"
-if command -v iwinfo >/dev/null 2>&1; then
-    wifi_clients_count=$(iwinfo 2>/dev/null | grep -i "assoc" | awk '{sum+=$NF; n++} END {if (n>0) print sum}')
-    [ -z "$wifi_clients_count" ] && wifi_clients_count="null"
-fi
 
 interfaces_json="[]"
 if [ -f /proc/net/dev ]; then
@@ -647,9 +701,11 @@ if [ -f /tmp/dnsmasq.stats ]; then
     dns_queries=$(awk '/queries received/ {print $1}' /tmp/dnsmasq.stats 2>/dev/null)
     dns_cache_hits=$(awk '/cache hits/ {print $1}' /tmp/dnsmasq.stats 2>/dev/null)
     dns_cache_misses=$(awk '/cache misses/ {print $1}' /tmp/dnsmasq.stats 2>/dev/null)
-elif pidof dnsmasq >/dev/null 2>&1; then
-    kill -USR1 $(pidof dnsmasq) 2>/dev/null &
 fi
+# (dnsmasq never writes /tmp/dnsmasq.stats; SIGUSR1 makes it log its statistics
+#  to syslog. The old branch sent that signal every minute, which only filled
+#  the log buffer - and on Turris wrote to eMMC - without ever yielding a
+#  number. Without the stats file these stay null.)
 [ -z "$dns_queries" ] && dns_queries="null"
 [ -z "$dns_cache_hits" ] && dns_cache_hits="null"
 [ -z "$dns_cache_misses" ] && dns_cache_misses="null"
@@ -667,7 +723,7 @@ fw_rejected="null"
 # "packets" v textu by jinak pricetlo, co za nim nahodou stoji.
 # Pocita se jen "counter packets N" - pravidlo bez pocitadla zadne cislo nema.
 _nft_verdict_packets() {
-    nft list ruleset 2>/dev/null | awk -v want="$1" '
+    printf '%s\n' "$bk_nft_rules" | awk -v want="$1" '
         {
             line = $0
             sub(/comment ".*/, "", line)
@@ -693,7 +749,12 @@ _ipt_target_packets() {
 # nainstalovana kompatibilni vrstva `iptables`, ktera o nich nevi a vypise
 # prazdnou tabulku. Puvodni poradi proto na takovem routeru cetlo prazdno
 # a firewall se netvaril, ze se nemeri - tvaril se, ze nic nezahazuje.
-if command -v nft >/dev/null 2>&1 && [ -n "$(nft list ruleset 2>/dev/null | head -n 1)" ]; then
+# The ruleset is fetched once (it was dumped from the kernel four times a run
+# - hundreds of lines each on fw4) and reused for the three sums and the
+# enabled check below.
+bk_nft_rules=""
+command -v nft >/dev/null 2>&1 && bk_nft_rules=$(nft list ruleset 2>/dev/null)
+if [ -n "$bk_nft_rules" ]; then
     fw_accepted=$(_nft_verdict_packets accept)
     fw_dropped=$(_nft_verdict_packets drop)
     fw_rejected=$(_nft_verdict_packets reject)
@@ -710,8 +771,8 @@ fi
 # paketu. Poradi zjistovani jde od nejsilnejsiho dukazu k nejslabsimu a kdyz
 # nevyjde ani jeden, zustava null: "nevime" je jina informace nez "vypnuty".
 firewall_enabled="null"
-if command -v nft >/dev/null 2>&1 && [ -n "$(nft list tables 2>/dev/null | head -n 1)" ]; then
-    # Nactena tabulka je dukaz, ze pravidla v jadre jsou.
+if [ -n "$bk_nft_rules" ]; then
+    # A loaded ruleset is proof the rules are in the kernel.
     firewall_enabled="true"
 elif command -v iptables >/dev/null 2>&1 && iptables -S 2>/dev/null | grep -q '^-'; then
     firewall_enabled="true"
@@ -744,15 +805,29 @@ wireguard_peers_json="[]"
 if command -v wg >/dev/null 2>&1; then
     wg_dump=$(wg show all dump 2>/dev/null)
     if [ -n "$wg_dump" ]; then
+        # `wg show all dump`: the first line per interface has 5 columns
+        # (iface, PRIVATE key, pubkey, port, fwmark), every peer line 9
+        # (iface, pubkey, psk, endpoint, allowed-ips, handshake, rx, tx,
+        # keepalive). The old parser read every line as a peer with the
+        # columns off by one: allowed-ips landed unquoted in latest_handshake,
+        # the server rejected the JSON - so a router with WireGuard up sent
+        # no telemetry at all - and the interface line leaked a private-key
+        # prefix as "public_key".
         wireguard_peers_json=$(echo "$wg_dump" | awk '
         BEGIN { printf "[" }
+        NF < 9 { next }
         {
             if (count > 0) printf ", ";
-            split($3, ep, ":");
-            endpoint = ep[1];
-            handshake = $5;
-            rx = $6;
-            tx = $7;
+            endpoint = $4;
+            if (endpoint == "(none)") { endpoint = "" }
+            else {
+                n = split(endpoint, ep, ":"); endpoint = "";
+                for (i = 1; i < n; i++) endpoint = endpoint (i > 1 ? ":" : "") ep[i];
+                gsub(/\[|\]/, "", endpoint);
+            }
+            handshake = ($6 ~ /^[0-9]+$/) ? $6 : "null";
+            rx = ($7 ~ /^[0-9]+$/) ? $7 : "null";
+            tx = ($8 ~ /^[0-9]+$/) ? $8 : "null";
             printf "{\"interface\":\"%s\",\"public_key\":\"%s\",\"endpoint\":\"%s\",\"latest_handshake\":%s,\"rx_bytes\":%s,\"tx_bytes\":%s}", $1, substr($2,1,12)"...", endpoint, handshake, rx, tx;
             count++;
         }
@@ -949,18 +1024,21 @@ if [ -r /proc/1/io ]; then
     io_accounting_json="true"
 fi
 if [ "$io_accounting_json" = "true" ]; then
+    # One awk over every readable /proc/<pid>/io instead of two forks per
+    # process (200-400 forks a minute on a router). Readability is checked
+    # in the shell first because busybox awk aborts on a file it cannot open.
     top_io_json=$(
-        for pid_dir in /proc/[0-9]*; do
-            pid=${pid_dir#/proc/}
-            [ -r "$pid_dir/io" ] || continue
-            wb=$(awk '/^write_bytes:/ {print $2}' "$pid_dir/io" 2>/dev/null)
-            [ -n "$wb" ] || continue
-            [ "$wb" -gt 0 ] 2>/dev/null || continue
-            name=$(awk '/^Name:/ {print $2}' "$pid_dir/status" 2>/dev/null)
-            [ -n "$name" ] || continue
-            echo "$wb|$pid|$name"
-        done | sort -t'|' -k1 -rn | head -5 | awk -F'|' '
-            { printf "%s{\"pid\":%s,\"name\":\"%s\",\"write_bytes\":%s}", (n++ ? "," : "["), $2, $3, $1 }
+        set --
+        for io_file in /proc/[0-9]*/io; do [ -r "$io_file" ] && set -- "$@" "$io_file"; done
+        [ $# -gt 0 ] && awk '
+            FNR == 1 { pid = FILENAME; sub(/^\/proc\//, "", pid); sub(/\/io$/, "", pid) }
+            /^write_bytes:/ && $2 > 0 {
+                cf = "/proc/" pid "/comm"; name = "";
+                if ((getline name < cf) > 0) close(cf);
+                if (name != "") print $2 "|" pid "|" name;
+            }' "$@" 2>/dev/null | sort -t'|' -k1,1 -rn | head -5 | awk -F'|' '
+            { nm = $3; gsub(/\\/, "\\\\", nm); gsub(/"/, "\\\"", nm);
+              printf "%s{\"pid\":%s,\"name\":\"%s\",\"write_bytes\":%s}", (n++ ? "," : "["), $2, nm, $1 }
             END { printf "%s", (n ? "]" : "[]") }'
     )
 fi
@@ -986,11 +1064,15 @@ if command -v top >/dev/null 2>&1; then
     # Dohledat rodicovstvi az potom nejde: proces uz je mrtvy a /proc o nem nic
     # nevi. $! je jediny spolehlivy zpusob, jak jeho PID znat.
     BK_TOP_OUT="/tmp/status-agent-openwrt-top.$$"
-    COLUMNS=512 top -bn1 -w 512 >"$BK_TOP_OUT" 2>/dev/null &
+    # busybox top has no -w: the procps form failed first on every run and
+    # each report paid for two top invocations. Pick the form once.
+    bk_top_args="-bn1 -w 512"
+    case "$(readlink -f "$(command -v top)" 2>/dev/null)" in *busybox*) bk_top_args="-bn1" ;; esac
+    COLUMNS=512 top $bk_top_args >"$BK_TOP_OUT" 2>/dev/null &
     bk_top_pid=$!
     wait "$bk_top_pid" 2>/dev/null
     top_out=$(cat "$BK_TOP_OUT" 2>/dev/null)
-    if [ -z "$top_out" ]; then
+    if [ -z "$top_out" ] && [ "$bk_top_args" != "-bn1" ]; then
         COLUMNS=512 top -bn1 >"$BK_TOP_OUT" 2>/dev/null &
         bk_top_pid=$!
         wait "$bk_top_pid" 2>/dev/null
@@ -1081,12 +1163,18 @@ mwan3_active_gw=""
 if [ -f /etc/config/mwan3 ]; then
     mwan3_status=$(mwan3 status 2>/dev/null)
     if [ -n "$mwan3_status" ]; then
-        mwan3_active_gw=$(echo "$mwan3_status" | grep -i "active" | head -1 | awk '{print $NF}')
-        mwan3_policies_json=$(echo "$mwan3_status" | awk '
-        /policy/ { pol=$2 }
-        /online/ { if (count > 0) printf ", "; printf "{\"policy\":\"%s\",\"interface\":\"%s\",\"status\":\"online\"}", pol, $2; count++ }
-        /offline/ { if (count > 0) printf ", "; printf "{\"policy\":\"%s\",\"interface\":\"%s\",\"status\":\"offline\"}", pol, $2; count++ }
+        # `mwan3 status` prints " interface wan is online and tracking is
+        # active". The old grep for "active" returned the word "active" as the
+        # gateway, and the policy scan never saw a policy line before the
+        # interface section, so every entry carried an empty policy name.
+        mwan3_active_gw=$(printf '%s\n' "$mwan3_status" | sed -n 's/^ *interface \([^ ]*\) is online.*/\1/p' | head -1)
+        mwan3_policies_json=$(printf '%s\n' "$mwan3_status" | awk '
         BEGIN { printf "[" }
+        /^ *interface [^ ]+ is (online|offline|disabled)/ {
+            st = ($4 == "online") ? "online" : "offline";
+            if (count > 0) printf ", ";
+            printf "{\"policy\":null,\"interface\":\"%s\",\"status\":\"%s\"}", $2, st; count++
+        }
         END { printf "]" }')
         [ -z "$mwan3_policies_json" ] && mwan3_policies_json="[]"
     fi
@@ -1111,8 +1199,12 @@ if [ -f /etc/config/sqm ]; then
         sqm_iface=$(uci get sqm.@queue[0].interface 2>/dev/null)
         if [ -n "$sqm_iface" ] && command -v tc >/dev/null 2>&1; then
             tc_out=$(tc -s qdisc show dev "$sqm_iface" 2>/dev/null | grep -A5 "cake")
-            sqm_dropped=$(echo "$tc_out" | grep -i "dropped" | awk '{print $NF}' | head -1)
-            sqm_ecn=$(echo "$tc_out" | grep -i "ecn" | awk '{print $NF}' | head -1)
+            # "(dropped 12, overlimits 0 requeues 0)": the value follows the
+            # word; the old $NF took "0)" from the end of the line, which the
+            # sanitizer then turned into null every time.
+            sqm_dropped=$(printf '%s\n' "$tc_out" | sed -n 's/.*dropped \([0-9]*\),.*/\1/p' | head -1)
+            # ECN marks are a per-tin table beyond this excerpt - not measured here.
+            sqm_ecn=""
         fi
         [ -z "$sqm_dropped" ] && sqm_dropped="null"
         [ -z "$sqm_ecn" ] && sqm_ecn="null"
@@ -1205,10 +1297,21 @@ bk_xml_tag() {
 # a overovaci token z /api/webserver/SesTokInfo - pak se dotaz zopakuje s
 # obojim. uclient-fetch hlavicky poslat neumi, takze na takovem modemu bez
 # curl/wget zustanou hodnoty null.
+# Result lands in $_hl_out (not printed through $(...): a subshell could not
+# keep the session token for the next endpoint). Once the modem answered
+# with a token it is sent straight away, and once the gateway failed to
+# answer at all the remaining endpoints are skipped - a stuck modem used to
+# cost four 2-second timeouts every minute.
+_hl_ses=""; _hl_ver=""; _hl_dead="0"
 bk_hilink_get() {
     _hl_url="http://${lte_api_host}$1"
-    _hl_body=""
-    if command -v curl >/dev/null 2>&1; then
+    _hl_body=""; _hl_out=""
+    [ "$_hl_dead" = "1" ] && return 0
+    if [ -n "$_hl_ses" ] && [ -n "$_hl_ver" ] && command -v curl >/dev/null 2>&1; then
+        _hl_body=$(curl -s -m 2 -H "Cookie: $_hl_ses" -H "__RequestVerificationToken: $_hl_ver" "$_hl_url" 2>/dev/null)
+    elif [ -n "$_hl_ses" ] && [ -n "$_hl_ver" ] && command -v wget >/dev/null 2>&1; then
+        _hl_body=$(wget -q -T 2 -O - --header "Cookie: $_hl_ses" --header "__RequestVerificationToken: $_hl_ver" "$_hl_url" 2>/dev/null)
+    elif command -v curl >/dev/null 2>&1; then
         _hl_body=$(curl -s -m 2 "$_hl_url" 2>/dev/null)
     elif command -v uclient-fetch >/dev/null 2>&1; then
         _hl_body=$(uclient-fetch -q -T 2 -O - "$_hl_url" 2>/dev/null)
@@ -1234,7 +1337,8 @@ bk_hilink_get() {
             fi
             ;;
     esac
-    printf '%s' "$_hl_body"
+    [ -z "$_hl_body" ] && _hl_dead="1"
+    _hl_out="$_hl_body"
 }
 
 if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; then
@@ -1244,7 +1348,7 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
     # ConnectionStatus 901 = pripojeno; 902/903/905 = odpojeno; 7/11/12/14/37
     # = sit pristup nepovolila (spatna SIM, zakazana sluzba). Neznamy kod se
     # neprevadi na nic - zustane null a surovy kod jde dal k posouzeni.
-    lte_mon_xml=$(bk_hilink_get /api/monitoring/status)
+    bk_hilink_get /api/monitoring/status; lte_mon_xml="$_hl_out"
     _cc=$(bk_xml_tag "$lte_mon_xml" ConnectionStatus | sed 's/[^0-9]//g')
     if [ -n "$_cc" ]; then
         lte_conn_code="$_cc"
@@ -1271,7 +1375,7 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
     # -- stav SIM: /api/pin/status --
     # SimState 257 = pripravena, 260 = ceka na PIN, 261 = ceka na PUK,
     # 255 = zadna SIM, 256/262 = neplatna nebo zablokovana.
-    lte_pin_xml=$(bk_hilink_get /api/pin/status)
+    bk_hilink_get /api/pin/status; lte_pin_xml="$_hl_out"
     _sim=$(bk_xml_tag "$lte_pin_xml" SimState | sed 's/[^0-9]//g')
     if [ -n "$_sim" ]; then
         lte_sim_code="$_sim"
@@ -1289,7 +1393,7 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
     [ -n "$_pin_left" ] && lte_sim_pin_left="$_pin_left"
 
     # -- sila signalu: /api/device/signal --
-    lte_sig_xml=$(bk_hilink_get /api/device/signal)
+    bk_hilink_get /api/device/signal; lte_sig_xml="$_hl_out"
 
     if echo "$lte_sig_xml" | grep -q "<rsrp>"; then
         # Hodnoty nesou jednotky primo v textu ("-83dBm", "-6.0dB"), tak se
@@ -1321,7 +1425,7 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
         [ -n "$_band" ] && lte_band="B${_band}"
 
         # Jmeno operatora ma jiny endpoint; bez nej zustava to, co uz mame.
-        lte_plmn_xml=$(bk_hilink_get /api/net/current-plmn)
+        bk_hilink_get /api/net/current-plmn; lte_plmn_xml="$_hl_out"
         _carrier=$(bk_xml_tag "$lte_plmn_xml" FullName)
         [ -z "$_carrier" ] && _carrier=$(bk_xml_tag "$lte_plmn_xml" ShortName)
         [ -n "$_carrier" ] && lte_carrier="$_carrier"
@@ -1338,7 +1442,8 @@ if command -v uqmi >/dev/null 2>&1; then
     if [ -n "$lte_signal" ]; then
         _q=$(echo "$lte_signal" | jsonfilter -e '@.rsrp' 2>/dev/null); [ -n "$_q" ] && lte_rsrp="$_q"
         _q=$(echo "$lte_signal" | jsonfilter -e '@.rsrq' 2>/dev/null); [ -n "$_q" ] && lte_rsrq="$_q"
-        _q=$(echo "$lte_signal" | jsonfilter -e '@.sinr' 2>/dev/null); [ -n "$_q" ] && lte_sinr="$_q"
+        # uqmi calls it "snr"; the old "sinr" key never existed in its output.
+        _q=$(echo "$lte_signal" | jsonfilter -e '@.snr' 2>/dev/null); [ -n "$_q" ] && lte_sinr="$_q"
         _q=$(echo "$lte_signal" | jsonfilter -e '@.band' 2>/dev/null); [ -n "$_q" ] && lte_band="$_q"
     fi
     _q=$(uqmi --get-network-registration 2>/dev/null | jsonfilter -e '@.description' 2>/dev/null)
@@ -1384,19 +1489,23 @@ fi
 [ -z "$lte_carrier" ] && lte_carrier="null"
 
 # --- Services restart tracking (last 24h from logread) ---
+# One logread for everything below (it used to dump the whole ring buffer
+# once per service - five to seven times a minute - and once more for the
+# error counts) and a single awk pass for all services.
 service_restarts_json="{}"
-if command -v logread >/dev/null 2>&1; then
-    svc_list="dnsmasq odhcpd hostapd mwan3 uhttpd nginx wireguard"
-    svc_parts=""
-    for svc in $svc_list; do
-        if [ -f "/etc/init.d/$svc" ]; then
-            cnt=$(logread 2>/dev/null | grep -i "$svc" | grep -ci "start" 2>/dev/null)
-            [ -z "$cnt" ] && cnt=0
-            [ -n "$svc_parts" ] && svc_parts="$svc_parts, "
-            svc_parts="${svc_parts}\"$svc\": $cnt"
-        fi
+bk_log_full=""
+command -v logread >/dev/null 2>&1 && bk_log_full=$(logread 2>/dev/null)
+if [ -n "$bk_log_full" ]; then
+    svc_names=""
+    for svc in dnsmasq odhcpd hostapd mwan3 uhttpd nginx wireguard; do
+        [ -f "/etc/init.d/$svc" ] && svc_names="$svc_names $svc"
     done
-    [ -n "$svc_parts" ] && service_restarts_json="{$svc_parts}"
+    if [ -n "$svc_names" ]; then
+        service_restarts_json=$(printf '%s\n' "$bk_log_full" | awk -v names="$svc_names" '
+            BEGIN { n = split(names, s, " "); for (i = 1; i <= n; i++) if (s[i] != "") cnt[s[i]] = 0 }
+            { low = tolower($0); if (index(low, "start") == 0) next; for (k in cnt) if (index(low, k) > 0) cnt[k]++ }
+            END { printf "{"; for (i = 1; i <= n; i++) { if (s[i] == "") continue; printf "%s\"%s\": %d", (c++ ? ", " : ""), s[i], cnt[s[i]] } printf "}" }')
+    fi
 fi
 
 # --- WAN reconnect stats (state file) ---
@@ -1426,8 +1535,8 @@ fi
 log_errors_24h="null"
 log_warnings_24h="null"
 log_buf=""
-if command -v logread >/dev/null 2>&1; then
-    log_buf=$(logread -l 500 2>/dev/null)
+if [ -n "$bk_log_full" ]; then
+    log_buf=$(printf '%s\n' "$bk_log_full" | tail -n 500)
 fi
 if [ -z "$log_buf" ] && command -v journalctl >/dev/null 2>&1; then
     log_buf=$(journalctl --since "24 hours ago" --no-pager -n 500 2>/dev/null)
@@ -1475,12 +1584,15 @@ if command -v upsc >/dev/null 2>&1; then
 fi
 
 # --- OOM kills, boot time, DNS latence, OpenVPN, USB (wishlist dodelavky) ---
-oom_kills="null"
-if command -v dmesg >/dev/null 2>&1; then
+# /proc/vmstat oom_kill (kernel 4.13+): one small read, monotonic since boot.
+# The dmesg scan it replaces read the whole ring buffer every minute, counted
+# each kill twice (two log lines per event) and shrank when the buffer
+# wrapped. dmesg stays as the fallback for older kernels only.
+oom_kills=$(awk '/^oom_kill / { print $2 }' /proc/vmstat 2>/dev/null)
+if [ -z "$oom_kills" ] && command -v dmesg >/dev/null 2>&1; then
     oom_kills=$(dmesg 2>/dev/null | grep -ci "oom-killer\|Out of memory")
-    # Prazdny vystup = dmesg nesel precist, ne "zadne OOM zabiti".
-    [ -z "$oom_kills" ] && oom_kills="null"
 fi
+[ -z "$oom_kills" ] && oom_kills="null"
 
 # Boot time = ted - uptime; UI z toho ukaze "System bezi od" bez driftu.
 boot_time="null"
@@ -1511,12 +1623,28 @@ wan_latency_ms="null"
 if command -v ping >/dev/null 2>&1; then
     for lat_target in "$wan_gateway" "1.1.1.1"; do
         [ -z "$lat_target" ] && continue
-        lat_out=$(ping -c 3 -W 2 "$lat_target" 2>/dev/null | sed -n 's|.*= [0-9.]*/\([0-9.]*\)/.*|\1|p')
+        # -w caps the whole call: a gateway that drops ICMP (common) used to
+        # hold the report for the full 3 x (1 s + 2 s) before the fallback.
+        lat_out=$(ping -c 2 -W 1 -w 3 "$lat_target" 2>/dev/null | sed -n 's|.*= [0-9.]*/\([0-9.]*\)/.*|\1|p')
         if [ -n "$lat_out" ]; then
             wan_latency_ms=$(awk -v v="$lat_out" 'BEGIN { printf "%.1f", v }')
             break
         fi
     done
+fi
+
+# Does the primary link actually carry traffic? One echo bound to the WAN
+# device (-I), so a reply that came back through the LTE backup cannot make a
+# dead line look alive. true/false is the verdict the server alerts on
+# (wan_lost / wan_restored); without a WAN device or ping it stays null.
+wan_internet="null"
+if [ -n "$wan_l3_device" ] && command -v ping >/dev/null 2>&1; then
+    if ping -I "$wan_l3_device" -c 1 -W 2 -w 3 1.1.1.1 >/dev/null 2>&1 \
+        || ping -I "$wan_l3_device" -c 1 -W 2 -w 3 9.9.9.9 >/dev/null 2>&1; then
+        wan_internet="true"
+    else
+        wan_internet="false"
+    fi
 fi
 
 # Rychlost WAN linky (Mbit/s) podle vyjednaneho rezimu rozhrani. Neni to
@@ -1570,25 +1698,28 @@ wifi_radios_json="[]"
 if command -v iwinfo >/dev/null 2>&1; then
     wifi_radios_json=$(for radio in $(iwinfo 2>/dev/null | awk '/^[a-z0-9]/ {print $1}'); do
         info=$(iwinfo "$radio" info 2>/dev/null)
-        ssid=$(echo "$info" | grep -i "essid" | sed 's/.*ESSID: "\([^"]*\)".*/\1/' | sed 's/["\\]//g')
-        [ -z "$ssid" ] || [ "$ssid" = "unknown" ] && ssid=$(echo "$info" | grep -i "essid" | awk '{print $NF}' | sed 's/["\\]//g')
+        ssid=$(echo "$info" | sed -n 's/.*ESSID: "\([^"]*\)".*/\1/p' | head -1 | sed 's/["\\]//g')
+        [ -z "$ssid" ] && ssid=$(echo "$info" | sed -n 's/.*ESSID: \([^ ]*\).*/\1/p' | head -1 | sed 's/["\\]//g')
 
         channel=$(echo "$info" | grep -i "channel" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p')
         [ -z "$channel" ] && channel=$(echo "$info" | grep -i "channel" | tr -cd '0-9')
 
         band="2.4GHz"
-        if echo "$info" | grep -qi -E '5\.[0-9]+ \?GHz|5[0-9]{3} \?MHz|a/n/ac|802\.11a|802\.11ac|5GHz'; then
+        # (In an ERE "\?" is a literal question mark, so the frequency forms
+        #  "(5.180 GHz)" never matched and everything fell through to the
+        #  HW-mode guess - where "802.11a" also swallowed 802.11ax radios.)
+        if echo "$info" | grep -qi -E '5\.[0-9]+ ?GHz|5[0-9]{3} ?MHz|a/n/ac|802\.11a([^cx]|$)|802\.11ac|5GHz'; then
             band="5GHz"
-        elif echo "$info" | grep -qi -E '6\.[0-9]+ \?GHz|6[0-9]{3} \?MHz|6GHz'; then
+        elif echo "$info" | grep -qi -E '6\.[0-9]+ ?GHz|6[0-9]{3} ?MHz|6GHz'; then
             band="6GHz"
         elif [ -n "$channel" ] && [ "$channel" -gt 14 ] 2>/dev/null; then
             band="5GHz"
         fi
 
         tx_power=$(echo "$info" | grep -i "tx-power" | sed -n 's/.*Tx-Power: \([0-9-]*\).*/\1/p')
-        [ -z "$tx_power" ] && tx_power="0"
+        [ -z "$tx_power" ] && tx_power="null"
         noise=$(echo "$info" | grep -i "noise" | sed -n 's/.*Noise: \([0-9-]*\).*/\1/p')
-        [ -z "$noise" ] && noise="0"
+        [ -z "$noise" ] && noise="null"
 
         # Count MAC addresses of connected stations
         clients=$(iwinfo "$radio" assoclist 2>/dev/null | grep -iE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | wc -l | tr -cd '0-9')
@@ -1598,26 +1729,27 @@ if command -v iwinfo >/dev/null 2>&1; then
             fi
         fi
 
-        [ -n "$ssid" ] || ssid="unknown"
-        [ -n "$channel" ] || channel="0"
-        [ -n "$clients" ] || clients="0"
+        # A disabled radio prints "unknown" everywhere: that is no SSID, no
+        # channel, not channel 0 at 0 dBm with 0 dBm of noise.
+        if [ -n "$ssid" ] && [ "$ssid" != "unknown" ]; then ssid_json="\"$(json_str "$ssid")\""; else ssid_json="null"; fi
+        for _rv in channel tx_power noise clients; do
+            eval "_rx=\$$_rv"
+            # shellcheck disable=SC2154
+            case "${_rx#-}" in (''|*[!0-9]*) eval "$_rv=null" ;; esac
+        done
 
-        # Vytizeni kanalu: pomer busy/active z iwinfo survey - ne kazdy driver
-        # to umi, pak zustava busy_pct null (zadna vymyslena nula).
+        # Channel utilisation: `iwinfo <dev> survey` is not a CLI subcommand
+        # (only the library and rpcd expose it), so this was one failing fork
+        # per radio that never produced a value. Not measured here: null.
         busy_pct="null"
-        survey=$(iwinfo "$radio" survey 2>/dev/null | grep -i -A4 "in use")
-        if [ -n "$survey" ]; then
-            s_active=$(echo "$survey" | sed -n 's/.*[Aa]ctive time:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
-            s_busy=$(echo "$survey" | sed -n 's/.*[Bb]usy time:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
-            if [ -n "$s_active" ] && [ -n "$s_busy" ] && [ "$s_active" -gt 0 ] 2>/dev/null; then
-                busy_pct=$(awk -v b="$s_busy" -v a="$s_active" 'BEGIN { printf "%.0f", (b/a)*100 }')
-            fi
-        fi
 
-        printf "{\"radio\":\"%s\",\"ssid\":\"%s\",\"band\":\"%s\",\"channel\":%d,\"tx_power\":%d,\"noise\":%d,\"clients\":%d,\"busy_pct\":%s}, " \
-            "$radio" "$ssid" "$band" "$channel" "$tx_power" "$noise" "$clients" "$busy_pct"
+        printf "{\"radio\":\"%s\",\"ssid\":%s,\"band\":\"%s\",\"channel\":%s,\"tx_power\":%s,\"noise\":%s,\"clients\":%s,\"busy_pct\":%s}, " \
+            "$radio" "$ssid_json" "$band" "$channel" "$tx_power" "$noise" "$clients" "$busy_pct"
     done | sed 's/, $//')
     [ -n "$wifi_radios_json" ] && wifi_radios_json="[$wifi_radios_json]" || wifi_radios_json="[]"
+    # Total clients = the sum over radios that reported a count.
+    wifi_clients_count=$(printf '%s' "$wifi_radios_json" | awk -F'clients":' 'NF > 1 { for (i = 2; i <= NF; i++) { v = $i; sub(/[^0-9].*/, "", v); if (v != "") { s += v; n++ } } } END { if (n) print s }')
+    [ -z "$wifi_clients_count" ] && wifi_clients_count="null"
 fi
 
 # --- LAN / DHCP ---
@@ -1640,13 +1772,15 @@ if [ -n "$lan_json" ]; then
         break
     done
 fi
-dhcp_leases_count=0
+# odhcpd-only setups and custom lease files have no /tmp/dhcp.leases: that is
+# unknown, not "0 leases".
+dhcp_leases_count="null"
 if [ -f /tmp/dhcp.leases ]; then
     dhcp_leases_count=$(wc -l < /tmp/dhcp.leases 2>/dev/null | xargs)
 fi
-dhcp_reservations_count=0
+dhcp_reservations_count="null"
 if command -v uci >/dev/null 2>&1; then
-    dhcp_reservations_count=$(uci show dhcp 2>/dev/null | grep -c "=host$")
+    _uci_dhcp=$(uci show dhcp 2>/dev/null) && dhcp_reservations_count=$(printf '%s\n' "$_uci_dhcp" | grep -c "=host$")
 fi
 
 # --- DNS Engine, Upstream Servers & DoT/DoH Encryption ---
@@ -1736,6 +1870,9 @@ fi
 
 if [ $svc_cache_age -lt $HEAVY_OP_INTERVAL_SEC ] && [ -f "$SVC_CACHE_FILE" ]; then
     discovered_services_json=$(cat "$SVC_CACHE_FILE" 2>/dev/null)
+    # An empty cache (write failed on a full /tmp, or read mid-write) used to
+    # put `"discovered_services": ,` in the payload - and a 400 for the lot.
+    [ -n "$discovered_services_json" ] || discovered_services_json="[]"
 else
     disc_list=""
 
@@ -1853,7 +1990,7 @@ else
     detect_svc "Minecraft Server" "minecraft" "java" "63DD" "" 25565 "Minecraft herní server"
 
     [ -n "$disc_list" ] && discovered_services_json="[$disc_list]" || discovered_services_json="[]"
-    echo "$discovered_services_json" > "$SVC_CACHE_FILE" 2>/dev/null || true
+    echo "$discovered_services_json" > "$SVC_CACHE_FILE.tmp" 2>/dev/null && mv "$SVC_CACHE_FILE.tmp" "$SVC_CACHE_FILE" 2>/dev/null || true
 fi
 
 [ -z "$top_cpu_json" ] && top_cpu_json="[]"
@@ -1868,11 +2005,13 @@ fi
 # Sanitace všech numerických proměnných
 for var in cpu ram ram_total_mb ram_used_mb ram_available_mb ram_free_mb swap_pct entropy conntrack_pct upgradable_packages wifi_clients_count dhcp_leases_count dhcp_reservations_count dns_queries dns_cache_hits dns_cache_misses fw_accepted fw_dropped fw_rejected net net_ipv4_kbps net_ipv6_kbps hdd disk_io_write btrfs_errors load1 load5 load15 uptime_sec temperature wan_uptime sqm_download_kbps sqm_upload_kbps sqm_dropped sqm_ecn lte_rsrp lte_rsrq lte_sinr wan_reconnect_count wan_last_reconnect installed_packages log_errors_24h log_warnings_24h; do
     eval "val=\$$var"
-    if [ -z "$val" ] || [ "$val" = "" ]; then
-        eval "$var=\"null\""
-    elif ! echo "$val" | grep -q '^-\?[0-9.]\+$'; then
-        eval "$var=\"null\""
-    fi
+    # A case pattern instead of `echo | grep` - that was ~45 pipelines a run.
+    _num="${val#-}"
+    case "$_num" in
+        ''|*[!0-9.]*) eval "$var=\"null\"" ;;
+        *[0-9]*) : ;;
+        *) eval "$var=\"null\"" ;;
+    esac
 done
 
 # TCP Retransmissions & Conntrack Count & Inode Usage for OpenWrt
@@ -1925,7 +2064,7 @@ payload=$(cat <<EOF
   "wifi_radios": $wifi_radios_json,
   "interfaces": $interfaces_json,
   "discovered_services": $discovered_services_json,
-  "lan_subnet": "$(json_str "$lan_subnet")",
+  "lan_subnet": $(json_val "$lan_subnet"),
   "dhcp_leases_count": $dhcp_leases_count,
   "dhcp_reservations_count": $dhcp_reservations_count,
   "dns_queries": $dns_queries,
@@ -1962,11 +2101,11 @@ payload=$(cat <<EOF
   "model": "$(json_str "$ow_model")",
   "board_name": "$(json_str "$ow_board_name")",
   "wan_up": $wan_up_json,
-  "wan_proto": "$(json_str "$wan_proto")",
-  "wan_ipv4": "$(json_str "$wan_ipv4")",
-  "wan_ipv6": "$(json_str "$wan_ipv6")",
-  "wan_gateway": "$(json_str "$wan_gateway")",
-  "wan_dns": "$(json_str "$wan_dns")",
+  "wan_proto": $(json_val "$wan_proto"),
+  "wan_ipv4": $(json_val "$wan_ipv4"),
+  "wan_ipv6": $(json_val "$wan_ipv6"),
+  "wan_gateway": $(json_val "$wan_gateway"),
+  "wan_dns": $(json_val "$wan_dns"),
   "wan_uptime": $wan_uptime,
   "mwan3_policies": $mwan3_policies_json,
   "mwan3_active_gw": $mwan3_active_gw,
@@ -2011,6 +2150,7 @@ payload=$(cat <<EOF
   "boot_time": $boot_time,
   "dns_latency_ms": $dns_latency_ms,
   "wan_latency_ms": $wan_latency_ms,
+  "wan_internet": $wan_internet,
   "wan_link_mbit": $wan_link_mbit,
   "openvpn_tunnels": $openvpn_tunnels,
   "usb_devices": $usb_devices,
@@ -2033,17 +2173,27 @@ http_code=""
 body=""
 
 if command -v curl >/dev/null 2>&1; then
-    response=$(curl -s -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d "$payload" "$API_URL")
+    response=$(curl -s -m 20 --connect-timeout 5 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d "$payload" "$API_URL")
     http_code=$(echo "$response" | tail -n 1)
     body=$(echo "$response" | head -n -1)
 elif command -v uclient-fetch >/dev/null 2>&1; then
     # uclient-fetch je soucasti zakladni instalace OpenWrt a na rozdil od
     # holeho BusyBox wget ma spolehlivou HTTPS podporu (ustream-ssl).
-    body=$(uclient-fetch -q -O - --post-data="$payload" --header="Content-Type: application/json" "$API_URL" 2>/dev/null)
-    [ -n "$body" ] && http_code="200"
+    # Judged by the exit code, not by "some body came back": an error page
+    # used to count as HTTP 200 and be parsed for remote actions, while the
+    # real reason ("Connection refused", TLS) went to /dev/null.
+    uf_err=$(mktemp /tmp/status-openwrt-uf-err.XXXXXX 2>/dev/null || echo "/tmp/status-openwrt-uf-err-$$")
+    if body=$(uclient-fetch -q -T 20 -O - --post-data="$payload" --header="Content-Type: application/json" "$API_URL" 2>"$uf_err"); then
+        http_code="200"
+    else
+        http_code=$(sed -n 's/.*HTTP error \([0-9][0-9]*\).*/\1/p' "$uf_err" | head -n 1)
+        [ -z "$http_code" ] && http_code="000"
+        body=$(cat "$uf_err" 2>/dev/null)
+    fi
+    rm -f "$uf_err"
 elif command -v wget >/dev/null 2>&1; then
     headers_file=$(mktemp /tmp/status-openwrt-wget-hdr.XXXXXX 2>/dev/null || echo "/tmp/status-openwrt-wget-hdr-$$")
-    body=$(wget --post-data="$payload" --header="Content-Type: application/json" --server-response -q -O - "$API_URL" 2>"$headers_file")
+    body=$(wget -T 20 -t 2 --post-data="$payload" --header="Content-Type: application/json" --server-response -q -O - "$API_URL" 2>"$headers_file")
     http_code=$(grep -E '^[[:space:]]*HTTP/' "$headers_file" | tail -n 1 | awk '{print $2}')
     rm -f "$headers_file"
 else
@@ -2219,11 +2369,11 @@ if [ "$http_code" = "200" ]; then
 
                 download_ok=0
                 if command -v curl >/dev/null 2>&1; then
-                    curl -fsS -o "$tmp_file" "$update_url" && download_ok=1
+                    curl -fsS -m 60 --connect-timeout 10 -o "$tmp_file" "$update_url" && download_ok=1
                 elif command -v uclient-fetch >/dev/null 2>&1; then
-                    uclient-fetch -q -O "$tmp_file" "$update_url" && download_ok=1
+                    uclient-fetch -q -T 60 -O "$tmp_file" "$update_url" && download_ok=1
                 elif command -v wget >/dev/null 2>&1; then
-                    wget -q -O "$tmp_file" "$update_url" && download_ok=1
+                    wget -q -T 60 -t 2 -O "$tmp_file" "$update_url" && download_ok=1
                 fi
 
                 if [ "$download_ok" = "1" ]; then

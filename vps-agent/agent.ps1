@@ -1,10 +1,14 @@
+﻿# CmdletBinding gives the script the common -Verbose switch the help text has
+# promised for a while; without it PowerShell rejected the parameter outright.
+[CmdletBinding()]
 param(
     [alias("h")][switch]$Help,
     [alias("v")][switch]$Version,
-    [switch]$Update
+    [switch]$Update,
+    [alias("Print")][switch]$DryRun
 )
 
-$AGENT_VERSION = "0.0.1"
+$AGENT_VERSION = "0.1.0"
 
 if ($Help) {
     Write-Host "Windows PowerShell Status Agent v$AGENT_VERSION"
@@ -14,6 +18,7 @@ if ($Help) {
     Write-Host "  -Help, -h      Zobrazí tuto nápovědu"
     Write-Host "  -Version, -v   Zobrazí verzi agenta"
     Write-Host "  -Update        Vynutí kontrolu a aktualizaci agenta ze serveru"
+    Write-Host "  -DryRun        Sesbírá data a vypíše JSON, neodesílá (i bez klíče)"
     Write-Host "  -Verbose       Zobrazí podrobný průběh sběru dat"
     Write-Host ""
     Write-Host "Konfigurace:"
@@ -74,15 +79,22 @@ function Write-AgentLog {
     param([string]$Message)
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "$ts - $Message"
-    Write-Output $line
+    # In -DryRun stdout is the JSON payload; keep the chatter on the host stream.
+    if ($DryRun) { Write-Host $line } else { Write-Output $line }
     try {
+        # Bounded: above 1 MB keep the last 500 lines. It grew without limit before.
+        try {
+            if ((Test-Path $LogFile) -and (Get-Item $LogFile).Length -gt 1MB) {
+                Get-Content $LogFile -Tail 500 | Set-Content -Path $LogFile -Encoding UTF8
+            }
+        } catch {}
         Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction Stop
     } catch {
         try { Add-Content -Path (Join-Path $env:TEMP "status-agent.log") -Value $line -Encoding UTF8 } catch {}
     }
 }
 
-if ($AGENT_KEY -eq "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE") {
+if ($AGENT_KEY -eq "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE" -and -not $DryRun) {
     Write-AgentLog "CHYBA: Nebyl nastaven AGENT_KEY. Upravte skript nebo 'agent.cfg'."
     exit 1
 }
@@ -90,29 +102,34 @@ if ($AGENT_KEY -eq "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE") {
 Write-AgentLog "Získávám systémové statistiky (PowerShell)..."
 
 # --- CPU: průměrné vytížení všech procesorů ---
-$cpu = 0.0
+# Unmeasured stays $null - the old 0.0 default sent "idle" to the server
+# whenever WMI failed, which is not what happened.
+$cpu = $null
 try {
-    $cpuLoad = (Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+    $cpuLoad = (Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Measure-Object -Property LoadPercentage -Average).Average
     if ($null -ne $cpuLoad) { $cpu = [math]::Round([double]$cpuLoad, 1) }
 } catch {
     try {
-        $counter = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 2
-        $cpu = [math]::Round(($counter.CounterSamples | Measure-Object -Property CookedValue -Average).Average, 1)
-    } catch {}
+        # Performance data through CIM, not Get-Counter: counter paths are
+        # localized ("\Prozessor(_Total)\Prozessorzeit (%)" on a German
+        # Windows), the CIM class names are not.
+        $perf = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop
+        if ($perf) { $cpu = [math]::Round([double]$perf.PercentProcessorTime, 1) }
+    } catch { Write-AgentLog "VAROVANI: CPU nelze zmerit: $($_.Exception.Message)" }
 }
 
 # --- RAM: využitá fyzická paměť v % ---
-$ram = 0.0
+$ram = $null
 $os_info = $null
 try {
-    $os_info = Get-CimInstance -ClassName Win32_OperatingSystem
+    $os_info = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
     $totalKb = [double]$os_info.TotalVisibleMemorySize
     $freeKb = [double]$os_info.FreePhysicalMemory
     if ($totalKb -gt 0) { $ram = [math]::Round((($totalKb - $freeKb) / $totalKb) * 100, 1) }
-} catch {}
+} catch { Write-AgentLog "VAROVANI: RAM nelze zmerit: $($_.Exception.Message)" }
 
 # --- Disk: zaplnění systémového disku (obvykle C:) v % ---
-$hdd = 0.0
+$hdd = $null
 try {
     $systemDrive = $env:SystemDrive
     if (-not $systemDrive) { $systemDrive = "C:" }
@@ -120,10 +137,10 @@ try {
     if ($disk -and [double]$disk.Size -gt 0) {
         $hdd = [math]::Round((([double]$disk.Size - [double]$disk.FreeSpace) / [double]$disk.Size) * 100, 1)
     }
-} catch {}
+} catch { Write-AgentLog "VAROVANI: disk nelze zmerit: $($_.Exception.Message)" }
 
 # --- Swap (stránkovací soubor): využití v % ---
-$swap = 0.0
+$swap = $null
 try {
     $pageFiles = Get-CimInstance -ClassName Win32_PageFileUsage
     if ($pageFiles) {
@@ -139,15 +156,18 @@ try {
 $load1 = $null; $load5 = $null; $load15 = $null
 $cpuSteal = $null
 
-# --- Disk I/O (KB/s čtení/zápis), průměr za 1s vzorek přes výkonnostní čítače ---
+# --- Disk I/O (KB/s čtení/zápis) ---
+# Formatted performance data through CIM: locale-independent (Get-Counter
+# paths are translated on non-English Windows and silently returned nothing)
+# and instant - the old two-sample counter made every run a second longer.
 $diskIoRead = $null
 $diskIoWrite = $null
 try {
-    $ioCounters = Get-Counter '\PhysicalDisk(_Total)\Disk Read Bytes/sec', '\PhysicalDisk(_Total)\Disk Write Bytes/sec' -SampleInterval 1 -MaxSamples 2 -ErrorAction Stop
-    $readAvg = ($ioCounters.CounterSamples | Where-Object { $_.Path -like '*read bytes*' } | Measure-Object -Property CookedValue -Average).Average
-    $writeAvg = ($ioCounters.CounterSamples | Where-Object { $_.Path -like '*write bytes*' } | Measure-Object -Property CookedValue -Average).Average
-    if ($null -ne $readAvg) { $diskIoRead = [math]::Round($readAvg / 1024, 1) }
-    if ($null -ne $writeAvg) { $diskIoWrite = [math]::Round($writeAvg / 1024, 1) }
+    $ioPerf = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop
+    if ($ioPerf) {
+        $diskIoRead = [math]::Round([double]$ioPerf.DiskReadBytesPersec / 1024, 1)
+        $diskIoWrite = [math]::Round([double]$ioPerf.DiskWriteBytesPersec / 1024, 1)
+    }
 } catch {}
 
 # --- Síť: propustnost (KB/s, RX+TX) a nové chyby/zahozené pakety od posledního běhu ---
@@ -191,7 +211,7 @@ try {
 } catch {}
 
 # --- Uptime v sekundách ---
-$uptime = 0
+$uptime = $null
 try {
     if ($os_info) {
         $uptime = [int]((Get-Date) - $os_info.LastBootUpTime).TotalSeconds
@@ -279,13 +299,17 @@ try {
 } catch {}
 
 # --- SMART stav disků ---
-$smart = "N/A"
+# Win32_DiskDrive.Status is a device-manager state, not disk health - it says
+# "OK" on a drive whose SMART is failing. The Storage module's HealthStatus
+# (Healthy / Warning / Unhealthy) is the real verdict; without it the answer
+# is N/A, not a reassuring OK.
+$smart = "N/A (Storage modul neni k dispozici)"
 try {
-    $drives = Get-CimInstance -ClassName Win32_DiskDrive
-    $failed = $drives | Where-Object { $_.Status -and $_.Status -ne "OK" }
-    if ($failed) {
-        $smart = "WARNING (Disk $($failed[0].Model) hlásí stav $($failed[0].Status))"
-    } elseif ($drives) {
+    $pdisks = @(Get-PhysicalDisk -ErrorAction Stop)
+    $bad = $pdisks | Where-Object { $_.HealthStatus -and $_.HealthStatus -ne "Healthy" }
+    if ($bad) {
+        $smart = "WARNING (Disk $($bad[0].FriendlyName) hlasi stav $($bad[0].HealthStatus))"
+    } elseif ($pdisks.Count -gt 0) {
         $smart = "OK"
     }
 } catch {}
@@ -320,7 +344,7 @@ try {
         $stateFileTs = Join-Path $env:TEMP "status_agent_win_ts3.json"
         $nowTicks = (Get-Date).Ticks
         $cpuMsNow = $proc.TotalProcessorTime.TotalMilliseconds
-        $ts3Cpu = 0.0
+        $ts3Cpu = $null
 
         if (Test-Path $stateFileTs) {
             try {
@@ -382,7 +406,9 @@ try {
     if ($tsRaw) {
         $tsJson = $tsRaw | ConvertFrom-Json
         $tailscaleUp = ($tsJson.BackendState -eq 'Running')
-        $tailscalePeers = @($tsJson.Peer.PSObject.Properties).Count
+        # No peers = no Peer object at all; reading .PSObject off $null threw
+        # and took tailscale_up down with it.
+        $tailscalePeers = if ($tsJson.Peer) { @($tsJson.Peer.PSObject.Properties).Count } else { 0 }
     }
 } catch {}
 
@@ -410,12 +436,17 @@ try {
 $ramTotalMb = $null; $ramUsedMb = $null; $ramAvailMb = $null; $ramFreeMb = $null
 $bootTime = $null
 try {
-    $osInfo = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-    $ramTotalMb = [math]::Round($osInfo.TotalVisibleMemorySize / 1024)
-    $ramFreeMb = [math]::Round($osInfo.FreePhysicalMemory / 1024)
-    $ramAvailMb = $ramFreeMb
-    $ramUsedMb = $ramTotalMb - $ramFreeMb
-    $bootTime = [int][double]::Parse((Get-Date $osInfo.LastBootUpTime -UFormat %s))
+    # The same Win32_OperatingSystem instance as above - it used to be
+    # queried a second time here.
+    if ($os_info) {
+        $ramTotalMb = [math]::Round($os_info.TotalVisibleMemorySize / 1024)
+        $ramFreeMb = [math]::Round($os_info.FreePhysicalMemory / 1024)
+        $ramAvailMb = $ramFreeMb
+        $ramUsedMb = $ramTotalMb - $ramFreeMb
+        # Unix epoch straight from DateTimeOffset - `-UFormat %s` is
+        # culture-formatted on Windows PowerShell 5.1 and failed to parse.
+        $bootTime = [int][DateTimeOffset]::new([DateTime]$os_info.LastBootUpTime).ToUnixTimeSeconds()
+    }
 } catch {}
 
 # Windows umi "ceka na restart" precist z registru - dosavadni natvrdo $null
@@ -434,7 +465,9 @@ try {
 
 $usbDevices = $null
 try {
-    $usbDevices = @(Get-PnpDevice -Class USB -Status OK -ErrorAction Stop).Count
+    # Devices only: the USB class also lists every root hub and host
+    # controller, so an empty machine reported three or four "devices".
+    $usbDevices = @(Get-PnpDevice -PresentOnly -Status OK -ErrorAction Stop | Where-Object { $_.InstanceId -like 'USB\VID_*' }).Count
 } catch {}
 
 $payload = @{
@@ -488,6 +521,12 @@ $payload = @{
     ups_battery_pct = $upsBattery
     discovered_services = $discoveredServices
 } | ConvertTo-Json -Depth 4
+
+if ($DryRun) {
+    Write-Output $payload
+    Write-AgentLog "Rezim -DryRun: data se neodesilaji."
+    exit 0
+}
 
 $netLog = if ($null -ne $net) { "$net KB/s" } else { "N/A (první běh)" }
 Write-AgentLog "Metriky - OS: $os_version, CPU: $cpu%, RAM: $ram%, swap $swap%, HDD: $hdd%, Sit: $netLog, Uptime: ${uptime}s, SMART: $smart"

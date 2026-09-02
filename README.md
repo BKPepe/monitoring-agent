@@ -70,3 +70,21 @@ One-time setup: add the same `FTP_SERVER`, `FTP_USERNAME` and `FTP_PASSWORD`
 secrets the `monitoring` repo uses under **Settings → Secrets and variables →
 Actions**. The workflow fails loudly when they're missing instead of
 pretending it deployed.
+
+## Testing
+
+`tests/` runs every agent for real, not just through a parser: `agent.sh` and
+`agent.py` in a Debian container (two runs, so between-run deltas exist),
+`agent_openwrt.sh` in busybox with canned `wg` / `mwan3` / `tc` / `uci` /
+`logread` / `iwinfo` / `nft` / `ubus` output. Each harness asserts on the JSON
+the agent prints with `--dry-run` - valid JSON, honest `null` on the first run,
+parsers reading the right columns. Needs docker and python3:
+
+```bash
+bash tests/run_linux_e2e.sh
+bash tests/run_openwrt_e2e.sh
+```
+
+Every agent also supports `--dry-run` (PowerShell: `-DryRun`): it collects
+everything and prints the payload instead of sending it, no key needed - the
+way to see what a new host will report before registering it.

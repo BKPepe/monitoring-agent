@@ -16,6 +16,13 @@ import hashlib
 import datetime
 import urllib.request
 import subprocess
+import threading
+
+# subprocess.run(capture_output=...) is 3.7+; on 3.6 every tool call raised
+# TypeError inside a silent except and the agent reported null for all of
+# them without a word. Better to say so once.
+if sys.version_info < (3, 7):
+    sys.exit("agent.py vyzaduje Python 3.7+ (subprocess capture_output)")
 
 # === VÝCHOZÍ KONFIGURACE ===
 # Pokud chcete, můžete tyto hodnoty nechat zde, nebo vytvořit soubor 'agent.cfg' ve stejné složce
@@ -79,29 +86,77 @@ if os.path.exists(cfg_path):
     except Exception:
         pass
 
-AGENT_VERSION = "0.0.1"
+AGENT_VERSION = "0.1.0"
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent.log')
 # V Docker režimu je adresář se skriptem připojený read-only, proto se stavový
 # soubor pro výpočet síťové propustnosti ukládá vždy do /tmp.
 NET_STATE_FILE = '/tmp/status-agent-net.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_net.state')
 
+# Between-run state and caches live next to the script (a root-owned
+# directory), not in the world-writable /tmp where any local user could
+# pre-create them; only the read-only Docker mount keeps /tmp.
+STATE_DIR = '/tmp' if DOCKER_MODE else os.path.dirname(os.path.abspath(__file__))
+
 VERBOSE = '--verbose' in sys.argv or '-v' in sys.argv or os.environ.get('STATUS_VERBOSE') == '1' or sys.stdout.isatty()
+# --dry-run / --print: collect, print the JSON to stdout, send nothing.
+DRY_RUN = '--dry-run' in sys.argv or '--print' in sys.argv
 
 def log_message(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_line = f"{ts} - {msg}\n"
     if VERBOSE:
-        print(log_line.strip())
-    
+        # In --dry-run stdout carries the JSON; chatter goes to stderr.
+        print(log_line.strip(), file=sys.stderr if DRY_RUN else sys.stdout)
+
     if not DOCKER_MODE:
         try:
+            # Bounded: above 1 MB keep the last 500 lines. It used to grow
+            # without limit - 5 lines per run including the full port list.
+            try:
+                if os.path.getsize(LOG_FILE) > 1048576:
+                    with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                        tail = f.readlines()[-500:]
+                    with open(LOG_FILE, "w", encoding="utf-8") as f:
+                        f.writelines(tail)
+            except OSError:
+                pass
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(log_line)
         except Exception:
             pass
 
 def log_debug(msg):
-    log_message(msg)
+    """Progress chatter - only with --verbose; the log file keeps errors and actions."""
+    if VERBOSE:
+        log_message(msg)
+
+
+def _boot_id():
+    """Kernel boot id: counters restart from zero after a reboot, so a delta
+    against a state file from the previous boot is meaningless (or, worse, a
+    fabricated 0.0). Every between-run state is keyed by this."""
+    try:
+        with open('/proc/sys/kernel/random/boot_id', 'r') as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _atomic_write_json(path, obj):
+    """State files are read by the next run: a kill mid-write must not leave a
+    truncated file behind (it would cost that run its deltas)."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except BaseException:
+        # A full disk must not leave one orphan per run next to the script.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 def get_cpu_usage():
     """
@@ -112,7 +167,7 @@ def get_cpu_usage():
     vysoký iowait ukazuje na pomalý/přetížený disk, ne na volnou CPU.
     Vrací (cpu_pct, steal_pct, iowait_pct).
     """
-    state_file = '/tmp/vps_agent_cpu_state.json'
+    state_file = os.path.join(STATE_DIR, 'vps_agent_cpu_state.json')
     now_ts = time.time()
 
     def read_stat():
@@ -129,28 +184,30 @@ def get_cpu_usage():
                     return idle, steal, iowait, total
         except IOError:
             pass
-        return 0.0, 0.0, 0.0, 0.0
+        return None, None, None, 0.0
 
     idle2, steal2, iowait2, total2 = read_stat()
     if total2 == 0:
-        return 0.0, 0.0, 0.0
+        return None, None, None
 
+    boot_id = _boot_id()
     prev_state = None
     if os.path.exists(state_file):
         try:
             with open(state_file, 'r') as f:
                 prev_state = json.load(f)
+            if prev_state.get('boot_id') != boot_id:
+                prev_state = None
         except Exception:
             pass
 
     try:
-        with open(state_file, 'w') as f:
-            json.dump({'ts': now_ts, 'stat': [idle2, steal2, iowait2, total2]}, f)
+        _atomic_write_json(state_file, {'ts': now_ts, 'boot_id': boot_id, 'stat': [idle2, steal2, iowait2, total2]})
     except Exception:
         pass
 
     if not prev_state or 'stat' not in prev_state:
-        return 0.0, 0.0, 0.0
+        return None, None, None
 
     idle1, steal1, iowait1, total1 = prev_state['stat']
     idle_delta = idle2 - idle1
@@ -159,7 +216,7 @@ def get_cpu_usage():
     total_delta = total2 - total1
 
     if total_delta <= 0:
-        return 0.0, 0.0, 0.0
+        return None, None, None
 
     cpu_pct = round((1.0 - idle_delta / total_delta) * 100, 1)
     steal_pct = round((steal_delta / total_delta) * 100, 1)
@@ -258,25 +315,39 @@ def get_conntrack_count():
 
 
 def get_oom_kills():
-    """Počet OOM zásahů od startu (dmesg). None = dmesg nedostupný (práva)."""
+    """OOM kills since boot from /proc/vmstat (kernel 4.13+). One small read,
+    monotonic. The old `dmesg` scan read the whole ring buffer every run,
+    counted each kill twice (two log lines per event) and shrank when the
+    buffer wrapped. None where the kernel does not expose the counter."""
     try:
-        out = subprocess.run(['dmesg'], capture_output=True, text=True, timeout=10)
-        if out.returncode != 0:
-            return None
-        low = out.stdout.lower()
-        return low.count('oom-killer') + low.count('out of memory')
+        with open('/proc/vmstat', 'r') as f:
+            for line in f:
+                if line.startswith('oom_kill '):
+                    return int(line.split()[1])
     except Exception:
-        return None
+        pass
+    return None
 
 
 def get_dns_latency_ms():
-    """Změřená latence skutečného DNS dotazu přes systémový resolver."""
-    try:
-        t0 = time.time()
-        socket.getaddrinfo('example.com', 80)
-        return round((time.time() - t0) * 1000, 1)
-    except Exception:
-        return None
+    """Latency of one resolver lookup. getaddrinfo() has no timeout of its own
+    and a dead resolver blocks it for 10-30 s - exactly when the report is
+    most wanted - so it runs in a daemon thread with a 3 s budget; a lookup
+    that did not finish has no latency to report."""
+    result = {}
+
+    def _lookup():
+        try:
+            t0 = time.time()
+            socket.getaddrinfo('example.com', 80)
+            result['ms'] = round((time.time() - t0) * 1000, 1)
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_lookup, daemon=True)
+    th.start()
+    th.join(3)
+    return result.get('ms')
 
 
 def get_openvpn_tunnels():
@@ -291,7 +362,9 @@ def get_openvpn_tunnels():
 def get_usb_devices():
     try:
         entries = os.listdir('/sys/bus/usb/devices')
-        return sum(1 for e in entries if e and e[0].isdigit() and '-' in e)
+        # 1-1 is a device; 1-0:1.0 is an interface (one per root hub even
+        # with nothing plugged in) - only the former count.
+        return sum(1 for e in entries if e and e[0].isdigit() and '-' in e and ':' not in e)
     except Exception:
         return None
 
@@ -317,14 +390,15 @@ def get_ram_usage():
         used = total - available
         
         if total == 0:
-            return 0.0
+            return None
         
         return round((used / total) * 100, 1)
     except Exception:
-        return 0.0
+        return None
 
 def get_swap_usage():
-    """Vypočítá využití swapu v % z /proc/meminfo. Vrací 0.0, pokud swap není nakonfigurovaný."""
+    """Swap usage in % from /proc/meminfo. No swap configured is "not applicable"
+    (None, a dash in the UI) - the same answer the other agents give - not 0.0 % of nothing."""
     try:
         mem = {}
         with open('/proc/meminfo', 'r') as f:
@@ -336,10 +410,10 @@ def get_swap_usage():
         total = mem.get('SwapTotal', 0)
         free = mem.get('SwapFree', 0)
         if total == 0:
-            return 0.0
+            return None
         return round(((total - free) / total) * 100, 1)
     except Exception:
-        return 0.0
+        return None
 
 def get_load_average():
     """Vrátí (load1, load5, load15) z /proc/loadavg, nebo (None, None, None) při chybě."""
@@ -360,11 +434,11 @@ def get_hdd_usage():
         used = total - free
 
         if total == 0:
-            return 0.0
+            return None
 
         return round((used / total) * 100, 1)
     except Exception:
-        return 0.0
+        return None
 
 def get_inode_usage():
     """Vypočítá zaplnění inodů kořenového disku v % - stejný statvfs() jako get_hdd_usage(), jen jiná pole."""
@@ -393,6 +467,7 @@ def get_disk_io_sectors():
     """
     read_total = 0
     write_total = 0
+    matched = 0
     try:
         with open('/proc/diskstats', 'r') as f:
             for line in f:
@@ -401,11 +476,14 @@ def get_disk_io_sectors():
                     continue
                 if not _WHOLE_DISK_RE.match(fields[2]):
                     continue
+                matched += 1
                 read_total += int(fields[5])   # sectors read
                 write_total += int(fields[9])  # sectors written
     except Exception:
-        pass
-    return read_total, write_total
+        return None, None
+    # mmcblk / dm-only hosts and containers without diskstats match nothing:
+    # that is "not measured", not a 0.0 KB/s rate.
+    return (read_total, write_total) if matched else (None, None)
 
 def get_disk_io():
     """
@@ -413,6 +491,8 @@ def get_disk_io():
     Stejný tick/tock princip jako get_network_usage() - první běh vrací (None, None).
     """
     read_sectors, write_sectors = get_disk_io_sectors()
+    if read_sectors is None:
+        return None, None
     now = time.time()
     sector_size = 512  # /proc/diskstats vždy počítá v 512B sektorech bez ohledu na fyzickou velikost sektoru
 
@@ -513,19 +593,35 @@ def get_temperature():
 
 def get_system_identity():
     """Statická identita hostitele kešovaná v RAM."""
-    cache_file = '/tmp/vps_agent_identity.json'
+    cache_file = os.path.join(STATE_DIR, 'vps_agent_identity.json')
+    root = HOST_ROOT if DOCKER_MODE and os.path.isdir(HOST_ROOT) else ''
+
+    def reboot_required():
+        # /var/run/reboot-required is a Debian/Ubuntu convention; elsewhere its
+        # absence proves nothing, so the answer is None, not a fabricated False.
+        if not os.path.exists(root + '/etc/debian_version'):
+            return None
+        # Both spellings: under /host, /var/run is a symlink to /run that the
+        # kernel would resolve against the container's own root.
+        return any(os.path.exists(root + p) for p in ('/run/reboot-required', '/var/run/reboot-required'))
+
+    # The cache used to be trusted forever - a kernel upgrade or a rename never
+    # reached the server where /tmp survives reboots. Keyed by boot id now.
+    boot_id = _boot_id()
     if os.path.exists(cache_file):
         try:
             with open(cache_file, 'r') as f:
                 res = json.load(f)
-                res['reboot_required'] = os.path.exists('/var/run/reboot-required')
+            if res.get('_boot_id') == boot_id:
+                res.pop('_boot_id', None)
+                res['reboot_required'] = reboot_required()
                 return res
         except Exception:
             pass
 
     identity = {
         'hostname': None, 'kernel': None, 'timezone': None,
-        'reboot_required': os.path.exists('/var/run/reboot-required'),
+        'reboot_required': reboot_required(),
         'cloud_provider': None, 'virtualization': None,
     }
 
@@ -542,17 +638,12 @@ def get_system_identity():
         pass
 
     try:
-        if os.path.exists('/etc/timezone'):
-            with open('/etc/timezone', 'r') as f:
+        if os.path.exists(root + '/etc/timezone'):
+            with open(root + '/etc/timezone', 'r') as f:
                 identity['timezone'] = f.read().strip()
-        elif os.path.islink('/etc/localtime'):
-            link = os.readlink('/etc/localtime')
+        elif os.path.islink(root + '/etc/localtime'):
+            link = os.readlink(root + '/etc/localtime')
             identity['timezone'] = link.split('zoneinfo/')[-1] if 'zoneinfo/' in link else None
-    except Exception:
-        pass
-
-    try:
-        identity['reboot_required'] = os.path.exists('/var/run/reboot-required')
     except Exception:
         pass
 
@@ -586,9 +677,8 @@ def get_system_identity():
         pass
 
     try:
-        with open(cache_file, 'w') as f:
-            json.dump(identity, f)
-        log_message(f"Načtena identita VPS: hostname={identity['hostname']} kernel={identity['kernel']}")
+        _atomic_write_json(cache_file, dict(identity, _boot_id=boot_id))
+        log_debug(f"Načtena identita VPS: hostname={identity['hostname']} kernel={identity['kernel']}")
     except Exception:
         pass
 
@@ -625,8 +715,10 @@ def get_process_snapshot(limit=5):
             pass
         return stats
 
-    state_file = '/tmp/vps_agent_proc_state.json'
+    state_file = os.path.join(STATE_DIR, 'vps_agent_proc_state.json')
     now_ts = time.time()
+    boot_id = _boot_id()
+    self_pid = str(os.getpid())
     stats2 = read_all_stats()
     zombie_count = sum(1 for state, _ in stats2.values() if state == 'Z')
 
@@ -635,17 +727,41 @@ def get_process_snapshot(limit=5):
         try:
             with open(state_file, 'r') as f:
                 raw = json.load(f)
-                prev_state = {int(k): v for k, v in raw.get('stats', {}).items()}
+                # PIDs are strings on both sides: the previous version cast the
+                # saved keys to int while the live keys stayed str, so no PID
+                # ever matched and the CPU ranking was always empty.
+                prev_state = {str(k): v for k, v in raw.get('stats', {}).items()}
                 prev_ts = raw.get('ts', now_ts)
+                if raw.get('boot_id') != boot_id:
+                    prev_state = None
         except Exception:
             pass
 
     try:
         serializable_stats = {str(k): list(v) for k, v in stats2.items()}
-        with open(state_file, 'w') as f:
-            json.dump({'ts': now_ts, 'stats': serializable_stats}, f)
+        _atomic_write_json(state_file, {'ts': now_ts, 'boot_id': boot_id, 'stats': serializable_stats})
     except Exception:
         pass
+
+    # One pass over /proc/<pid>/status gives every name and RSS; both rankings
+    # come from it, so neither needs a /proc walk of its own. Both values in
+    # both lists so no cell in the table stays empty - a value that was not
+    # read is None, never 0.
+    names = {}
+    rss_kb = {}
+    for pid in stats2:
+        try:
+            with open(f'/proc/{pid}/status', 'r') as f:
+                for line in f:
+                    if line.startswith('Name:'):
+                        names[pid] = line.split(None, 1)[1].strip()
+                    elif line.startswith('VmRSS:'):
+                        rss_kb[pid] = int(line.split()[1])
+        except Exception:
+            continue
+
+    def ram_mb(pid):
+        return round(rss_kb[pid] / 1024, 1) if pid in rss_kb else None
 
     cpu_deltas = []
     if prev_state:
@@ -655,39 +771,21 @@ def get_process_snapshot(limit=5):
             clk_tck = 100
         elapsed = max(0.1, now_ts - prev_ts)
         for pid, (state, ticks2) in stats2.items():
-            if pid not in prev_state or state == 'Z':
+            # The agent itself never belongs in its own ranking.
+            if pid == self_pid or pid not in prev_state or state == 'Z':
                 continue
             ticks1 = prev_state[pid][1]
             delta_ticks = ticks2 - ticks1
             if delta_ticks <= 0:
                 continue
             cpu_pct = round(((delta_ticks / clk_tck) / elapsed) * 100, 1)
-        try:
-            with open(f'/proc/{pid}/comm', 'r') as f:
-                name = f.read().strip()
-        except Exception:
-            name = f'pid-{pid}'
-        cpu_deltas.append({'name': name, 'cpu': cpu_pct})
+            cpu_deltas.append({'name': names.get(pid, f'pid-{pid}'), 'cpu': cpu_pct, 'ram_mb': ram_mb(pid)})
 
     cpu_deltas.sort(key=lambda x: x['cpu'], reverse=True)
     top_cpu = cpu_deltas[:limit]
 
-    ram_list = []
-    for pid in stats2:
-        try:
-            with open(f'/proc/{pid}/status', 'r') as f:
-                rss_kb = None
-                name = f'pid-{pid}'
-                for line in f:
-                    if line.startswith('VmRSS:'):
-                        rss_kb = int(line.split()[1])
-                    elif line.startswith('Name:'):
-                        name = line.split(None, 1)[1].strip()
-                if rss_kb:
-                    ram_list.append({'name': name, 'ram_mb': round(rss_kb / 1024, 1)})
-        except Exception:
-            continue
-
+    ram_list = [{'name': names.get(pid, f'pid-{pid}'), 'ram_mb': round(kb / 1024, 1)}
+                for pid, kb in rss_kb.items() if kb and pid != self_pid]
     ram_list.sort(key=lambda x: x['ram_mb'], reverse=True)
     top_ram = ram_list[:limit]
 
@@ -758,7 +856,7 @@ def get_network_usage():
         return None, None
 
     net_kbps = round((delta_bytes / elapsed) / 1024, 1)
-    net_errors = max(0, delta_errors)
+    net_errors = delta_errors if delta_errors >= 0 else None
     return net_kbps, net_errors
 
 def get_uptime():
@@ -767,31 +865,67 @@ def get_uptime():
         with open('/proc/uptime', 'r') as f:
             return int(float(f.readline().split()[0]))
     except Exception:
-        return 0
+        return None
 
 def get_smart_status():
-    """Kontrola stavu disků přes smartctl (pokud je dostupné)"""
+    """SMART health, refreshed once per HEAVY_OP_INTERVAL_HOURS. smartctl wakes
+    drives and costs 50-300 ms each; running it every minute was the single
+    most expensive thing this agent did, for a value that changes about never."""
+    cache_file = os.path.join(STATE_DIR, 'vps_agent_smart_cache.json')
+    ttl = max(1, HEAVY_OP_INTERVAL_HOURS) * 3600
     try:
-        drives = []
-        if os.path.exists('/sys/class/block'):
-            for dev in os.listdir('/sys/class/block'):
-                if dev.startswith('sd') or dev.startswith('nvme') or dev.startswith('vd'):
-                    if os.path.exists(f'/sys/class/block/{dev}/device') and not dev[-1].isdigit():
-                        drives.append(dev)
-        
-        if not drives:
-            return "OK (Nebyly detekovány fyzické disky)"
-            
-        for drive in drives:
-            res = subprocess.run(['smartctl', '-H', f'/dev/{drive}'], capture_output=True, text=True)
-            if res.returncode != 0:
-                if "not found" in res.stderr or res.returncode == 127:
-                    return "N/A (smartctl chybí)"
-                if "PASSED" not in res.stdout:
-                    return f"WARNING (Disk /dev/{drive} selhal v SMART)"
-        return "OK"
+        if time.time() - os.path.getmtime(cache_file) < ttl:
+            with open(cache_file, 'r') as f:
+                cached = json.load(f)
+            if isinstance(cached, dict) and isinstance(cached.get('smart'), str):
+                return cached['smart']
+    except Exception:
+        pass
+    result = _probe_smart_status()
+    try:
+        _atomic_write_json(cache_file, {'smart': result})
+    except Exception:
+        pass
+    return result
+
+
+def _probe_smart_status():
+    try:
+        drives = sorted(d for d in os.listdir('/sys/class/block')
+                        if _WHOLE_DISK_RE.match(d) and os.path.exists(f'/sys/class/block/{d}/device'))
     except Exception:
         return "N/A"
+    if not drives:
+        return "OK (Nebyly detekovány fyzické disky)"
+    failed = []
+    unknown = []
+    for drive in drives:
+        try:
+            # -n standby: do not spin a sleeping drive up just to ask how it feels.
+            res = subprocess.run(['smartctl', '-H', '-n', 'standby', f'/dev/{drive}'],
+                                 capture_output=True, text=True, timeout=20)
+        except FileNotFoundError:
+            return "N/A (smartctl chybí)"
+        except Exception:
+            unknown.append(drive)
+            continue
+        out = res.stdout
+        # Exit-status bit 3 is "DISK FAILING" (smartctl(8)). ATA drives print
+        # PASSED/FAILED, SCSI/SAS ones "SMART Health Status: OK" or a failure text.
+        if (res.returncode & 8) or 'FAILED' in out or ('Health Status:' in out and 'Health Status: OK' not in out):
+            failed.append(drive)
+        elif 'PASSED' in out or 'Health Status: OK' in out:
+            continue
+        else:
+            # No verdict: virtio disk, unsupported bridge, not root, standby.
+            unknown.append(drive)
+    # A failing disk wins even when another gave no verdict - an early return
+    # on the first silent drive used to hide the failing one behind it.
+    if failed:
+        return f"WARNING (Disk /dev/{failed[0]} selhal v SMART)"
+    if unknown:
+        return "N/A (SMART nedostupné pro /dev/" + ", /dev/".join(unknown) + ")"
+    return "OK"
 
 def get_os_version():
     """Zjistí název a verzi operačního systému ze souboru /etc/os-release"""
@@ -874,7 +1008,9 @@ def get_ts3_process_info():
     if pid is None:
         return None
 
-    result = {"pid": int(pid), "cpu": 0.0, "ram_mb": 0.0, "threads": 0, "open_fds": 0, "uptime_sec": 0}
+    # Unmeasured is None: CPU needs a previous sample of the same PID, the
+    # rest needs a readable /proc entry (not always the case without root).
+    result = {"pid": int(pid), "cpu": None, "ram_mb": None, "threads": None, "open_fds": None, "uptime_sec": None}
 
     try:
         clk_tck = os.sysconf('SC_CLK_TCK')
@@ -897,20 +1033,23 @@ def get_ts3_process_info():
             return None
 
     stat2 = read_proc_stat(pid)
-    state_file = f'/tmp/vps_agent_ts3_{pid}_state.json'
+    # One fixed file with the PID inside - the old per-PID name left a new
+    # file in /tmp after every ts3server restart, forever.
+    state_file = os.path.join(STATE_DIR, 'vps_agent_ts3_state.json')
     now_ts = time.time()
     prev_state = None
     if os.path.exists(state_file):
         try:
             with open(state_file, 'r') as f:
                 prev_state = json.load(f)
+            if str(prev_state.get('pid')) != str(pid):
+                prev_state = None
         except Exception:
             pass
 
     try:
         if stat2:
-            with open(state_file, 'w') as f:
-                json.dump({'ts': now_ts, 'stat': stat2}, f)
+            _atomic_write_json(state_file, {'ts': now_ts, 'pid': str(pid), 'stat': stat2})
     except Exception:
         pass
 
@@ -918,7 +1057,11 @@ def get_ts3_process_info():
         stat1 = prev_state['stat']
         elapsed = max(0.1, now_ts - prev_state.get('ts', now_ts))
         cpu_ticks_delta = (stat2[0] + stat2[1]) - (stat1[0] + stat1[1])
-        result["cpu"] = round(((cpu_ticks_delta / clk_tck) / elapsed) * 100, 1)
+        if cpu_ticks_delta >= 0:
+            result["cpu"] = round(((cpu_ticks_delta / clk_tck) / elapsed) * 100, 1)
+    if stat2:
+        # Uptime comes from the process start time alone - it never needed the
+        # previous sample, yet it used to be 0 until the second run.
         try:
             with open('/proc/uptime', 'r') as f:
                 host_uptime = float(f.readline().split()[0])
@@ -1054,9 +1197,6 @@ def send_action_result(action_id, status, message):
     agent_actions.status zůstal navždy na 'sent' v administraci, i když se
     akce provedla - stejný kontrakt jako send_action_result() v agent.sh
     a agent_openwrt.sh (agent_api.php větev action_result)."""
-    ts_up, ts_peers = get_tailscale()
-    ups_status, ups_battery = get_ups()
-    ram_total_mb, ram_used_mb, ram_available_mb, ram_free_mb = get_ram_detail_mb()
     payload = {
         "agent_key": AGENT_KEY,
         "action_result": {
@@ -1130,15 +1270,25 @@ def handle_remote_action(res_body):
             return
         try:
             if subprocess.call(["systemctl", "restart", svc_name],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120) == 0:
                 log_message(f"Restartována služba přes systemctl: {svc_name}")
                 send_action_result(act_id, "executed", f"Služba '{svc_name}' restartována přes systemctl")
                 return
+        except subprocess.TimeoutExpired:
+            # subprocess.call kills the client and raises; without this the
+            # exception escaped to main(), the agent exited 1 and the action
+            # stayed "sent" on the server forever.
+            send_action_result(act_id, "failed", f"Restart '{svc_name}' přes systemctl nedoběhl do 120 s")
+            return
         except OSError:
             pass
         init_script = f"/etc/init.d/{svc_name}"
         if os.access(init_script, os.X_OK):
-            subprocess.call([init_script, "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                subprocess.call([init_script, "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                send_action_result(act_id, "failed", f"Restart '{svc_name}' přes init.d selhal: {e}")
+                return
             log_message(f"Restartována služba přes init.d: {svc_name}")
             send_action_result(act_id, "executed", f"Služba '{svc_name}' restartována přes init.d")
         else:
@@ -1151,9 +1301,9 @@ def handle_remote_action(res_body):
         send_action_result(act_id, "executed", "Server se restartuje")
         for cmd in (["/sbin/reboot"], ["systemctl", "reboot"]):
             try:
-                if subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                if subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120) == 0:
                     break
-            except OSError:
+            except (subprocess.TimeoutExpired, OSError):
                 continue
 
 
@@ -1161,7 +1311,7 @@ def get_discovered_services(ports, processes):
     """Detekce běžících služeb podle portů/procesů/konfiguračních souborů.
     Vrací seznam dictů: {name, type, port, confidence, evidence, missing}.
     Confidence je součet bodů (process=30, port=25, config=25, active=19), max 99."""
-    cache_file = '/tmp/vps_agent_services_cache.json'
+    cache_file = os.path.join(STATE_DIR, 'vps_agent_services_cache.json')
     now_ts = time.time()
     cache_ttl = HEAVY_OP_INTERVAL_HOURS * 3600
 
@@ -1277,15 +1427,15 @@ def get_discovered_services(ports, processes):
 
 
 def main():
-    global AUTO_UPDATE, VERBOSE
+    global AUTO_UPDATE, VERBOSE, DRY_RUN
 
     for arg in sys.argv[1:]:
         if arg in ('--help', '-h'):
             print(f"Python VPS Status Agent v{AGENT_VERSION}")
             print(f"Použití: {sys.argv[0]} [MOŽNOSTI]")
             print("\nMožnosti:")
-            print("  --register TOKEN [API_URL]   Zaregistruje agenta na zadaný monitoring server")
             print("  --update, --auto-update      Vynutí kontrolu a aktualizaci agenta ze serveru")
+            print("  --dry-run, --print           Sesbírá data a vypíše JSON, neodesílá (i bez klíče)")
             print("  --verbose, -v                Zobrazí podrobný průbeh sběru dat a odesílání")
             print("  --version, -V                Zobrazí verzi agenta")
             print("  --help, -h                   Zobrazí tuto nápovědu")
@@ -1302,10 +1452,25 @@ def main():
             VERBOSE = True
         elif arg in ('--verbose', '-v'):
             VERBOSE = True
+        elif arg in ('--dry-run', '--print'):
+            DRY_RUN = True
+            VERBOSE = True
 
-    if AGENT_KEY == "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE":
+    if AGENT_KEY == "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE" and not DRY_RUN:
         log_message("CHYBA: Nebyl nastaven AGENT_KEY. Upravte skript nebo 'agent.cfg'.")
         sys.exit(1)
+
+    # One run at a time: a report stalled on a dead server must not let cron
+    # stack a fresh agent on top of it every minute.
+    lock_fh = None
+    try:
+        import fcntl
+        lock_fh = open(os.path.join(STATE_DIR, 'vps_agent.lock'), 'w')
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (ImportError, OSError):
+        if lock_fh is not None:
+            log_message("Předchozí běh ještě běží, tento končím.")
+            sys.exit(0)
 
     log_debug("Získávám systémové statistiky...")
     cpu, cpu_steal, iowait = get_cpu_usage()
@@ -1328,6 +1493,12 @@ def main():
     ts3_process = get_ts3_process_info()
     zombie_count, top_cpu_processes, top_ram_processes = get_process_snapshot()
     discovered_services = get_discovered_services(ports, processes)
+    # These three lived inside send_action_result() by mistake, so main()
+    # died with NameError on ram_total_mb before it ever built a payload -
+    # the Python agent has not delivered a single report since they were added.
+    ts_up, ts_peers = get_tailscale()
+    ups_status, ups_battery = get_ups()
+    ram_total_mb, ram_used_mb, ram_available_mb, ram_free_mb = get_ram_detail_mb()
 
     payload = {
         "agent_key": AGENT_KEY,
@@ -1354,7 +1525,7 @@ def main():
         "uptime": uptime,
         "smart": smart,
         "ports": ports,
-        "processes": processes,
+        "processes": sorted(processes),
         "teamspeak_servers": teamspeak_servers,
         "ts3_process": ts3_process,
         "zombie_count": zombie_count,
@@ -1385,6 +1556,11 @@ def main():
         "usb_devices": get_usb_devices(),
         "discovered_services": discovered_services
     }
+
+    if DRY_RUN:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        log_debug("Režim --dry-run: data se neodesílají.")
+        return
 
     net_log = f"{net} KB/s" if net is not None else "N/A (první běh)"
     log_debug(f"Metriky - OS: {os_ver}, CPU: {cpu}% (steal {cpu_steal}%, iowait {iowait}%), RAM: {ram}% (swap {swap}%), HDD: {hdd}% (inode {inode_usage}%), Load: {load1}/{load5}/{load15}, Síť: {net_log}, Zombie: {zombie_count}, Uptime: {uptime}s, SMART: {smart}, Porty: {ports}")

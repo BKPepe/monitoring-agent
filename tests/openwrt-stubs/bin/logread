@@ -1,0 +1,10 @@
+#!/bin/sh
+cat <<'M'
+Tue Sep  2 09:00:01 2026 daemon.info dnsmasq[123]: started, version 2.90 cachesize 150
+Tue Sep  2 09:00:02 2026 daemon.info uhttpd[200]: starting
+Tue Sep  2 09:00:03 2026 daemon.err odhcpd[300]: Failed to send RS
+Tue Sep  2 09:00:04 2026 kern.warn kernel: something odd
+Tue Sep  2 09:05:01 2026 daemon.info dnsmasq[124]: started, version 2.90 cachesize 150
+Tue Sep  2 09:05:02 2026 daemon.err dnsmasq[124]: failed to create listening socket
+Tue Sep  2 09:05:03 2026 daemon.notice netifd: wan (1234): udhcpc: lease of 10.0.0.2 obtained
+M
