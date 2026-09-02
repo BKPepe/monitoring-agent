@@ -47,6 +47,8 @@ checks = {
     "hilink: registration asked every run": hilink_calls("/api/monitoring/status") == 2,
     "hilink: SIM state and operator asked once, then served from the cache": hilink_calls("/api/pin/status") == 1 and hilink_calls("/api/net/current-plmn") == 1,
     "no interfaces at all: LTE stays unknown": d3["lte_up"] is None and d3["lte_connected"] is None,
+    "link roles: the WAN device is reported, the LTE rate is measured on the second run": d["wan_l3_device"] == "eth0" and d1["net_lte"] is None and isinstance(d["net_lte"], (int, float)),
+    "no interfaces at all: no WAN device, no LTE rate": d3["wan_l3_device"] is None and d3["net_lte"] is None,
     "version reported": isinstance(d.get("version"), str) and d["version"] != "",
 }
 failed = [k for k, v in checks.items() if not v]

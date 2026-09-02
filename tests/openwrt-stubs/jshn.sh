@@ -46,7 +46,8 @@ json_get_var() {
         /interface/2:interface) eval "$1=lte" ;;
         /interface/2:up) eval "$1=1" ;;
         /interface/2:proto) eval "$1=dhcp" ;;
-        /interface/2:l3_device) eval "$1=eth2" ;;
+        # loopback: exists in the container, so the LTE rate path has counters to read
+        /interface/2:l3_device) eval "$1=lo" ;;
         /interface/2:uptime) eval "$1=700" ;;
         /interface/2/ipv4-address/0:address) eval "$1=192.168.8.100" ;;
         *) eval "$1=''" ;;

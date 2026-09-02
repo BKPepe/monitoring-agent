@@ -101,7 +101,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.2"
+AGENT_VERSION="0.1.3"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 CPU_STATE_FILE="/tmp/status-agent-openwrt-cpu.state"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
@@ -1326,6 +1326,42 @@ if bk_iface_load "lte wwan wwan0 modem lte1" "qmi mbim ncm modemmanager 3g"; the
     done
 fi
 
+# --- LTE throughput (KB/s): the same tick/tock as the WAN rate above -------
+# Together with the wan_lost / wan_restored events this is what tells the two
+# links apart on the web - which bytes went over the primary line and which
+# over the backup. A different device than last time (modem re-enumerated)
+# is a fresh start, not a negative delta.
+net_lte="null"
+NET_LTE_STATE_FILE="/tmp/status-agent-openwrt-net-lte.state"
+if [ -n "$lte_device" ] && [ "$lte_device" != "null" ] && [ -f /proc/net/dev ]; then
+    lte_bytes=$(awk -v iface="$lte_device" '
+    NR > 2 {
+        line = $0;
+        colon = index(line, ":");
+        if (colon == 0) next;
+        ifname = substr(line, 1, colon - 1);
+        gsub(/^[ \t]+|[ \t]+$/, "", ifname);
+        if (ifname != iface) next;
+        n = split(substr(line, colon + 1), f, " ");
+        printf "%.0f", (f[1] + 0) + (f[9] + 0);
+    }' /proc/net/dev 2>/dev/null)
+    if [ -n "$lte_bytes" ]; then
+        if [ -f "$NET_LTE_STATE_FILE" ]; then
+            prev_lte_ts=$(cut -d',' -f1 "$NET_LTE_STATE_FILE" 2>/dev/null)
+            prev_lte_dev=$(cut -d',' -f2 "$NET_LTE_STATE_FILE" 2>/dev/null)
+            prev_lte_bytes=$(cut -d',' -f3 "$NET_LTE_STATE_FILE" 2>/dev/null)
+            if [ "$prev_lte_dev" = "$lte_device" ] && [ -n "$prev_lte_ts" ] && [ -n "$prev_lte_bytes" ]; then
+                elapsed_lte=$((now_ts - prev_lte_ts))
+                delta_lte=$((lte_bytes - prev_lte_bytes))
+                if [ "$elapsed_lte" -gt 0 ] && [ "$delta_lte" -ge 0 ]; then
+                    net_lte=$(awk -v d="$delta_lte" -v e="$elapsed_lte" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
+                fi
+            fi
+        fi
+        echo "${now_ts},${lte_device},${lte_bytes}" > "$NET_LTE_STATE_FILE" 2>/dev/null || true
+    fi
+fi
+
 # --- Signal, SIM a registrace z HiLink API modemu ----------------------------
 #
 # Modemy Huawei/Brovi v rezimu HiLink vystavuji na sve brane HTTP API. Je to
@@ -2186,6 +2222,7 @@ payload=$(cat <<EOF
   "top_cpu_processes": $top_cpu_json,
   "top_ram_processes": $top_ram_json,
   "net": $net,
+  "net_lte": $net_lte,
   "net_ipv4_kbps": $net_ipv4_kbps,
   "net_ipv6_kbps": $net_ipv6_kbps,
   "hdd": $hdd,
@@ -2202,6 +2239,7 @@ payload=$(cat <<EOF
   "board_name": "$(json_str "$ow_board_name")",
   "wan_up": $wan_up_json,
   "wan_proto": $(json_val "$wan_proto"),
+  "wan_l3_device": $(json_val "$wan_l3_device"),
   "wan_ipv4": $(json_val "$wan_ipv4"),
   "wan_ipv6": $(json_val "$wan_ipv6"),
   "wan_gateway": $(json_val "$wan_gateway"),
