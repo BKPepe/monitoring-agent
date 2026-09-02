@@ -74,8 +74,21 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
     HOSTNAME_VAL=$(uname -n 2>/dev/null || echo "OpenWrt-Router")
     echo "Registruji router na $API_URL..."
-    FETCH_CMD="curl -s -X POST -H 'Content-Type: application/json' -d \"{\\\"action\\\":\\\"register\\\", \\\"token\\\":\\\"$REG_TOKEN\\\", \\\"hostname\\\":\\\"$HOSTNAME_VAL\\\", \\\"agent_type\\\":\\\"openwrt\\\"}\" \"$API_URL\""
-    RESP=$(eval "$FETCH_CMD")
+    # Stock OpenWrt ships uclient-fetch, not curl - registration used to fail
+    # on exactly the routers this script is for. Values are escaped into the
+    # body, not eval'ed into a command line.
+    bk_reg_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+    REG_BODY="{\"action\":\"register\",\"token\":\"$(bk_reg_esc "$REG_TOKEN")\",\"hostname\":\"$(bk_reg_esc "$HOSTNAME_VAL")\",\"agent_type\":\"openwrt\"}"
+    if command -v curl >/dev/null 2>&1; then
+        RESP=$(curl -s -m 20 -X POST -H 'Content-Type: application/json' -d "$REG_BODY" "$API_URL")
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        RESP=$(uclient-fetch -q -T 20 -O - --post-data="$REG_BODY" --header='Content-Type: application/json' "$API_URL" 2>&1)
+    elif command -v wget >/dev/null 2>&1; then
+        RESP=$(wget -q -T 20 -O - --post-data="$REG_BODY" --header='Content-Type: application/json' "$API_URL" 2>&1)
+    else
+        echo "CHYBA: Neni k dispozici curl, uclient-fetch ani wget."
+        exit 1
+    fi
     NEW_KEY=$(echo "$RESP" | sed -n 's/.*"agent_key":"\([^"]*\)".*/\1/p')
     if [ -n "$NEW_KEY" ]; then
         echo "API_URL=\"$API_URL\"" > "$ScriptPath/agent_openwrt.cfg"
@@ -88,7 +101,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.1"
+AGENT_VERSION="0.1.2"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 CPU_STATE_FILE="/tmp/status-agent-openwrt-cpu.state"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
@@ -158,7 +171,9 @@ BK_VERSION_STAMP="/tmp/status-agent-openwrt-version.stamp"
 if [ "$(cat "$BK_VERSION_STAMP" 2>/dev/null)" != "$AGENT_VERSION" ]; then
     rm -f /tmp/status-agent-openwrt-identity.cache \
           /tmp/status-agent-openwrt-opkg.cache \
-          /tmp/status-agent-openwrt-services.cache 2>/dev/null || true
+          /tmp/status-agent-openwrt-services.cache \
+          /tmp/status-agent-openwrt-hilink-pin.cache \
+          /tmp/status-agent-openwrt-hilink-plmn.cache 2>/dev/null || true
     echo "$AGENT_VERSION" > "$BK_VERSION_STAMP" 2>/dev/null || true
 fi
 
@@ -415,9 +430,63 @@ fi
 # (access point, uplink on wwan or wan_pppoe) measured nothing, and "false"
 # would make the server raise a wan_lost alert on it forever.
 wan_up=""; wan_proto=""; wan_uptime="null"; wan_ipv4=""; wan_gateway=""; wan_dns=""; wan_l3_device=""
-wan_json=$(ubus call network.interface.wan status 2>/dev/null)
-if [ -n "$wan_json" ]; then
-    json_load "$wan_json"
+# One `network.interface dump` for everything below (WAN, wan6, LAN, LTE):
+# it carries the same fields as the per-interface status calls, of which the
+# agent used to make up to eight a run.
+dump_json=""
+command -v ubus >/dev/null 2>&1 && dump_json=$(ubus call network.interface dump 2>/dev/null)
+_bi_list=""
+# Scans the dump once into "key|name|proto" lines.
+bk_iface_scan() {
+    [ -n "$_bi_list" ] && return 0
+    [ -n "$dump_json" ] || return 1
+    json_load "$dump_json"
+    json_select interface
+    _bi_keys=""
+    json_get_keys _bi_keys
+    for _bi_k in $_bi_keys; do
+        json_select "$_bi_k"
+        _bi_name=""; _bi_proto=""
+        json_get_var _bi_name interface
+        json_get_var _bi_proto proto
+        _bi_list="$_bi_list$_bi_k|$_bi_name|$_bi_proto
+"
+        json_select ..
+    done
+    [ -n "$_bi_list" ]
+}
+# bk_iface_load NAMES [PROTOS]: leaves the jshn cursor inside the first
+# interface called one of NAMES (in that order), else the first whose proto
+# is one of PROTOS. Returns 1 when there is none - a box with no "wan"
+# measures nothing about it.
+bk_iface_load() {
+    bk_iface_scan || return 1
+    _bi_hit=""
+    for _bi_want in $1; do
+        while IFS='|' read -r _bi_k _bi_n _bi_p; do
+            [ "$_bi_n" = "$_bi_want" ] && { _bi_hit="$_bi_k"; break; }
+        done <<EOF
+$_bi_list
+EOF
+        [ -n "$_bi_hit" ] && break
+    done
+    if [ -z "$_bi_hit" ]; then
+        for _bi_want in $2; do
+            while IFS='|' read -r _bi_k _bi_n _bi_p; do
+                [ "$_bi_p" = "$_bi_want" ] && { _bi_hit="$_bi_k"; break; }
+            done <<EOF
+$_bi_list
+EOF
+            [ -n "$_bi_hit" ] && break
+        done
+    fi
+    [ -n "$_bi_hit" ] || return 1
+    json_load "$dump_json"
+    json_select interface
+    json_select "$_bi_hit"
+    return 0
+}
+if bk_iface_load wan; then
     json_get_var wan_up up
     json_get_var wan_proto proto
     json_get_var wan_uptime uptime
@@ -528,7 +597,6 @@ fi
 # "wan6" (typicke pro PPPoE + DHCPv6-PD), protoze "wan" samo casto ma jen
 # link-local fe80:: adresu, ktera pro verejne zobrazeni nema smysl. ---
 wan_ipv6=""
-dump_json=$(ubus call network.interface dump 2>/dev/null)
 if [ -n "$dump_json" ]; then
     json_load "$dump_json"
     json_select interface
@@ -1223,27 +1291,37 @@ lte_up="null"
 lte_device="null"
 lte_uptime="null"
 lte_ipv4="null"
-if command -v ubus >/dev/null 2>&1; then
-    for lte_if in lte wwan wwan0 modem lte1; do
-        lte_status=$(ubus call "network.interface.${lte_if}" status 2>/dev/null)
-        [ -z "$lte_status" ] && continue
-
-        lte_up_raw=$(echo "$lte_status" | jsonfilter -e '@.up' 2>/dev/null)
-        [ "$lte_up_raw" = "true" ] || [ "$lte_up_raw" = "1" ] && lte_up="true" || lte_up="false"
-
-        lte_dev=$(echo "$lte_status" | jsonfilter -e '@.l3_device' 2>/dev/null)
-        [ -z "$lte_dev" ] && lte_dev=$(echo "$lte_status" | jsonfilter -e '@.device' 2>/dev/null)
-        [ -n "$lte_dev" ] && lte_device="$lte_dev"
-
-        lte_up_sec=$(echo "$lte_status" | jsonfilter -e '@.uptime' 2>/dev/null)
-        case "$lte_up_sec" in
-            ''|*[!0-9]*) : ;;
-            *) lte_uptime="$lte_up_sec" ;;
-        esac
-
-        lte_addr=$(echo "$lte_status" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
-        [ -n "$lte_addr" ] && lte_ipv4="$lte_addr"
-
+# From the one interface dump above: the usual names first, then any
+# interface whose protocol is a modem one - the uplink does not have to be
+# called "lte" for the backup to count. Five speculative ubus calls a run
+# used to go here, four of them failing.
+if bk_iface_load "lte wwan wwan0 modem lte1" "qmi mbim ncm modemmanager 3g"; then
+    _lte_up_raw=""
+    json_get_var _lte_up_raw up
+    case "$_lte_up_raw" in
+        1|true) lte_up="true" ;;
+        0|false) lte_up="false" ;;
+    esac
+    _lte_dev=""
+    json_get_var _lte_dev l3_device
+    [ -z "$_lte_dev" ] && json_get_var _lte_dev device
+    [ -n "$_lte_dev" ] && lte_device="$_lte_dev"
+    _lte_up_sec=""
+    json_get_var _lte_up_sec uptime
+    case "$_lte_up_sec" in
+        ''|*[!0-9]*) : ;;
+        *) lte_uptime="$_lte_up_sec" ;;
+    esac
+    _lte_a4=""
+    json_get_keys _lte_a4 "ipv4-address"
+    for _lte_k in $_lte_a4; do
+        json_select "ipv4-address"
+        json_select "$_lte_k"
+        _lte_addr=""
+        json_get_var _lte_addr address
+        json_select ..
+        json_select ..
+        [ -n "$_lte_addr" ] && lte_ipv4="$_lte_addr"
         break
     done
 fi
@@ -1341,6 +1419,28 @@ bk_hilink_get() {
     _hl_out="$_hl_body"
 }
 
+# bk_hilink_cached ENDPOINT FILE TTL_SEC KEY: like bk_hilink_get, but the
+# answer is kept in FILE (timestamp, KEY, body) and reused while it is
+# younger than TTL_SEC and KEY has not changed. SIM state and operator name
+# change about never; the modem was asked for both every minute anyway.
+bk_hilink_cached() {
+    _hc_file="$2"; _hc_ttl="$3"; _hc_key="$4"; _hl_out=""
+    if [ -f "$_hc_file" ]; then
+        _hc_ts=$(sed -n '1p' "$_hc_file" 2>/dev/null)
+        _hc_k=$(sed -n '2p' "$_hc_file" 2>/dev/null)
+        case "$_hc_ts" in ''|*[!0-9]*) _hc_ts=0 ;; esac
+        if [ $((now_ts - _hc_ts)) -lt "$_hc_ttl" ] && [ "$_hc_k" = "$_hc_key" ]; then
+            _hl_out=$(sed -n '3,$p' "$_hc_file" 2>/dev/null)
+            [ -n "$_hl_out" ] && return 0
+        fi
+    fi
+    bk_hilink_get "$1"
+    if [ -n "$_hl_out" ]; then
+        { printf '%s\n%s\n' "$now_ts" "$_hc_key"; printf '%s' "$_hl_out"; } > "$_hc_file.tmp" 2>/dev/null \
+            && mv "$_hc_file.tmp" "$_hc_file" 2>/dev/null
+    fi
+}
+
 if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; then
     lte_api_host=$(echo "$lte_ipv4" | sed 's/\.[0-9]*$/.1/')
 
@@ -1375,7 +1475,8 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
     # -- stav SIM: /api/pin/status --
     # SimState 257 = pripravena, 260 = ceka na PIN, 261 = ceka na PUK,
     # 255 = zadna SIM, 256/262 = neplatna nebo zablokovana.
-    bk_hilink_get /api/pin/status; lte_pin_xml="$_hl_out"
+    # Ten minutes, or sooner when monitoring/status reports a different SimStatus.
+    bk_hilink_cached /api/pin/status /tmp/status-agent-openwrt-hilink-pin.cache 600 "$lte_sim_status_code"; lte_pin_xml="$_hl_out"
     _sim=$(bk_xml_tag "$lte_pin_xml" SimState | sed 's/[^0-9]//g')
     if [ -n "$_sim" ]; then
         lte_sim_code="$_sim"
@@ -1425,7 +1526,8 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
         [ -n "$_band" ] && lte_band="B${_band}"
 
         # Jmeno operatora ma jiny endpoint; bez nej zustava to, co uz mame.
-        bk_hilink_get /api/net/current-plmn; lte_plmn_xml="$_hl_out"
+        # Once per heavy interval, or when the PLMN code from device/signal changes.
+        bk_hilink_cached /api/net/current-plmn /tmp/status-agent-openwrt-hilink-plmn.cache "$HEAVY_OP_INTERVAL_SEC" "$lte_plmn"; lte_plmn_xml="$_hl_out"
         _carrier=$(bk_xml_tag "$lte_plmn_xml" FullName)
         [ -z "$_carrier" ] && _carrier=$(bk_xml_tag "$lte_plmn_xml" ShortName)
         [ -n "$_carrier" ] && lte_carrier="$_carrier"
@@ -1754,9 +1856,7 @@ fi
 
 # --- LAN / DHCP ---
 lan_subnet=""
-lan_json=$(ubus call network.interface.lan status 2>/dev/null)
-if [ -n "$lan_json" ]; then
-    json_load "$lan_json"
+if bk_iface_load lan; then
     json_get_keys lan_v4_keys "ipv4-address"
     for k in $lan_v4_keys; do
         json_select "ipv4-address"

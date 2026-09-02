@@ -11,6 +11,12 @@ out = sys.argv[1]
 d1 = json.load(open(f"{out}/r1.json"))
 d = json.load(open(f"{out}/r2.json"))
 d3 = json.load(open(f"{out}/r3.json"))  # no "wan" interface at all
+try:
+    calls = open(f"{out}/hilink_calls.log").read().split()
+except FileNotFoundError:
+    calls = []
+def hilink_calls(path):
+    return sum(1 for c in calls if c.endswith(path))
 wg = d["wireguard_peers"]
 radios = {r["radio"]: r for r in d["wifi_radios"]}
 checks = {
@@ -33,6 +39,14 @@ checks = {
     "oom_kills is a number": isinstance(d["oom_kills"], int),
     "no value is the string 'null'": all(v != "null" for v in d.values()),
     "no wan interface: wan_up and wan_internet are null, not false": d3["wan_up"] is None and d3["wan_internet"] is None and d3["wan_proto"] is None,
+    "wan: address and gateway from the one interface dump": d["wan_ipv4"] == "203.0.113.10" and d["wan_gateway"] == "203.0.113.1" and d["wan_proto"] == "dhcp",
+    "lan: subnet from the same dump": d["lan_subnet"] == "192.168.1.1/24",
+    "lte: interface found by name, address and uptime read": d["lte_up"] is True and d["lte_ipv4"] == "192.168.8.100" and d["lte_uptime"] == 700,
+    "hilink: registration and SIM verdict": d["lte_connected"] is True and d["lte_sim_state"] == "ready" and d["lte_conn_code"] == 901 and d["lte_service_code"] == 2 and d["lte_sim_status_code"] == 1 and d["lte_sim_pin_left"] == 3,
+    "hilink: signal, band, PLMN, operator": d["lte_rsrp"] == -85 and d["lte_band"] == "B20" and d["lte_plmn"] == "23001" and d["lte_carrier"] == "T-Mobile CZ",
+    "hilink: registration asked every run": hilink_calls("/api/monitoring/status") == 2,
+    "hilink: SIM state and operator asked once, then served from the cache": hilink_calls("/api/pin/status") == 1 and hilink_calls("/api/net/current-plmn") == 1,
+    "no interfaces at all: LTE stays unknown": d3["lte_up"] is None and d3["lte_connected"] is None,
     "version reported": isinstance(d.get("version"), str) and d["version"] != "",
 }
 failed = [k for k, v in checks.items() if not v]

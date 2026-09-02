@@ -1,0 +1,13 @@
+#!/bin/sh
+# Canned HiLink modem (192.168.8.1) API. The last argument is the URL; every
+# call is logged so the test can prove the SIM/operator answers are cached.
+for last; do :; done
+url="$last"
+echo "$url" >> /work/out/hilink_calls.log
+case "$url" in
+  */api/monitoring/status) printf '<response><ConnectionStatus>901</ConnectionStatus><SimStatus>1</SimStatus><ServiceStatus>2</ServiceStatus><CurrentNetworkType>19</CurrentNetworkType></response>\n' ;;
+  */api/pin/status) printf '<response><SimState>257</SimState><SimPinTimes>3</SimPinTimes></response>\n' ;;
+  */api/device/signal) printf '<response><rsrp>-85dBm</rsrp><rsrq>-9dB</rsrq><sinr>7dB</sinr><rssi>-61dBm</rssi><band>20</band><plmn>23001</plmn><dlbandwidth>20MHz</dlbandwidth><pci>123</pci><cell_id>1234567</cell_id></response>\n' ;;
+  */api/net/current-plmn) printf '<response><FullName>T-Mobile CZ</FullName><ShortName>T-Mobile</ShortName></response>\n' ;;
+  *) exit 1 ;;
+esac
