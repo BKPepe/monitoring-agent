@@ -3,5 +3,6 @@
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         procps curl wget openssl python3 mawk iproute2 util-linux ca-certificates dnsutils \
+        netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /agent

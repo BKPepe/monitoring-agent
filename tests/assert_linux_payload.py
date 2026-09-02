@@ -25,6 +25,16 @@ for kind in ("sh", "py"):
     check(f"{kind}: version reported", isinstance(r2.get("version"), str) and r2["version"] != "")
     check(f"{kind}: uptime and boot_time consistent", isinstance(r2["uptime"], int) and isinstance(r2["boot_time"], int))
 
+# TeamSpeak, asked over each transport the agents have.
+for kind, label in (("sh2", "bash agent via python3"), ("sh3", "bash agent via nc"), ("py2", "python agent")):
+    servers = json.load(open(f"{out}/{kind}.json")).get("teamspeak_servers") or []
+    first = servers[0] if servers else {}
+    check(
+        f"teamspeak: {label} reads the virtual server",
+        first.get("port") == 9987 and first.get("clients_online") == 7 and first.get("clients_max") == 32,
+    )
+    check(f"teamspeak: {label} decodes the escaped name", first.get("name") == "Blood Kings")
+
 sh2 = json.load(open(f"{out}/sh2.json"))
 top = sh2["top_cpu_processes"]
 check("sh: the busy `yes` tops the CPU ranking", bool(top) and top[0]["name"] == "yes" and top[0]["cpu"] >= 50)

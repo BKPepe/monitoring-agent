@@ -86,7 +86,7 @@ if os.path.exists(cfg_path):
     except Exception:
         pass
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.1.1"
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent.log')
 # V Docker režimu je adresář se skriptem připojený read-only, proto se stavový
 # soubor pro výpočet síťové propustnosti ukládá vždy do /tmp.
@@ -1095,19 +1095,25 @@ def get_local_teamspeak_servers(ports):
         if q_port in ports:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2)
+                s.settimeout(5)
                 s.connect(('127.0.0.1', q_port))
-                s.recv(1024)
-                s.recv(1024)
+                # The command goes out first and everything that comes back is
+                # read as one stream. The previous version consumed the
+                # greeting with two fixed recv() calls, which assumed it
+                # arrives in exactly two packets - TCP promises no such thing,
+                # and when the server sent both lines together the second
+                # recv() blocked until the timeout and the whole query came
+                # back empty. The greeting carries no virtualserver_ fields,
+                # so parsing it along with the answer costs nothing.
                 s.sendall(b"serverlist\nquit\n")
-                
+
                 response = ""
                 while True:
-                    chunk = s.recv(4096).decode('utf-8')
+                    chunk = s.recv(4096).decode('utf-8', 'replace')
                     if not chunk:
                         break
                     response += chunk
-                    if "error id=" in chunk:
+                    if "error id=" in response:
                         break
                 s.close()
                 
