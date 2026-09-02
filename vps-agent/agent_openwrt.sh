@@ -85,7 +85,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.0.1"
+AGENT_VERSION="0.1.0"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 CPU_STATE_FILE="/tmp/status-agent-openwrt-cpu.state"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
@@ -1156,31 +1156,140 @@ if command -v ubus >/dev/null 2>&1; then
     done
 fi
 
-# --- Signal LTE z HiLink API modemu ----------------------------------------
+# --- Signal, SIM a registrace z HiLink API modemu ----------------------------
 #
-# Modemy Huawei/Brovi v rezimu HiLink vystavuji na sve brane HTTP API se
-# silou signalu. Je to jedina cesta, jak signal zjistit bez mmcli/uqmi -
-# ubus u dhcp rozhrani zna jen to, ze spojeni jede.
+# Modemy Huawei/Brovi v rezimu HiLink vystavuji na sve brane HTTP API. Je to
+# jedina cesta, jak bez mmcli/uqmi zjistit silu signalu - a hlavne jedina
+# cesta, jak zjistit, jestli zaloha VUBEC MUZE FUNGOVAT.
+#
+# `lte_up` z ubus totiz rika jen to, ze router dostal od modemu DHCP adresu.
+# HiLink modem ji rozda i bez SIM karty nebo se spatnym PINem - rozhrani pak
+# "bezi" devet dni v kuse, zatimco pres nej neprojde jediny paket. Proto se
+# tady cte /api/monitoring/status (registrace do site) a /api/pin/status
+# (stav SIM) a posila se dal jako lte_connected a lte_sim_state. Kdyz modem
+# neodpovi, zustava null - "nevime" se nikdy nevydava za "funguje".
 #
 # Dotaz jde vylucne na branu LTE rozhrani (odvozenou z jeho vlastni adresy),
-# s kratkym timeoutem, a jen kdyz LTE opravdu bezi. Kdyz modem API nema,
-# hodnoty zustavaji null - nic se nedopocitava.
+# s kratkym timeoutem, a jen kdyz rozhrani bezi.
+#
+# Inicializace signalu je TADY, pred HiLink blokem - driv stala az v bloku
+# uqmi/mmcli pod nim a bezpodminecne prepsala vsechno, co HiLink prave
+# naplnil. Na routeru bez uqmi/mmcli tak RSRP/RSRQ/SINR nikdy nedorazily,
+# jen RSSI, ktere v tom resetu shodou okolnosti nebylo.
+lte_rsrp="null"
+lte_rsrq="null"
+lte_sinr="null"
+lte_band="null"
+lte_carrier="null"
 lte_rssi="null"
 lte_pci="null"
 lte_cell_id="null"
 lte_bandwidth="null"
 lte_plmn="null"
+lte_connected="null"
+lte_sim_state="null"
+lte_conn_code="null"
+lte_sim_code="null"
+lte_service_code="null"
+lte_sim_pin_left="null"
+lte_sim_status_code="null"
+lte_api_host=""
+
+# Jedna hodnota z XML odpovedi: bk_xml_tag "<xml>" tag -> obsah, nebo prazdno.
+bk_xml_tag() {
+    printf '%s' "$1" | sed -n "s|.*<$2>\([^<]*\)</$2>.*|\1|p" | head -1
+}
+
+# GET na HiLink API modemu. Nektere firmwary (E3372h-320, Brovi E3372-325)
+# odpovi na kazdy dotaz chybou 125002/125003, dokud nedostanou session cookie
+# a overovaci token z /api/webserver/SesTokInfo - pak se dotaz zopakuje s
+# obojim. uclient-fetch hlavicky poslat neumi, takze na takovem modemu bez
+# curl/wget zustanou hodnoty null.
+bk_hilink_get() {
+    _hl_url="http://${lte_api_host}$1"
+    _hl_body=""
+    if command -v curl >/dev/null 2>&1; then
+        _hl_body=$(curl -s -m 2 "$_hl_url" 2>/dev/null)
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        _hl_body=$(uclient-fetch -q -T 2 -O - "$_hl_url" 2>/dev/null)
+    elif command -v wget >/dev/null 2>&1; then
+        _hl_body=$(wget -q -T 2 -O - "$_hl_url" 2>/dev/null)
+    fi
+    case "$_hl_body" in
+        *"<code>125002</code>"*|*"<code>125003</code>"*|*"<code>100003</code>"*)
+            _hl_tok=""
+            if command -v curl >/dev/null 2>&1; then
+                _hl_tok=$(curl -s -m 2 "http://${lte_api_host}/api/webserver/SesTokInfo" 2>/dev/null)
+            elif command -v wget >/dev/null 2>&1; then
+                _hl_tok=$(wget -q -T 2 -O - "http://${lte_api_host}/api/webserver/SesTokInfo" 2>/dev/null)
+            fi
+            _hl_ses=$(bk_xml_tag "$_hl_tok" SesInfo)
+            _hl_ver=$(bk_xml_tag "$_hl_tok" TokInfo)
+            if [ -n "$_hl_ses" ] && [ -n "$_hl_ver" ]; then
+                if command -v curl >/dev/null 2>&1; then
+                    _hl_body=$(curl -s -m 2 -H "Cookie: $_hl_ses" -H "__RequestVerificationToken: $_hl_ver" "$_hl_url" 2>/dev/null)
+                elif command -v wget >/dev/null 2>&1; then
+                    _hl_body=$(wget -q -T 2 -O - --header "Cookie: $_hl_ses" --header "__RequestVerificationToken: $_hl_ver" "$_hl_url" 2>/dev/null)
+                fi
+            fi
+            ;;
+    esac
+    printf '%s' "$_hl_body"
+}
 
 if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; then
     lte_api_host=$(echo "$lte_ipv4" | sed 's/\.[0-9]*$/.1/')
-    lte_sig_xml=""
-    if command -v curl >/dev/null 2>&1; then
-        lte_sig_xml=$(curl -s -m 2 "http://${lte_api_host}/api/device/signal" 2>/dev/null)
-    elif command -v uclient-fetch >/dev/null 2>&1; then
-        lte_sig_xml=$(uclient-fetch -q -T 2 -O - "http://${lte_api_host}/api/device/signal" 2>/dev/null)
-    elif command -v wget >/dev/null 2>&1; then
-        lte_sig_xml=$(wget -q -T 2 -O - "http://${lte_api_host}/api/device/signal" 2>/dev/null)
+
+    # -- registrace do site: /api/monitoring/status --
+    # ConnectionStatus 901 = pripojeno; 902/903/905 = odpojeno; 7/11/12/14/37
+    # = sit pristup nepovolila (spatna SIM, zakazana sluzba). Neznamy kod se
+    # neprevadi na nic - zustane null a surovy kod jde dal k posouzeni.
+    lte_mon_xml=$(bk_hilink_get /api/monitoring/status)
+    _cc=$(bk_xml_tag "$lte_mon_xml" ConnectionStatus | sed 's/[^0-9]//g')
+    if [ -n "$_cc" ]; then
+        lte_conn_code="$_cc"
+        case "$_cc" in
+            901) lte_connected="true" ;;
+            902|903|905|7|11|12|14|37|201|202|203|204) lte_connected="false" ;;
+        esac
     fi
+    _sc=$(bk_xml_tag "$lte_mon_xml" ServiceStatus | sed 's/[^0-9]//g')
+    [ -n "$_sc" ] && lte_service_code="$_sc"
+    # SimStatus: 1 = platna; 0/255 = neni vlozena; 2/3/4 = SIM sit NEPRIJIMA
+    # (neplatna pro hlasove / datove sluzby / oboje) - typicky deaktivovana nebo
+    # zablokovana operatorem. Presne to mela SIM, kvuli ktere tahle kontrola
+    # vznikla: /api/pin/status hlasil 257 "pripravena" (PIN je jina osa), ale
+    # SimStatus 4 a ConnectionStatus 902.
+    _ss=$(bk_xml_tag "$lte_mon_xml" SimStatus | sed 's/[^0-9]//g')
+    [ -n "$_ss" ] && lte_sim_status_code="$_ss"
+    case "$_ss" in
+        1) lte_sim_state="ready" ;;
+        0|255) lte_sim_state="no_sim" ;;
+        2|3|4) lte_sim_state="invalid" ;;
+    esac
+
+    # -- stav SIM: /api/pin/status --
+    # SimState 257 = pripravena, 260 = ceka na PIN, 261 = ceka na PUK,
+    # 255 = zadna SIM, 256/262 = neplatna nebo zablokovana.
+    lte_pin_xml=$(bk_hilink_get /api/pin/status)
+    _sim=$(bk_xml_tag "$lte_pin_xml" SimState | sed 's/[^0-9]//g')
+    if [ -n "$_sim" ]; then
+        lte_sim_code="$_sim"
+        # Blokujici stavy odsud maji prednost; "pripravena" (257) jen doplni,
+        # co monitoring/status nerekl - SIM bez PINu muze porad byt odmitnuta siti.
+        case "$_sim" in
+            260) lte_sim_state="pin_required" ;;
+            261) lte_sim_state="puk_required" ;;
+            255) lte_sim_state="no_sim" ;;
+            256|262) lte_sim_state="invalid" ;;
+            257) [ "$lte_sim_state" = "null" ] && lte_sim_state="ready" ;;
+        esac
+    fi
+    _pin_left=$(bk_xml_tag "$lte_pin_xml" SimPinTimes | sed 's/[^0-9]//g')
+    [ -n "$_pin_left" ] && lte_sim_pin_left="$_pin_left"
+
+    # -- sila signalu: /api/device/signal --
+    lte_sig_xml=$(bk_hilink_get /api/device/signal)
 
     if echo "$lte_sig_xml" | grep -q "<rsrp>"; then
         # Hodnoty nesou jednotky primo v textu ("-83dBm", "-6.0dB"), tak se
@@ -1212,40 +1321,34 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
         [ -n "$_band" ] && lte_band="B${_band}"
 
         # Jmeno operatora ma jiny endpoint; bez nej zustava to, co uz mame.
-        if command -v curl >/dev/null 2>&1; then
-            lte_plmn_xml=$(curl -s -m 2 "http://${lte_api_host}/api/net/current-plmn" 2>/dev/null)
-        elif command -v uclient-fetch >/dev/null 2>&1; then
-            lte_plmn_xml=$(uclient-fetch -q -T 2 -O - "http://${lte_api_host}/api/net/current-plmn" 2>/dev/null)
-        else
-            lte_plmn_xml=""
-        fi
-        _carrier=$(echo "$lte_plmn_xml" | sed -n 's|.*<FullName>\([^<]*\)</FullName>.*|\1|p' | head -1)
-        [ -z "$_carrier" ] && _carrier=$(echo "$lte_plmn_xml" | sed -n 's|.*<ShortName>\([^<]*\)</ShortName>.*|\1|p' | head -1)
+        lte_plmn_xml=$(bk_hilink_get /api/net/current-plmn)
+        _carrier=$(bk_xml_tag "$lte_plmn_xml" FullName)
+        [ -z "$_carrier" ] && _carrier=$(bk_xml_tag "$lte_plmn_xml" ShortName)
         [ -n "$_carrier" ] && lte_carrier="$_carrier"
     fi
 fi
 
-# --- LTE/WWAN modem ---
-lte_rsrp="null"
-lte_rsrq="null"
-lte_sinr="null"
-lte_band="null"
-lte_carrier="null"
+# --- LTE/WWAN modem pres uqmi / mmcli ---
+#
+# Zadna inicializace na null: ta je nahore pred HiLink blokem. Tady se
+# hodnota prepise jen tehdy, kdyz uqmi/mmcli opravdu neco vrati - jinak by
+# router s HiLink modemem a bez techto nastroju o signal prisel.
 if command -v uqmi >/dev/null 2>&1; then
     lte_signal=$(uqmi --get-signal-info 2>/dev/null)
     if [ -n "$lte_signal" ]; then
-        lte_rsrp=$(echo "$lte_signal" | jsonfilter -e '@.rsrp' 2>/dev/null)
-        lte_rsrq=$(echo "$lte_signal" | jsonfilter -e '@.rsrq' 2>/dev/null)
-        lte_sinr=$(echo "$lte_signal" | jsonfilter -e '@.sinr' 2>/dev/null)
-        lte_band=$(echo "$lte_signal" | jsonfilter -e '@.band' 2>/dev/null)
+        _q=$(echo "$lte_signal" | jsonfilter -e '@.rsrp' 2>/dev/null); [ -n "$_q" ] && lte_rsrp="$_q"
+        _q=$(echo "$lte_signal" | jsonfilter -e '@.rsrq' 2>/dev/null); [ -n "$_q" ] && lte_rsrq="$_q"
+        _q=$(echo "$lte_signal" | jsonfilter -e '@.sinr' 2>/dev/null); [ -n "$_q" ] && lte_sinr="$_q"
+        _q=$(echo "$lte_signal" | jsonfilter -e '@.band' 2>/dev/null); [ -n "$_q" ] && lte_band="$_q"
     fi
-    lte_carrier=$(uqmi --get-network-registration 2>/dev/null | jsonfilter -e '@.description' 2>/dev/null)
+    _q=$(uqmi --get-network-registration 2>/dev/null | jsonfilter -e '@.description' 2>/dev/null)
+    [ -n "$_q" ] && lte_carrier="$_q"
 elif command -v mmcli >/dev/null 2>&1; then
     mm_out=$(mmcli -m any --signal-get 2>/dev/null)
     if [ -n "$mm_out" ]; then
-        lte_rsrp=$(echo "$mm_out" | grep -i "rsrp" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}')
-        lte_rsrq=$(echo "$mm_out" | grep -i "rsrq" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}')
-        lte_sinr=$(echo "$mm_out" | grep -i "sinr" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}')
+        _q=$(echo "$mm_out" | grep -i "rsrp" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}'); [ -n "$_q" ] && lte_rsrp="$_q"
+        _q=$(echo "$mm_out" | grep -i "rsrq" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}'); [ -n "$_q" ] && lte_rsrq="$_q"
+        _q=$(echo "$mm_out" | grep -i "sinr" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}'); [ -n "$_q" ] && lte_sinr="$_q"
     fi
 fi
 # Fallback: Turris/OpenWrt s ModemManager pres ubus, kdyz uqmi/mmcli chybi
@@ -1886,6 +1989,13 @@ payload=$(cat <<EOF
   "lte_sinr": $lte_sinr,
   "lte_band": $(json_val "$lte_band"),
   "lte_carrier": $(json_val "$lte_carrier"),
+  "lte_connected": $lte_connected,
+  "lte_sim_state": $(json_val "$lte_sim_state"),
+  "lte_conn_code": $lte_conn_code,
+  "lte_sim_code": $lte_sim_code,
+  "lte_service_code": $lte_service_code,
+  "lte_sim_status_code": $lte_sim_status_code,
+  "lte_sim_pin_left": $lte_sim_pin_left,
   "service_restarts": $service_restarts_json,
   "wan_reconnect_count": $wan_reconnect_count,
   "wan_last_reconnect": $wan_last_reconnect,
