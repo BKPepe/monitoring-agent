@@ -101,7 +101,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.3"
+AGENT_VERSION="0.1.4"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 CPU_STATE_FILE="/tmp/status-agent-openwrt-cpu.state"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
@@ -204,7 +204,11 @@ log_message() {
     # /tmp is RAM on OpenWrt and this file used to grow without limit (about
     # a megabyte a day) until the tmpfs was full and dhcp.leases could not be
     # written. Above 64 KB keep the last 32 KB.
-    _log_size=$(stat -c %s "$LOG_FILE" 2>/dev/null)
+    # `wc -c`, not `stat`: OpenWrt builds busybox without the stat applet
+    # (CONFIG_STAT is not set), so the size came back empty, the guard below
+    # rewrote it to 0 and the trim never ran on a single router - while the
+    # test image, a busybox defconfig build, does ship stat and looked fine.
+    _log_size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -cd '0-9')
     case "$_log_size" in ''|*[!0-9]*) _log_size=0 ;; esac
     if [ "$_log_size" -gt 65536 ]; then
         tail -c 32768 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null
@@ -459,11 +463,17 @@ bk_iface_scan() {
 # interface called one of NAMES (in that order), else the first whose proto
 # is one of PROTOS. Returns 1 when there is none - a box with no "wan"
 # measures nothing about it.
+# $3 is an interface name to skip: without it the protocol fallback below
+# happily returns the WAN interface itself on a router whose uplink IS a
+# modem (proto qmi/ncm), and the same device would be reported as both the
+# primary line and the backup.
 bk_iface_load() {
     bk_iface_scan || return 1
     _bi_hit=""
+    _bi_skip="$3"
     for _bi_want in $1; do
         while IFS='|' read -r _bi_k _bi_n _bi_p; do
+            [ -n "$_bi_skip" ] && [ "$_bi_n" = "$_bi_skip" ] && continue
             [ "$_bi_n" = "$_bi_want" ] && { _bi_hit="$_bi_k"; break; }
         done <<EOF
 $_bi_list
@@ -473,6 +483,7 @@ EOF
     if [ -z "$_bi_hit" ]; then
         for _bi_want in $2; do
             while IFS='|' read -r _bi_k _bi_n _bi_p; do
+                [ -n "$_bi_skip" ] && [ "$_bi_n" = "$_bi_skip" ] && continue
                 [ "$_bi_p" = "$_bi_want" ] && { _bi_hit="$_bi_k"; break; }
             done <<EOF
 $_bi_list
@@ -491,6 +502,10 @@ if bk_iface_load wan; then
     json_get_var wan_proto proto
     json_get_var wan_uptime uptime
     json_get_var wan_l3_device l3_device
+    # netifd reports l3_device only while the interface is up. Without this
+    # fallback the primary link loses its device name for as long as the WAN
+    # is down - exactly when someone is looking at which link carried what.
+    [ -z "$wan_l3_device" ] && json_get_var wan_l3_device device
 
     # Prvni IPv4 adresa (pole "ipv4-address")
     json_get_keys ipv4_keys "ipv4-address"
@@ -1095,16 +1110,26 @@ if [ "$io_accounting_json" = "true" ]; then
     # One awk over every readable /proc/<pid>/io instead of two forks per
     # process (200-400 forks a minute on a router). Readability is checked
     # in the shell first because busybox awk aborts on a file it cannot open.
+    # The paths are fed to awk as DATA and read with getline, not passed as
+    # input files: a process can exit between the readability test and awk's
+    # open(), and busybox awk treats an unopenable input file as fatal - it
+    # would abort mid-scan and silently truncate the ranking. getline just
+    # returns -1 for the vanished ones.
     top_io_json=$(
-        set --
-        for io_file in /proc/[0-9]*/io; do [ -r "$io_file" ] && set -- "$@" "$io_file"; done
-        [ $# -gt 0 ] && awk '
-            FNR == 1 { pid = FILENAME; sub(/^\/proc\//, "", pid); sub(/\/io$/, "", pid) }
-            /^write_bytes:/ && $2 > 0 {
+        for io_file in /proc/[0-9]*/io; do [ -r "$io_file" ] && printf '%s\n' "$io_file"; done | awk '
+            {
+                f = $0; pid = f; sub(/^\/proc\//, "", pid); sub(/\/io$/, "", pid);
+                wb = "";
+                while ((getline line < f) > 0) {
+                    if (line ~ /^write_bytes:/) { split(line, a, " "); wb = a[2] }
+                }
+                close(f);
+                if (wb == "" || wb + 0 <= 0) next;
                 cf = "/proc/" pid "/comm"; name = "";
                 if ((getline name < cf) > 0) close(cf);
-                if (name != "") print $2 "|" pid "|" name;
-            }' "$@" 2>/dev/null | sort -t'|' -k1,1 -rn | head -5 | awk -F'|' '
+                close(cf);
+                if (name != "") print wb "|" pid "|" name;
+            }' 2>/dev/null | sort -rn | head -5 | awk -F'|' '
             { nm = $3; gsub(/\\/, "\\\\", nm); gsub(/"/, "\\\"", nm);
               printf "%s{\"pid\":%s,\"name\":\"%s\",\"write_bytes\":%s}", (n++ ? "," : "["), $2, nm, $1 }
             END { printf "%s", (n ? "]" : "[]") }'
@@ -1211,13 +1236,17 @@ if command -v top >/dev/null 2>&1; then
             # jen cpu a zebricek podle RAM jen ram_mb, takze v tabulce mela
             # kazda radka jednu bunku prazdnou ("librespeed-cli 63,2 % / -").
             # null se posila, kdyz hodnota u procesu opravdu chybi.
-            top_cpu_json=$(echo "$top_parsed" | awk -F'|' '$2 != ""' | sort -t'|' -k2 -rn | head -5 | awk -F'|' '
+            # The sort key goes FIRST and plain `sort -rn` does the work:
+            # OpenWrt builds busybox without FEATURE_SORT_BIG, where -t and -k
+            # are accepted and then ignored, so `-k2` compared whole lines and
+            # both rankings listed the wrong five processes on every router.
+            top_cpu_json=$(echo "$top_parsed" | awk -F'|' '$2 != "" { print $2 "|" $0 }' | sort -rn | head -5 | awk -F'|' '
                 BEGIN { printf "[" }
-                { if (NR > 1) printf ", "; printf "{\"name\":\"%s\",\"cpu\":%.1f,\"ram_mb\":%s}", $1, $2, ($3 != "" ? sprintf("%.1f", $3) : "null") }
+                { if (NR > 1) printf ", "; printf "{\"name\":\"%s\",\"cpu\":%.1f,\"ram_mb\":%s}", $2, $3, ($4 != "" ? sprintf("%.1f", $4) : "null") }
                 END { printf "]" }')
-            top_ram_json=$(echo "$top_parsed" | awk -F'|' '$3 != ""' | sort -t'|' -k3 -rn | head -5 | awk -F'|' '
+            top_ram_json=$(echo "$top_parsed" | awk -F'|' '$3 != "" { print $3 "|" $0 }' | sort -rn | head -5 | awk -F'|' '
                 BEGIN { printf "[" }
-                { if (NR > 1) printf ", "; printf "{\"name\":\"%s\",\"ram_mb\":%.1f,\"cpu\":%s}", $1, $3, ($2 != "" ? sprintf("%.1f", $2) : "null") }
+                { if (NR > 1) printf ", "; printf "{\"name\":\"%s\",\"ram_mb\":%.1f,\"cpu\":%s}", $2, $4, ($3 != "" ? sprintf("%.1f", $3) : "null") }
                 END { printf "]" }')
         fi
     fi
@@ -1295,7 +1324,7 @@ lte_ipv4="null"
 # interface whose protocol is a modem one - the uplink does not have to be
 # called "lte" for the backup to count. Five speculative ubus calls a run
 # used to go here, four of them failing.
-if bk_iface_load "lte wwan wwan0 modem lte1" "qmi mbim ncm modemmanager 3g"; then
+if bk_iface_load "lte wwan wwan0 modem lte1" "qmi mbim ncm modemmanager 3g" "wan"; then
     _lte_up_raw=""
     json_get_var _lte_up_raw up
     case "$_lte_up_raw" in
@@ -1704,8 +1733,10 @@ fi
 
 zerotier_networks_json="null"
 if command -v zerotier-cli >/dev/null 2>&1; then
-    zerotier_networks_json=$(zerotier-cli listnetworks 2>/dev/null | grep -c " OK ")
-    [ -z "$zerotier_networks_json" ] && zerotier_networks_json=0
+    # `grep -c` answers 0 for empty input, so a daemon that is down looked
+    # like "0 networks". The count is taken only when the CLI really replied.
+    _zt_out=$(zerotier-cli listnetworks 2>/dev/null) \
+        && zerotier_networks_json=$(printf '%s\n' "$_zt_out" | grep -c " OK ")
 fi
 
 ups_status_json="null"
@@ -2321,7 +2352,11 @@ elif command -v uclient-fetch >/dev/null 2>&1; then
     # used to count as HTTP 200 and be parsed for remote actions, while the
     # real reason ("Connection refused", TLS) went to /dev/null.
     uf_err=$(mktemp /tmp/status-openwrt-uf-err.XXXXXX 2>/dev/null || echo "/tmp/status-openwrt-uf-err-$$")
-    if body=$(uclient-fetch -q -T 20 -O - --post-data="$payload" --header="Content-Type: application/json" "$API_URL" 2>"$uf_err"); then
+    # No -q here: uclient-fetch prints "HTTP error NNN" and "Connection
+    # error: ..." only when it is not quiet, and those are exactly what the
+    # failure branch below parses. Its stderr goes to the file either way, so
+    # nothing reaches the console.
+    if body=$(uclient-fetch -T 20 -O - --post-data="$payload" --header="Content-Type: application/json" "$API_URL" 2>"$uf_err"); then
         http_code="200"
     else
         http_code=$(sed -n 's/.*HTTP error \([0-9][0-9]*\).*/\1/p' "$uf_err" | head -n 1)

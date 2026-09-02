@@ -17,6 +17,11 @@ except FileNotFoundError:
     calls = []
 def hilink_calls(path):
     return sum(1 for c in calls if c.endswith(path))
+
+try:
+    log_size = int(open(f"{out}/logsize.txt").read().strip())
+except (FileNotFoundError, ValueError):
+    log_size = -1
 wg = d["wireguard_peers"]
 radios = {r["radio"]: r for r in d["wifi_radios"]}
 checks = {
@@ -49,6 +54,7 @@ checks = {
     "no interfaces at all: LTE stays unknown": d3["lte_up"] is None and d3["lte_connected"] is None,
     "link roles: the WAN device is reported, the LTE rate is measured on the second run": d["wan_l3_device"] == "eth0" and d1["net_lte"] is None and isinstance(d["net_lte"], (int, float)),
     "no interfaces at all: no WAN device, no LTE rate": d3["wan_l3_device"] is None and d3["net_lte"] is None,
+    "the log is trimmed on a router that has no stat applet": 0 < log_size <= 40000,
     "version reported": isinstance(d.get("version"), str) and d["version"] != "",
 }
 failed = [k for k, v in checks.items() if not v]

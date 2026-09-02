@@ -85,7 +85,12 @@ function Write-AgentLog {
         # Bounded: above 1 MB keep the last 500 lines. It grew without limit before.
         try {
             if ((Test-Path $LogFile) -and (Get-Item $LogFile).Length -gt 1MB) {
-                Get-Content $LogFile -Tail 500 | Set-Content -Path $LogFile -Encoding UTF8
+                # Read fully first, then write. Piping Get-Content straight into
+                # Set-Content on the SAME file has both handles open at once,
+                # which throws - and the empty catch below swallowed it, so the
+                # 1 MB bound was never actually enforced.
+                $tail = @(Get-Content $LogFile -Tail 500)
+                Set-Content -Path $LogFile -Value $tail -Encoding UTF8
             }
         } catch {}
         Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction Stop

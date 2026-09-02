@@ -94,8 +94,14 @@ NET_STATE_FILE = '/tmp/status-agent-net.state' if DOCKER_MODE else os.path.join(
 
 # Between-run state and caches live next to the script (a root-owned
 # directory), not in the world-writable /tmp where any local user could
-# pre-create them; only the read-only Docker mount keeps /tmp.
-STATE_DIR = '/tmp' if DOCKER_MODE else os.path.dirname(os.path.abspath(__file__))
+# pre-create them. Two exceptions: the read-only Docker mount, and an agent
+# running as a user who cannot write beside the script - there every state
+# write would fail silently and CPU, network and fork rate would stay null
+# forever, which is worse than the /tmp exposure. The fallback says so in
+# the log rather than degrading quietly.
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = '/tmp' if (DOCKER_MODE or not os.access(_script_dir, os.W_OK)) else _script_dir
+STATE_DIR_FALLBACK = STATE_DIR == '/tmp' and not DOCKER_MODE
 
 VERBOSE = '--verbose' in sys.argv or '-v' in sys.argv or os.environ.get('STATUS_VERBOSE') == '1' or sys.stdout.isatty()
 # --dry-run / --print: collect, print the JSON to stdout, send nothing.
@@ -1478,6 +1484,8 @@ def main():
             log_message("Předchozí běh ještě běží, tento končím.")
             sys.exit(0)
 
+    if STATE_DIR_FALLBACK:
+        log_message(f"VAROVANI: do {_script_dir} nelze zapisovat, stav se ukládá do /tmp.")
     log_debug("Získávám systémové statistiky...")
     cpu, cpu_steal, iowait = get_cpu_usage()
     ram = get_ram_usage()

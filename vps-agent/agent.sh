@@ -92,7 +92,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.1"
+AGENT_VERSION="0.1.2"
 LOG_FILE="$ScriptPath/agent.log"
 # One state file for every between-run delta (CPU, disk I/O, network, forks,
 # TS3 CPU), written once per run next to the script. It used to be four files,
@@ -341,9 +341,15 @@ fi
 # 3.05 Inode Usage (%) - stejný df, jen s -i (inode počty místo bloků)
 inode_usage=$(df -iP / 2>/dev/null | tail -n 1 | awk '{print $5}' | tr -d '%')
 inode_usage_json="null"
-if [ -n "$inode_usage" ]; then
-    inode_usage_json="$inode_usage"
-fi
+# df prints a literal "-" in the IUse% column for a filesystem that reports no
+# inode total - btrfs always, some tmpfs mounts too. That is not a number, and
+# writing it into the payload made the JSON invalid, so the server rejected
+# the ENTIRE report (CPU, RAM, disk, everything) on every run of every btrfs
+# host. Unmeasurable inode usage is null, like everywhere else.
+case "$inode_usage" in
+    ''|*[!0-9]*) : ;;
+    *) inode_usage_json="$inode_usage" ;;
+esac
 
 # 3.1 Disk I/O (KB/s read/write) - the same tick/tock principle as network
 # throughput. /proc/diskstats is a whole-kernel counter (not per pid
@@ -514,23 +520,30 @@ if [ -r /proc/1/io ]; then
     # process - on a 300-process host that was ~600 forks a minute, the single
     # biggest cost of this script. Readability is checked with the builtin
     # test first so awk never trips over a file it cannot open.
-    io_files=()
-    for f in /proc/[0-9]*/io; do [ -r "$f" ] && io_files+=("$f"); done
-    if [ "${#io_files[@]}" -gt 0 ]; then
-        top_io_json=$(awk '
-            FNR == 1 { pid = FILENAME; sub(/^\/proc\//, "", pid); sub(/\/io$/, "", pid) }
-            /^write_bytes:/ {
-                wb = $2 + 0;
-                if (wb > 0) {
-                    cf = "/proc/" pid "/comm"; name = "";
-                    if ((getline name < cf) > 0) { close(cf) }
-                    if (name != "") print wb "|" pid "|" name;
+    # The paths are fed to awk as DATA and read with getline, never passed as
+    # input files. A process can exit between the readability test and awk's
+    # open(), and both mawk and gawk treat an unopenable input file as fatal:
+    # awk would exit right there, skip every remaining process and never run
+    # END, so the ranking came out truncated or empty on any busy host. The
+    # test above cannot close that window; getline returns -1 and moves on.
+    top_io_json=$(
+        for f in /proc/[0-9]*/io; do [ -r "$f" ] && printf '%s\n' "$f"; done | awk '
+            {
+                f = $0; pid = f; sub(/^\/proc\//, "", pid); sub(/\/io$/, "", pid);
+                wb = "";
+                while ((getline line < f) > 0) {
+                    if (line ~ /^write_bytes:/) { split(line, a, " "); wb = a[2] }
                 }
-            }' "${io_files[@]}" 2>/dev/null | sort -t'|' -k1,1 -rn | head -5 | awk -F'|' '
-            { n = $3; gsub(/\\/, "\\\\", n); gsub(/"/, "\\\"", n); gsub(/[\t]/, " ", n);
+                close(f);
+                if (wb == "" || wb + 0 <= 0) next;
+                cf = "/proc/" pid "/comm"; name = "";
+                if ((getline name < cf) > 0) close(cf);
+                close(cf);
+                if (name != "") print wb "|" pid "|" name;
+            }' 2>/dev/null | sort -rn | head -5 | awk -F'|' '
+            { n = $3; gsub(/[^[:print:]]/, " ", n); gsub(/\\/, "\\\\", n); gsub(/"/, "\\\"", n);
               printf "%s{\"pid\":%s,\"name\":\"%s\",\"write_bytes\":%s}", (c++ ? "," : "["), $2, n, $1 }
             END { printf "%s", (c ? "]" : "[]") }')
-    fi
 fi
 [ -z "$top_io_json" ] && top_io_json="[]"
 
@@ -569,10 +582,17 @@ get_smart_status() {
         sm_failed=""; sm_unknown=""
         for d in $drives; do
             sm_out=$(timeout 20 smartctl -H -n standby "/dev/$d" 2>/dev/null); sm_rc=$?
+            # 124 is timeout firing, 125-127 mean the wrapper itself could not
+            # run (no `timeout` installed at all gives 127). None of those is a
+            # verdict about the disk - and 127 & 8 is nonzero, so without this
+            # every healthy drive on such a host was reported as failing.
+            case "$sm_rc" in
+                124|125|126|127) sm_unknown="$sm_unknown $d"; continue ;;
+            esac
             # Exit-status bit 3 is "DISK FAILING" (smartctl(8); 124 is timeout's
             # own code). ATA drives print PASSED/FAILED, SCSI/SAS ones
             # "SMART Health Status: OK" or a failure text.
-            if [ "$sm_rc" -ne 124 ] && [ $((sm_rc & 8)) -ne 0 ]; then sm_failed="$sm_failed $d"; continue; fi
+            if [ $((sm_rc & 8)) -ne 0 ]; then sm_failed="$sm_failed $d"; continue; fi
             case "$sm_out" in
                 *FAILED*) sm_failed="$sm_failed $d" ;;
                 *"Health Status: OK"*|*PASSED*) : ;;
