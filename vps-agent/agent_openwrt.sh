@@ -101,7 +101,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.4"
+AGENT_VERSION="0.1.5"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 CPU_STATE_FILE="/tmp/status-agent-openwrt-cpu.state"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
@@ -173,7 +173,11 @@ if [ "$(cat "$BK_VERSION_STAMP" 2>/dev/null)" != "$AGENT_VERSION" ]; then
           /tmp/status-agent-openwrt-opkg.cache \
           /tmp/status-agent-openwrt-services.cache \
           /tmp/status-agent-openwrt-hilink-pin.cache \
-          /tmp/status-agent-openwrt-hilink-plmn.cache 2>/dev/null || true
+          /tmp/status-agent-openwrt-hilink-plmn.cache \
+          /var/run/status-agent-openwrt/hilink-pin.cache \
+          /var/run/status-agent-openwrt/hilink-plmn.cache \
+          /tmp/status-agent-openwrt-private/hilink-pin.cache \
+          /tmp/status-agent-openwrt-private/hilink-plmn.cache 2>/dev/null || true
     echo "$AGENT_VERSION" > "$BK_VERSION_STAMP" 2>/dev/null || true
 fi
 
@@ -225,7 +229,16 @@ log_debug() {
 # not let cron pile a fresh agent on top of it every minute until the RAM is
 # gone. mkdir is atomic; flock is not part of stock OpenWrt. A lock whose
 # owner no longer exists (kill -9, power loss with /tmp on flash) is reclaimed.
-BK_LOCK_DIR="/tmp/status-agent-openwrt.lock"
+# /var/run is a root-only tmpfs on OpenWrt: nothing unprivileged can pre-create
+# the lock there (which in /tmp would stop the agent for good) or plant a
+# HiLink cache that forges the LTE-backup verdict. /tmp remains the fallback
+# for systems without it (the busybox test image).
+BK_PRIVATE_DIR="/var/run/status-agent-openwrt"
+if ! mkdir -p "$BK_PRIVATE_DIR" 2>/dev/null || [ -L "$BK_PRIVATE_DIR" ] || [ ! -d "$BK_PRIVATE_DIR" ]; then
+    BK_PRIVATE_DIR="/tmp/status-agent-openwrt-private"
+    mkdir -p "$BK_PRIVATE_DIR" 2>/dev/null || true
+fi
+BK_LOCK_DIR="$BK_PRIVATE_DIR/run.lock"
 if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
     _lock_pid=$(cat "$BK_LOCK_DIR/pid" 2>/dev/null)
     # Digits only: /tmp is world-writable and "../.." in here would make the
@@ -563,9 +576,13 @@ if [ -n "$wan_l3_device" ] && [ -f /proc/net/dev ]; then
     }' /proc/net/dev 2>/dev/null)
     if [ -n "$net_bytes" ]; then
         if [ -f "$NET_STATE_FILE" ]; then
+            # The device is part of the state: after a failover the WAN device
+            # changes (pppoe-wan -> wwan0) and a delta between two different
+            # counters charged the whole new session to one interval.
             prev_ts=$(cut -d',' -f1 "$NET_STATE_FILE" 2>/dev/null)
-            prev_bytes=$(cut -d',' -f2 "$NET_STATE_FILE" 2>/dev/null)
-            if [ -n "$prev_ts" ] && [ -n "$prev_bytes" ]; then
+            prev_dev=$(cut -d',' -f2 "$NET_STATE_FILE" 2>/dev/null)
+            prev_bytes=$(cut -d',' -f3 "$NET_STATE_FILE" 2>/dev/null)
+            if [ "$prev_dev" = "$wan_l3_device" ] && [ -n "$prev_ts" ] && [ -n "$prev_bytes" ]; then
                 elapsed=$((now_ts - prev_ts))
                 delta=$((net_bytes - prev_bytes))
                 if [ "$elapsed" -gt 0 ] && [ "$delta" -ge 0 ]; then
@@ -573,7 +590,7 @@ if [ -n "$wan_l3_device" ] && [ -f /proc/net/dev ]; then
                 fi
             fi
         fi
-        echo "${now_ts},${net_bytes}" > "$NET_STATE_FILE" 2>/dev/null || true
+        echo "${now_ts},${wan_l3_device},${net_bytes}" > "$NET_STATE_FILE" 2>/dev/null || true
     fi
 fi
 
@@ -1541,7 +1558,7 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
     # SimState 257 = pripravena, 260 = ceka na PIN, 261 = ceka na PUK,
     # 255 = zadna SIM, 256/262 = neplatna nebo zablokovana.
     # Ten minutes, or sooner when monitoring/status reports a different SimStatus.
-    bk_hilink_cached /api/pin/status /tmp/status-agent-openwrt-hilink-pin.cache 600 "$lte_sim_status_code"; lte_pin_xml="$_hl_out"
+    bk_hilink_cached /api/pin/status "$BK_PRIVATE_DIR/hilink-pin.cache" 600 "$lte_sim_status_code"; lte_pin_xml="$_hl_out"
     _sim=$(bk_xml_tag "$lte_pin_xml" SimState | sed 's/[^0-9]//g')
     if [ -n "$_sim" ]; then
         lte_sim_code="$_sim"
@@ -1592,7 +1609,7 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
 
         # Jmeno operatora ma jiny endpoint; bez nej zustava to, co uz mame.
         # Once per heavy interval, or when the PLMN code from device/signal changes.
-        bk_hilink_cached /api/net/current-plmn /tmp/status-agent-openwrt-hilink-plmn.cache "$HEAVY_OP_INTERVAL_SEC" "$lte_plmn"; lte_plmn_xml="$_hl_out"
+        bk_hilink_cached /api/net/current-plmn "$BK_PRIVATE_DIR/hilink-plmn.cache" "$HEAVY_OP_INTERVAL_SEC" "$lte_plmn"; lte_plmn_xml="$_hl_out"
         _carrier=$(bk_xml_tag "$lte_plmn_xml" FullName)
         [ -z "$_carrier" ] && _carrier=$(bk_xml_tag "$lte_plmn_xml" ShortName)
         [ -n "$_carrier" ] && lte_carrier="$_carrier"
@@ -1759,7 +1776,10 @@ fi
 # wrapped. dmesg stays as the fallback for older kernels only.
 oom_kills=$(awk '/^oom_kill / { print $2 }' /proc/vmstat 2>/dev/null)
 if [ -z "$oom_kills" ] && command -v dmesg >/dev/null 2>&1; then
-    oom_kills=$(dmesg 2>/dev/null | grep -ci "oom-killer\|Out of memory")
+    # One line per kill ("Out of memory: Kill(ed) process"); the "invoked
+    # oom-killer" header of the same event must not count again. A dmesg that
+    # cannot be read (no permission) is unknown, not zero.
+    _dm=$(dmesg 2>/dev/null) && oom_kills=$(printf '%s\n' "$_dm" | grep -c "Out of memory: Kill")
 fi
 [ -z "$oom_kills" ] && oom_kills="null"
 

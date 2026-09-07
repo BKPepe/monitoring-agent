@@ -92,7 +92,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.2"
+AGENT_VERSION="0.1.3"
 LOG_FILE="$ScriptPath/agent.log"
 # One state file for every between-run delta (CPU, disk I/O, network, forks,
 # TS3 CPU), written once per run next to the script. It used to be four files,
@@ -140,6 +140,10 @@ for arg in "$@"; do
             ;;
     esac
 done
+# A dry run keeps its own state series: run by hand between two cron ticks it
+# used to overwrite the counters, and the next cron report shipped forks and
+# network errors for a fraction of the interval as if they covered all of it.
+[ "$DRY_RUN" = "1" ] && STATE_FILE="$STATE_FILE.dryrun"
 
 # Escapes one string for a JSON value: backslash, quote, and the control
 # characters a process name may legally contain (a tab would break the whole
@@ -151,7 +155,7 @@ json_str() {
 log_message() {
     local msg="$1"
     local ts
-    printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1
+    printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1 2>/dev/null || ts=$(date '+%Y-%m-%d %H:%M:%S')
     if [ "$VERBOSE" = "1" ]; then
         # In --dry-run stdout is the JSON payload; keep the chatter on stderr
         # so `agent.sh --dry-run | python3 -m json.tool` just works.
@@ -188,12 +192,16 @@ log_debug "Získávám systémové statistiky (BASH)..."
 # One run at a time: a stalled report (server down, hung disk) must not let
 # cron stack a new agent on top of it every minute.
 if command -v flock >/dev/null 2>&1; then
-    if exec 9>"$ScriptPath/.agent.lock" 2>/dev/null; then
+    # The brace group puts the stderr redirect in place BEFORE exec tries to
+    # open the lock file - on the exec line itself it came too late, so an
+    # unwritable directory printed the error every minute.
+    if { exec 9>"$ScriptPath/.agent.lock"; } 2>/dev/null; then
         flock -n 9 || { log_message "Predchozi beh jeste bezi, tento koncim."; exit 0; }
     fi
 fi
 
-bk_now() { printf '%(%s)T' -1; }
+# printf's %()T needs bash 4.2; older bash falls back to date (measured, not fabricated).
+bk_now() { printf '%(%s)T' -1 2>/dev/null || date +%s; }
 now_ts=$(bk_now)
 
 # Previous-run state, read as plain key=value lines - never eval'ed.
@@ -317,8 +325,15 @@ if command -v df >/dev/null 2>&1; then
         filesystems_json=$(echo "$df_out" | awk -v has_type="$df_has_type" '
             NR == 1 { next }
             {
-                if (has_type) { dev=$1; type=$2; total=$3; used=$4; avail=$5; pct=$6; mnt=$7 }
-                else          { dev=$1; type="";  total=$2; used=$3; avail=$4; pct=$5; mnt=$6 }
+                # Right-anchored on the Capacity column ("42%"): a device or a
+                # mount point with a space in it (/media/My Disk, a LABEL= device)
+                # shifted every number by one under the old fixed columns.
+                p = 0; for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+%$/) { p = i; break }
+                if (p == 0) next;
+                pct = $p; avail = $(p - 1); used = $(p - 2); total = $(p - 3);
+                if (has_type) { type = $(p - 4); dl = p - 5 } else { type = ""; dl = p - 4 }
+                dev = $1; for (i = 2; i <= dl; i++) dev = dev " " $i;
+                mnt = $(p + 1); for (i = p + 2; i <= NF; i++) mnt = mnt " " $i;
                 if (mnt == "") next;
                 # Virtual filesystems are not storage - reporting tmpfs as a
                 # "disk" would make a machine look full when RAM fills a cache.
@@ -330,6 +345,10 @@ if command -v df >/dev/null 2>&1; then
                 if (mnt ~ /^\/snap\//) next;
                 gsub("%", "", pct);
                 if (pct !~ /^[0-9]+$/) next;
+                # Escaped before they become JSON strings.
+                gsub(/[^[:print:]]/, " ", mnt); gsub(/\\/, "\\\\", mnt); gsub(/"/, "\\\"", mnt);
+                gsub(/[^[:print:]]/, " ", dev); gsub(/\\/, "\\\\", dev); gsub(/"/, "\\\"", dev);
+                gsub(/[^[:print:]"\\]/, " ", type);
                 printf "%s{\"mount\":\"%s\",\"device\":\"%s\",\"fstype\":\"%s\",\"total_kb\":%s,\"used_kb\":%s,\"avail_kb\":%s,\"used_pct\":%s}",
                        (n++ ? "," : "["), mnt, dev, type, total+0, used+0, avail+0, pct+0;
             }
@@ -604,7 +623,7 @@ get_smart_status() {
         done
         # A failing disk wins even when another gave no verdict - an early
         # return on the first silent drive used to hide the failing one behind it.
-        if [ -n "$sm_failed" ]; then echo "WARNING (Disk /dev/${sm_failed# } selhal v SMART)"; return; fi
+        if [ -n "$sm_failed" ]; then echo "WARNING (Disk /dev/$(echo "${sm_failed# }" | sed 's| |, /dev/|g') selhal v SMART)"; return; fi
         if [ -n "$sm_unknown" ]; then echo "N/A (SMART nedostupné pro /dev/$(echo "${sm_unknown# }" | sed 's| |, /dev/|g'))"; return; fi
         echo "OK"
     else
@@ -1224,11 +1243,14 @@ if [ "$http_code" = "200" ]; then
                                     svc_name=$(echo "$body" | sed -n 's/.*"service_name":"\([^"]*\)".*/\1/p')
                                     if [ -n "$svc_name" ]; then
                                         if command -v systemctl >/dev/null 2>&1; then
-                                            systemctl restart "$svc_name" >/dev/null 2>&1 || true
+                                            systemctl restart "$svc_name" 9>&- >/dev/null 2>&1 || true
                                             log_message "Restartována služba přes systemctl: $svc_name"
                                             send_action_result "$act_id" "executed" "Služba '$svc_name' restartována přes systemctl"
                                         elif [ -x "/etc/init.d/$svc_name" ]; then
-                                            /etc/init.d/"$svc_name" restart >/dev/null 2>&1 || true
+                                            # 9>&- closes the run lock for the child: a daemon
+                                            # started by an init script inherits open fds and
+                                            # would otherwise hold the lock for as long as it lives.
+                                            /etc/init.d/"$svc_name" restart 9>&- >/dev/null 2>&1 || true
                                             log_message "Restartována služba přes init.d: $svc_name"
                                             send_action_result "$act_id" "executed" "Služba '$svc_name' restartována přes init.d"
                                         else

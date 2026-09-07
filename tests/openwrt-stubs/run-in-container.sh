@@ -12,6 +12,8 @@ mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 # the log trim silently never ran on any router while the test looked fine
 # (OpenWrt: CONFIG_STAT is not set).
 rm -f /bin/stat /usr/bin/stat
+# OpenWrt has a root-only /var/run tmpfs; the agent keeps its lock and caches there.
+mkdir -p /var/run
 cp /work/stubs/jshn.sh /usr/share/libubox/jshn.sh
 touch /etc/config/mwan3 /etc/config/sqm /etc/init.d/dnsmasq /etc/init.d/uhttpd
 cp /work/agent/agent_openwrt.sh /root/agent/agent_openwrt.sh

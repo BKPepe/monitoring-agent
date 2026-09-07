@@ -86,11 +86,18 @@ if os.path.exists(cfg_path):
     except Exception:
         pass
 
-AGENT_VERSION = "0.1.1"
+AGENT_VERSION = "0.1.2"
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent.log')
 # V Docker režimu je adresář se skriptem připojený read-only, proto se stavový
 # soubor pro výpočet síťové propustnosti ukládá vždy do /tmp.
-NET_STATE_FILE = '/tmp/status-agent-net.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_net.state')
+# --dry-run / --print: collect, print the JSON to stdout, send nothing. A dry
+# run keeps its own state series (".dryrun" suffix): run by hand between two
+# cron ticks it used to overwrite the counters, and the next cron report
+# shipped forks and network errors for a fraction of the interval as if they
+# covered all of it. Two dry runs in a row still delta against each other.
+DRY_RUN = '--dry-run' in sys.argv or '--print' in sys.argv
+_STATE_SUFFIX = '.dryrun' if DRY_RUN else ''
+NET_STATE_FILE = ('/tmp/status-agent-net.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_net.state')) + _STATE_SUFFIX
 
 # Between-run state and caches live next to the script (a root-owned
 # directory), not in the world-writable /tmp where any local user could
@@ -104,8 +111,6 @@ STATE_DIR = '/tmp' if (DOCKER_MODE or not os.access(_script_dir, os.W_OK)) else 
 STATE_DIR_FALLBACK = STATE_DIR == '/tmp' and not DOCKER_MODE
 
 VERBOSE = '--verbose' in sys.argv or '-v' in sys.argv or os.environ.get('STATUS_VERBOSE') == '1' or sys.stdout.isatty()
-# --dry-run / --print: collect, print the JSON to stdout, send nothing.
-DRY_RUN = '--dry-run' in sys.argv or '--print' in sys.argv
 
 def log_message(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -173,7 +178,7 @@ def get_cpu_usage():
     vysoký iowait ukazuje na pomalý/přetížený disk, ne na volnou CPU.
     Vrací (cpu_pct, steal_pct, iowait_pct).
     """
-    state_file = os.path.join(STATE_DIR, 'vps_agent_cpu_state.json')
+    state_file = os.path.join(STATE_DIR, 'vps_agent_cpu_state.json' + _STATE_SUFFIX)
     now_ts = time.time()
 
     def read_stat():
@@ -460,7 +465,7 @@ def get_inode_usage():
     except Exception:
         return None
 
-DISKIO_STATE_FILE = '/tmp/status-agent-diskio.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_diskio.state')
+DISKIO_STATE_FILE = ('/tmp/status-agent-diskio.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_diskio.state')) + _STATE_SUFFIX
 _WHOLE_DISK_RE = re.compile(r'^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+)$')
 
 def get_disk_io_sectors():
@@ -530,7 +535,7 @@ def get_disk_io():
     write_kbps = round((delta_write * sector_size / elapsed) / 1024, 1)
     return read_kbps, write_kbps
 
-FORKRATE_STATE_FILE = '/tmp/status-agent-forkrate.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_forkrate.state')
+FORKRATE_STATE_FILE = ('/tmp/status-agent-forkrate.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_forkrate.state')) + _STATE_SUFFIX
 
 def get_fork_rate():
     """
@@ -599,7 +604,7 @@ def get_temperature():
 
 def get_system_identity():
     """Statická identita hostitele kešovaná v RAM."""
-    cache_file = os.path.join(STATE_DIR, 'vps_agent_identity.json')
+    cache_file = os.path.join(STATE_DIR, 'vps_agent_identity.json' + _STATE_SUFFIX)
     root = HOST_ROOT if DOCKER_MODE and os.path.isdir(HOST_ROOT) else ''
 
     def reboot_required():
@@ -721,8 +726,9 @@ def get_process_snapshot(limit=5):
             pass
         return stats
 
-    state_file = os.path.join(STATE_DIR, 'vps_agent_proc_state.json')
+    state_file = os.path.join(STATE_DIR, 'vps_agent_proc_state.json' + _STATE_SUFFIX)
     now_ts = time.time()
+    prev_mono = None
     boot_id = _boot_id()
     self_pid = str(os.getpid())
     stats2 = read_all_stats()
@@ -738,6 +744,7 @@ def get_process_snapshot(limit=5):
                 # ever matched and the CPU ranking was always empty.
                 prev_state = {str(k): v for k, v in raw.get('stats', {}).items()}
                 prev_ts = raw.get('ts', now_ts)
+                prev_mono = raw.get('mono')
                 if raw.get('boot_id') != boot_id:
                     prev_state = None
         except Exception:
@@ -745,7 +752,7 @@ def get_process_snapshot(limit=5):
 
     try:
         serializable_stats = {str(k): list(v) for k, v in stats2.items()}
-        _atomic_write_json(state_file, {'ts': now_ts, 'boot_id': boot_id, 'stats': serializable_stats})
+        _atomic_write_json(state_file, {'ts': now_ts, 'mono': time.monotonic(), 'boot_id': boot_id, 'stats': serializable_stats})
     except Exception:
         pass
 
@@ -770,12 +777,17 @@ def get_process_snapshot(limit=5):
         return round(rss_kb[pid] / 1024, 1) if pid in rss_kb else None
 
     cpu_deltas = []
-    if prev_state:
+    # Elapsed time on the MONOTONIC clock: a wall-clock step backwards (NTP
+    # correction, a VM restored from a snapshot) made the interval tiny and the
+    # ranking reported fabricated 1000 %+ values. Without a monotonic stamp
+    # from the previous run there is no ranking, not a guessed one.
+    mono_prev = prev_mono if isinstance(prev_mono, (int, float)) else None
+    if prev_state and mono_prev is not None and time.monotonic() > mono_prev:
         try:
             clk_tck = os.sysconf('SC_CLK_TCK')
         except Exception:
             clk_tck = 100
-        elapsed = max(0.1, now_ts - prev_ts)
+        elapsed = max(0.1, time.monotonic() - mono_prev)
         for pid, (state, ticks2) in stats2.items():
             # The agent itself never belongs in its own ranking.
             if pid == self_pid or pid not in prev_state or state == 'Z':
@@ -877,7 +889,7 @@ def get_smart_status():
     """SMART health, refreshed once per HEAVY_OP_INTERVAL_HOURS. smartctl wakes
     drives and costs 50-300 ms each; running it every minute was the single
     most expensive thing this agent did, for a value that changes about never."""
-    cache_file = os.path.join(STATE_DIR, 'vps_agent_smart_cache.json')
+    cache_file = os.path.join(STATE_DIR, 'vps_agent_smart_cache.json' + _STATE_SUFFIX)
     ttl = max(1, HEAVY_OP_INTERVAL_HOURS) * 3600
     try:
         if time.time() - os.path.getmtime(cache_file) < ttl:
@@ -887,11 +899,14 @@ def get_smart_status():
                 return cached['smart']
     except Exception:
         pass
-    result = _probe_smart_status()
-    try:
-        _atomic_write_json(cache_file, {'smart': result})
-    except Exception:
-        pass
+    result, final = _probe_smart_status()
+    # A missing smartctl or a probe that timed out is not a verdict worth
+    # keeping for a day - the next run asks again.
+    if final:
+        try:
+            _atomic_write_json(cache_file, {'smart': result})
+        except Exception:
+            pass
     return result
 
 
@@ -900,9 +915,9 @@ def _probe_smart_status():
         drives = sorted(d for d in os.listdir('/sys/class/block')
                         if _WHOLE_DISK_RE.match(d) and os.path.exists(f'/sys/class/block/{d}/device'))
     except Exception:
-        return "N/A"
+        return "N/A", False
     if not drives:
-        return "OK (Nebyly detekovány fyzické disky)"
+        return "OK (Nebyly detekovány fyzické disky)", True
     failed = []
     unknown = []
     for drive in drives:
@@ -911,7 +926,9 @@ def _probe_smart_status():
             res = subprocess.run(['smartctl', '-H', '-n', 'standby', f'/dev/{drive}'],
                                  capture_output=True, text=True, timeout=20)
         except FileNotFoundError:
-            return "N/A (smartctl chybí)"
+            return "N/A (smartctl chybí)", False
+        except subprocess.TimeoutExpired:
+            return f"N/A (SMART neodpověděl pro /dev/{drive})", False
         except Exception:
             unknown.append(drive)
             continue
@@ -928,10 +945,10 @@ def _probe_smart_status():
     # A failing disk wins even when another gave no verdict - an early return
     # on the first silent drive used to hide the failing one behind it.
     if failed:
-        return f"WARNING (Disk /dev/{failed[0]} selhal v SMART)"
+        return "WARNING (Disk /dev/" + ", /dev/".join(failed) + " selhal v SMART)", True
     if unknown:
-        return "N/A (SMART nedostupné pro /dev/" + ", /dev/".join(unknown) + ")"
-    return "OK"
+        return "N/A (SMART nedostupné pro /dev/" + ", /dev/".join(unknown) + ")", True
+    return "OK", True
 
 def get_os_version():
     """Zjistí název a verzi operačního systému ze souboru /etc/os-release"""
@@ -1041,7 +1058,7 @@ def get_ts3_process_info():
     stat2 = read_proc_stat(pid)
     # One fixed file with the PID inside - the old per-PID name left a new
     # file in /tmp after every ts3server restart, forever.
-    state_file = os.path.join(STATE_DIR, 'vps_agent_ts3_state.json')
+    state_file = os.path.join(STATE_DIR, 'vps_agent_ts3_state.json' + _STATE_SUFFIX)
     now_ts = time.time()
     prev_state = None
     if os.path.exists(state_file):
@@ -1297,9 +1314,14 @@ def handle_remote_action(res_body):
         init_script = f"/etc/init.d/{svc_name}"
         if os.access(init_script, os.X_OK):
             try:
-                subprocess.call([init_script, "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                rc = subprocess.call([init_script, "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
             except (subprocess.TimeoutExpired, OSError) as e:
                 send_action_result(act_id, "failed", f"Restart '{svc_name}' přes init.d selhal: {e}")
+                return
+            if rc != 0:
+                # "executed" used to go out regardless of the exit code, so a
+                # restart that failed showed as done in the administration.
+                send_action_result(act_id, "failed", f"Restart '{svc_name}' přes init.d skončil kódem {rc}")
                 return
             log_message(f"Restartována služba přes init.d: {svc_name}")
             send_action_result(act_id, "executed", f"Služba '{svc_name}' restartována přes init.d")
@@ -1311,19 +1333,26 @@ def handle_remote_action(res_body):
         # Potvrzení musí odejít PŘED rebootem - jakmile reboot ukončí proces,
         # už se nic dalšího neprovede.
         send_action_result(act_id, "executed", "Server se restartuje")
+        rebooted = False
         for cmd in (["/sbin/reboot"], ["systemctl", "reboot"]):
             try:
                 if subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120) == 0:
+                    rebooted = True
                     break
             except (subprocess.TimeoutExpired, OSError):
                 continue
+        if not rebooted:
+            # Still alive and every command failed: the optimistic ack above
+            # was wrong, and the administration would show a reboot that never
+            # happened.
+            send_action_result(act_id, "failed", "Reboot se nepodařilo spustit (reboot ani systemctl reboot neuspěly)")
 
 
 def get_discovered_services(ports, processes):
     """Detekce běžících služeb podle portů/procesů/konfiguračních souborů.
     Vrací seznam dictů: {name, type, port, confidence, evidence, missing}.
     Confidence je součet bodů (process=30, port=25, config=25, active=19), max 99."""
-    cache_file = os.path.join(STATE_DIR, 'vps_agent_services_cache.json')
+    cache_file = os.path.join(STATE_DIR, 'vps_agent_services_cache.json' + _STATE_SUFFIX)
     now_ts = time.time()
     cache_ttl = HEAVY_OP_INTERVAL_HOURS * 3600
 
@@ -1478,11 +1507,25 @@ def main():
     try:
         import fcntl
         lock_fh = open(os.path.join(STATE_DIR, 'vps_agent.lock'), 'w')
-        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (ImportError, OSError):
-        if lock_fh is not None:
-            log_message("Předchozí běh ještě běží, tento končím.")
-            sys.exit(0)
+        # A dry run run by hand waits for a cron run to finish instead of
+        # printing nothing; a cron run gives way at once.
+        deadline = time.time() + (60 if DRY_RUN else 0)
+        while True:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                # EWOULDBLOCK is the only errno that means another run holds it.
+                if time.time() >= deadline:
+                    log_message("Předchozí běh ještě běží, tento končím.")
+                    sys.exit(1 if DRY_RUN else 0)
+                time.sleep(1)
+    except ImportError:
+        pass
+    except OSError as e:
+        # A filesystem without flock support (some network mounts) must not
+        # stop every report forever - it used to read as "still running".
+        log_message(f"VAROVANI: zamek nelze pouzit ({e}), bezim bez nej.")
 
     if STATE_DIR_FALLBACK:
         log_message(f"VAROVANI: do {_script_dir} nelze zapisovat, stav se ukládá do /tmp.")
