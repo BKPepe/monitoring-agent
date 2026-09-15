@@ -57,6 +57,22 @@ admin panel. See `apps/status/README.md` for full installation instructions for
 each variant, and the "Self-Updates" section for how the opt-in auto-update flow
 (checksum-verified, atomic replace) works across all four.
 
+### Wi-Fi 6E support of the clients (OpenWrt)
+
+From 0.1.6 each Wi-Fi radio also reports `clients_6ghz_capable` and
+`clients_caps_known`: how many connected stations list a 6 GHz operating class
+(131-137, i.e. Wi-Fi 6E) and how many sent their list of operating classes at
+all. The list comes from `hostapd_cli all_sta`, which ships in the
+`hostapd-utils` package and is not installed on OpenWrt by default:
+
+```sh
+opkg update && opkg install hostapd-utils
+```
+
+Without it both values are `null` (unknown), never `0`. A station that sent no
+list is left out of `clients_caps_known`, so "not capable" and "did not say"
+stay apart.
+
 ### Deployment (self-deploy to the dashboard hosting)
 
 `.github/workflows/deploy-agents.yml` uploads the four agent files to
@@ -76,7 +92,7 @@ pretending it deployed.
 `tests/` runs every agent for real, not just through a parser: `agent.sh` and
 `agent.py` in a Debian container (two runs, so between-run deltas exist),
 `agent_openwrt.sh` in busybox with canned `wg` / `mwan3` / `tc` / `uci` /
-`logread` / `iwinfo` / `nft` / `ubus` output. Each harness asserts on the JSON
+`logread` / `iwinfo` / `hostapd_cli` / `nft` / `ubus` output. Each harness asserts on the JSON
 the agent prints with `--dry-run` - valid JSON, honest `null` on the first run,
 parsers reading the right columns. Needs docker and python3:
 

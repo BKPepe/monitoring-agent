@@ -26,5 +26,7 @@ sleep 2
 head -c 200000 /dev/zero | tr "\\0" "x" > /tmp/status-agent-openwrt.log
 sh agent_openwrt.sh --dry-run > /work/out/r2.json 2>/work/out/e2.txt
 wc -c < /tmp/status-agent-openwrt.log | tr -cd "0-9" > /work/out/logsize.txt
+# The third run also has no hostapd_cli (hostapd-utils is not installed by default).
+mv /work/stubs/bin/hostapd_cli /work/stubs/hostapd_cli.off
 BK_STUB_NO_WAN=1 sh agent_openwrt.sh --dry-run > /work/out/r3.json 2>/work/out/e3.txt
 if [ -d /tmp/status-agent-openwrt.lock ]; then echo "lock directory left behind" >&2; exit 1; fi

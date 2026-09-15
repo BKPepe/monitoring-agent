@@ -24,6 +24,7 @@ except (FileNotFoundError, ValueError):
     log_size = -1
 wg = d["wireguard_peers"]
 radios = {r["radio"]: r for r in d["wifi_radios"]}
+radios3 = {r["radio"]: r for r in d3["wifi_radios"]}
 checks = {
     "wireguard: the interface line is skipped, two peers remain": len(wg) == 2,
     "wireguard: public_key is the peer's key, not the private key": wg[0]["public_key"].startswith("PEERONEpubke"),
@@ -37,6 +38,9 @@ checks = {
     "wifi: enabled radio has channel, clients, ssid, power, noise": radios["wlan0"]["channel"] == 6 and radios["wlan0"]["clients"] == 2 and radios["wlan0"]["ssid"] == "Home" and radios["wlan0"]["tx_power"] == 20 and radios["wlan0"]["noise"] == -95,
     "wifi: disabled radio reports null, not channel 0 at 0 dBm": radios["wlan1"]["channel"] is None and radios["wlan1"]["tx_power"] is None and radios["wlan1"]["noise"] is None and radios["wlan1"]["ssid"] is None and radios["wlan1"]["clients"] == 0,
     "wifi_clients_count is the sum over radios": d["wifi_clients_count"] == 2,
+    "wifi 6e: a station listing 6 GHz operating classes counts, one without does not": radios["wlan0"]["clients_6ghz_capable"] == 1 and radios["wlan0"]["clients_caps_known"] == 2,
+    "wifi 6e: a radio hostapd does not answer for is unknown, not zero": radios["wlan1"]["clients_6ghz_capable"] is None and radios["wlan1"]["clients_caps_known"] is None,
+    "wifi 6e: without hostapd_cli support is unknown and the client count stays": radios3["wlan0"]["clients_6ghz_capable"] is None and radios3["wlan0"]["clients_caps_known"] is None and radios3["wlan0"]["clients"] == 2,
     "firewall: accept/drop/reject sums and enabled from one ruleset": (d["fw_accepted"], d["fw_dropped"], d["fw_rejected"], d["firewall_enabled"]) == (200, 5, 3, True),
     "wan: interface up and the bound echo answered": d["wan_up"] is True and d["wan_internet"] is True,
     "dhcp: no lease file is unknown, reservations counted": d["dhcp_leases_count"] is None and d["dhcp_reservations_count"] == 3,

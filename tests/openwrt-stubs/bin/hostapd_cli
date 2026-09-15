@@ -1,0 +1,21 @@
+#!/bin/sh
+# hostapd_cli -i <iface> all_sta, as hostapd-utils prints it. wlan0 has two
+# stations: the first lists 6 GHz operating classes (0x83-0x86 = 131-134), the
+# second only 2.4/5 GHz ones (the real list from a Turris test log). Any other
+# interface has no hostapd behind it.
+case "$*" in
+  "-i wlan0 all_sta") cat <<'S'
+11:22:33:44:55:66
+flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT][HE]
+aid=1
+supp_op_classes=51515253547374757677787980818283848586
+dot11RSNAStatsSTAAddress=11:22:33:44:55:66
+77:88:99:aa:bb:cc
+flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT]
+aid=2
+supp_op_classes=80737475767778797a7b7c7d7e7f808182
+dot11RSNAStatsSTAAddress=77:88:99:aa:bb:cc
+S
+  ;;
+  *) echo "Failed to connect to hostapd - wpa_ctrl_open: No such file or directory" >&2; exit 255 ;;
+esac

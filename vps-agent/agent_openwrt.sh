@@ -101,7 +101,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.5"
+AGENT_VERSION="0.1.6"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 CPU_STATE_FILE="/tmp/status-agent-openwrt-cpu.state"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
@@ -1918,10 +1918,37 @@ if command -v iwinfo >/dev/null 2>&1; then
             fi
         fi
 
+        # Wi-Fi 6E support of the connected stations. A client lists the
+        # operating classes it can use when it associates; 131-137 are the
+        # 6 GHz ones, so a station on 2.4 or 5 GHz that lists one of them could
+        # use 6 GHz. hostapd_cli (package hostapd-utils) prints that list as
+        # supp_op_classes=<hex>. Without hostapd_cli, or when hostapd does not
+        # answer for this radio, support is unknown: null, never "none". A
+        # station that sent no list is simply not counted in clients_caps_known.
+        clients_6ghz_capable="null"
+        clients_caps_known="null"
+        if command -v hostapd_cli >/dev/null 2>&1 \
+            && _sta=$(hostapd_cli -i "$radio" all_sta 2>/dev/null) \
+            && ! printf '%s' "$_sta" | grep -q 'Failed to connect'; then
+            _caps=$(printf '%s\n' "$_sta" | awk '
+                function hexval(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+                /^supp_op_classes=/ {
+                    h = substr($0, 17); known++; six = 0
+                    for (i = 1; i < length(h); i += 2) {
+                        v = hexval(substr(h, i, 1)) * 16 + hexval(substr(h, i + 1, 1))
+                        if (v >= 131 && v <= 137) six = 1
+                    }
+                    capable += six
+                }
+                END { printf "%d %d", known, capable }')
+            clients_caps_known=${_caps% *}
+            clients_6ghz_capable=${_caps#* }
+        fi
+
         # A disabled radio prints "unknown" everywhere: that is no SSID, no
         # channel, not channel 0 at 0 dBm with 0 dBm of noise.
         if [ -n "$ssid" ] && [ "$ssid" != "unknown" ]; then ssid_json="\"$(json_str "$ssid")\""; else ssid_json="null"; fi
-        for _rv in channel tx_power noise clients; do
+        for _rv in channel tx_power noise clients clients_6ghz_capable clients_caps_known; do
             eval "_rx=\$$_rv"
             # shellcheck disable=SC2154
             case "${_rx#-}" in (''|*[!0-9]*) eval "$_rv=null" ;; esac
@@ -1932,8 +1959,8 @@ if command -v iwinfo >/dev/null 2>&1; then
         # per radio that never produced a value. Not measured here: null.
         busy_pct="null"
 
-        printf "{\"radio\":\"%s\",\"ssid\":%s,\"band\":\"%s\",\"channel\":%s,\"tx_power\":%s,\"noise\":%s,\"clients\":%s,\"busy_pct\":%s}, " \
-            "$radio" "$ssid_json" "$band" "$channel" "$tx_power" "$noise" "$clients" "$busy_pct"
+        printf "{\"radio\":\"%s\",\"ssid\":%s,\"band\":\"%s\",\"channel\":%s,\"tx_power\":%s,\"noise\":%s,\"clients\":%s,\"clients_6ghz_capable\":%s,\"clients_caps_known\":%s,\"busy_pct\":%s}, " \
+            "$radio" "$ssid_json" "$band" "$channel" "$tx_power" "$noise" "$clients" "$clients_6ghz_capable" "$clients_caps_known" "$busy_pct"
     done | sed 's/, $//')
     [ -n "$wifi_radios_json" ] && wifi_radios_json="[$wifi_radios_json]" || wifi_radios_json="[]"
     # Total clients = the sum over radios that reported a count.
