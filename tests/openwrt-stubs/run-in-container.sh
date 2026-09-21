@@ -406,3 +406,12 @@ fresh
 # Agent hardening (identity cache, last payload, remote actions); the version
 # stamp it needs was written by the runs above and lives outside $PRIV.
 sh /work/stubs/runs-g28.sh
+
+# The assertions run on the HOST, as whoever started the harness; everything in
+# here runs as root. Files the agent writes 0600 by design (the last payload,
+# the private directory) keep that mode through `cp`, so on a Linux host the
+# reader hits EACCES - on macOS it does not, because Docker maps ownership to
+# the calling user, which is why this only ever failed in CI. The modes that
+# the tests actually assert are captured as text next to the artifacts
+# (*_mode.txt, *_dirmode.txt), so relaxing the COPIES proves nothing less.
+chmod -R a+rX "$OUT" 2>/dev/null || true
