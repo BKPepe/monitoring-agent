@@ -1,0 +1,8 @@
+Survey data from wlan7
+	frequency:			5500 MHz [in use]
+	noise:				-93 dBm
+	channel active time:		800000 ms
+	channel busy time:		600000 ms
+	channel receive time:		450000 ms
+	channel BSS receive time:	200000 ms
+	channel transmit time:		300000 ms

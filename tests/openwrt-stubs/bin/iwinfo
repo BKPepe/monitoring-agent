@@ -1,22 +1,145 @@
 #!/bin/sh
-if [ $# -eq 0 ]; then
-cat <<'M'
-wlan0     ESSID: "Home"
-          Access Point: AA:BB:CC:DD:EE:FF
+# iwinfo as the CLI really behaves (iwinfo_cli.c): it takes exactly ONE
+# command per call. `iwinfo wlan0 info assoclist` does not print both - it
+# reads "info" as a backend name, complains on stderr, prints nothing and
+# exits 1. A collector that batches commands must see that here, not on a
+# router. Every call is logged; a command starting with "s" would be a scan,
+# which takes the radio off its channel, so it leaves a marker the test reads.
+#
+# Radios: wlan0 (2.4 GHz; an ESSID with a quote, a backslash and a #), wlan1
+# (disabled), phy0-ap0 and phy3-ap0 (the owner's Omnia, see omnia/README.md),
+# wlan6 (6 GHz, the driver gives no station list), wlan7 (5 GHz, nobody on it).
+D=/work/stubs/omnia
+echo "$*" >> /work/out/iwinfo_calls.log
+if [ $# -gt 2 ]; then echo "No such wireless backend: $1" >&2; exit 1; fi
+case "$2" in s*) echo SCAN >> /work/out/iwinfo_scan.log ;; esac
+
+info() {
+    case "$1" in
+    wlan0) cat <<'M'
+wlan0     ESSID: "Kafe "U Pepy" #1 \o/"
+          Access Point: 02:00:00:00:00:20
           Mode: Master  Channel: 6 (2.437 GHz)  HT Mode: HT20
+          Center Channel 1: 6 2: unknown
           Tx-Power: 20 dBm  Link Quality: 70/70
           Signal: -40 dBm  Noise: -95 dBm
+          Bit Rate: 130.0 MBit/s
+          Encryption: WPA2 PSK (CCMP)
+          Type: nl80211  HW Mode(s): 802.11b/g/n
+          Hardware: 168C:0033 168C:A120 [Qualcomm Atheros AR958x]
+          TX power offset: none
+          Frequency offset: none
+          Supports VAPs: yes  PHY name: phy1
+M
+    ;;
+    wlan1) cat <<'M'
 wlan1     ESSID: unknown
           Access Point: 00:00:00:00:00:00
           Mode: Unknown  Channel: unknown (unknown)
           Tx-Power: unknown  Link Quality: unknown/70
           Signal: unknown  Noise: unknown
+          Bit Rate: unknown
+          Encryption: unknown
+          Type: nl80211  HW Mode(s): 802.11b/g/n
+          Supports VAPs: yes  PHY name: phy5
 M
-exit 0; fi
-case "$1 $2" in
-  "wlan0 info") printf 'wlan0     ESSID: "Home"\n          Mode: Master  Channel: 6 (2.437 GHz)  HT Mode: HT20\n          Tx-Power: 20 dBm  Link Quality: 70/70\n          Signal: -40 dBm  Noise: -95 dBm\n          Hardware: 14C3:7915 [MediaTek MT7915E]\n' ;;
-  "wlan1 info") printf 'wlan1     ESSID: unknown\n          Mode: Unknown  Channel: unknown (unknown)\n          Tx-Power: unknown  Link Quality: unknown/70\n          Signal: unknown  Noise: unknown\n' ;;
-  "wlan0 assoclist") printf '11:22:33:44:55:66  -45 dBm / -95 dBm (SNR 50)  10 ms ago\n77:88:99:AA:BB:CC  -60 dBm / -95 dBm (SNR 35)  20 ms ago\n' ;;
-  "wlan1 assoclist") echo "No station connected" ;;
-  *) exit 1 ;;
+    ;;
+    phy0-ap0) cat $D/iwinfo_info.txt ;;
+    phy3-ap0) cat $D/iwinfo_phy3_info.txt ;;
+    wlan6) cat <<'M'
+wlan6     ESSID: "Six"
+          Access Point: 02:00:00:00:00:66
+          Mode: Master  Channel: 1 (5.955 GHz)  HT Mode: HE160
+          Center Channel 1: 15 2: unknown
+          Tx-Power: 20 dBm  Link Quality: unknown/70
+          Signal: unknown  Noise: unknown
+          Bit Rate: unknown
+          Encryption: WPA3 SAE (CCMP)
+          Type: nl80211  HW Mode(s): 802.11ax
+          Hardware: USB 0E8D:7961 [Generic MAC80211]
+          Supports VAPs: yes  PHY name: phy2
+M
+    ;;
+    wlan7) cat <<'M'
+wlan7     ESSID: "Garaz"
+          Access Point: 02:00:00:00:00:70
+          Mode: Master  Channel: 100 (5.500 GHz)  HT Mode: VHT80
+          Center Channel 1: 106 2: unknown
+          Tx-Power: 23 dBm  Link Quality: unknown/70
+          Signal: unknown  Noise: -93 dBm
+          Bit Rate: unknown
+          Encryption: mixed WPA/WPA2 PSK (TKIP, CCMP)
+          Type: nl80211  HW Mode(s): 802.11ac/n
+          Supports VAPs: yes  PHY name: phy4
+M
+    ;;
+    *) return 1 ;;
+    esac
+}
+
+assoclist() {
+    case "$1" in
+    # Station 1: a known signal next to an UNKNOWN noise - the SNR iwinfo then
+    # prints (-45) is arithmetic on a zero, not a measurement. Station 3: no
+    # signal at all. The mean TX rate (72.0) is not the AP-side Bit Rate (130.0).
+    wlan0) cat <<'M'
+02:00:00:00:00:21  -45 dBm / unknown (SNR -45)  10 ms ago
+	RX: 130.0 MBit/s, MCS 15, 20MHz                  1200 Pkts.
+	TX: 144.4 MBit/s, MCS 15, 20MHz, short GI        1500 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:22  -60 dBm / -95 dBm (SNR 35)  20 ms ago
+	RX: 58.5 MBit/s, MCS 6, 20MHz                     800 Pkts.
+	TX: 65.0 MBit/s, MCS 7, 20MHz                     900 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:23  unknown / -95 dBm (SNR 95)  4000 ms ago
+	RX: 1.0 MBit/s                                     12 Pkts.
+	TX: 6.5 MBit/s, MCS 0, 20MHz                       15 Pkts.
+	expected throughput: unknown
+
+M
+    ;;
+    wlan1|wlan7) echo "No station connected" ;;
+    wlan6) echo "No information available" ;;
+    phy0-ap0) cat $D/iwinfo_assoclist.txt ;;
+    phy3-ap0) cat $D/iwinfo_phy3_assoclist.txt ;;
+    *) return 1 ;;
+    esac
+}
+
+# htmodelist and freqlist: what the daily capability cache is made of.
+# Synthesized (no capture yet); omnia/caps.txt holds both for phy0-ap0.
+htmodelist() {
+    case "$1" in
+    phy0-ap0) sed -n '1p' $D/caps.txt ;;
+    wlan6) echo "HE20 HE40 HE80 HE160 " ;;
+    wlan7) echo "HT20 HT40 VHT20 VHT40 VHT80 " ;;
+    wlan0|wlan1|phy3-ap0) echo "HT20 HT40 " ;;
+    *) return 1 ;;
+    esac
+}
+freqlist() {
+    case "$1" in
+    phy0-ap0) sed -n '2,$p' $D/caps.txt ;;
+    wlan6) printf '* 5.955 GHz (Band: 6 GHz, Channel 1) \n  5.975 GHz (Band: 6 GHz, Channel 5) \n' ;;
+    wlan7) printf '  5.180 GHz (Band: 5 GHz, Channel 36) \n* 5.500 GHz (Band: 5 GHz, Channel 100) \n' ;;
+    wlan0) printf '  2.412 GHz (Band: 2.4 GHz, Channel 1) \n* 2.437 GHz (Band: 2.4 GHz, Channel 6) \n' ;;
+    phy3-ap0) printf '  2.412 GHz (Band: 2.4 GHz, Channel 1) \n* 2.432 GHz (Band: 2.4 GHz, Channel 5) \n' ;;
+    wlan1) printf '  2.412 GHz (Band: 2.4 GHz, Channel 1) \n  2.437 GHz (Band: 2.4 GHz, Channel 6) \n' ;;
+    *) return 1 ;;
+    esac
+}
+
+if [ $# -eq 0 ]; then
+    # Bare `iwinfo`: the info block of every device, a blank line between them.
+    for _r in wlan0 wlan1 phy0-ap0 wlan6 wlan7 phy3-ap0; do info "$_r"; echo; done
+    exit 0
+fi
+case "$2" in
+    info) info "$1" ;;
+    assoclist) assoclist "$1" ;;
+    htmodelist) htmodelist "$1" ;;
+    freqlist) freqlist "$1" ;;
+    *) exit 1 ;;
 esac

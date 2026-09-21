@@ -1,0 +1,30 @@
+02:00:00:00:00:31  -50 dBm / unknown (SNR -50)  120 ms ago
+	RX: 24.0 MBit/s                                  4100 Pkts.
+	TX: 72.2 MBit/s, MCS 7, 20MHz, short GI        5200 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:32  -58 dBm / unknown (SNR -58)  40 ms ago
+	RX: 24.0 MBit/s                                  4100 Pkts.
+	TX: 72.2 MBit/s, MCS 7, 20MHz, short GI        5200 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:33  -61 dBm / unknown (SNR -61)  2300 ms ago
+	RX: 24.0 MBit/s                                  4100 Pkts.
+	TX: 65.0 MBit/s, MCS 7, 20MHz        5200 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:34  -64 dBm / unknown (SNR -64)  10 ms ago
+	RX: 24.0 MBit/s                                  4100 Pkts.
+	TX: 72.2 MBit/s, MCS 7, 20MHz, short GI        5200 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:35  -68 dBm / unknown (SNR -68)  860 ms ago
+	RX: 24.0 MBit/s                                  4100 Pkts.
+	TX: 57.8 MBit/s, MCS 5, 20MHz, short GI        5200 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:36  -71 dBm / unknown (SNR -71)  30 ms ago
+	RX: 24.0 MBit/s                                  4100 Pkts.
+	TX: 86.7 MBit/s, MCS 12, 20MHz, short GI        5200 Pkts.
+	expected throughput: unknown
+

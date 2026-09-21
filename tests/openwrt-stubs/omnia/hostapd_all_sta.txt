@@ -1,0 +1,54 @@
+02:00:00:00:00:04
+flags=[AUTH][ASSOC][AUTHORIZED][WMM][MFP][HT][VHT][HE]
+aid=1
+capability=0x1511
+listen_interval=10
+timeout_next=NULLFUNC POLL
+dot11RSNAStatsSTAAddress=02:00:00:00:00:04
+dot11RSNAStatsVersion=1
+dot11RSNAStatsSelectedPairwiseCipher=00-0f-ac-4
+AKMSuiteSelector=00-0f-ac-8
+rx_packets=1
+tx_packets=1
+supp_op_classes=80515354737475767778797a7b7c7d7e7f8081838485860082808785
+connected_time=100
+02:00:00:00:00:03
+flags=[AUTH][ASSOC][AUTHORIZED][WMM][MFP][HT][VHT]
+aid=1
+capability=0x1511
+listen_interval=10
+timeout_next=NULLFUNC POLL
+dot11RSNAStatsSTAAddress=02:00:00:00:00:03
+dot11RSNAStatsVersion=1
+dot11RSNAStatsSelectedPairwiseCipher=00-0f-ac-4
+AKMSuiteSelector=00-0f-ac-8
+rx_packets=1
+tx_packets=1
+connected_time=100
+02:00:00:00:00:02
+flags=[AUTH][ASSOC][AUTHORIZED][WMM][MFP][HT]
+aid=1
+capability=0x1511
+listen_interval=10
+timeout_next=NULLFUNC POLL
+dot11RSNAStatsSTAAddress=02:00:00:00:00:02
+dot11RSNAStatsVersion=1
+dot11RSNAStatsSelectedPairwiseCipher=00-0f-ac-4
+AKMSuiteSelector=00-0f-ac-8
+rx_packets=1
+tx_packets=1
+connected_time=100
+02:00:00:00:00:01
+flags=[AUTH][ASSOC][AUTHORIZED][WMM][MFP][HT][VHT][HE]
+aid=1
+capability=0x1511
+listen_interval=10
+timeout_next=NULLFUNC POLL
+dot11RSNAStatsSTAAddress=02:00:00:00:00:01
+dot11RSNAStatsVersion=1
+dot11RSNAStatsSelectedPairwiseCipher=00-0f-ac-4
+AKMSuiteSelector=00-0f-ac-8
+rx_packets=1
+tx_packets=1
+supp_op_classes=808685848381807f7e7d7c7b7a7978777675747351
+connected_time=100

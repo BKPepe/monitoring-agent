@@ -1,7 +1,28 @@
 #!/bin/sh
-cat <<'M'
+# tc stub. Egress and ingress are two different qdiscs on two different
+# devices - SQM shapes the download on its own ifb device - so the two must
+# never answer with the same number.
+echo "$*" >> /work/out/tc_calls.log 2>/dev/null
+_dev=""
+while [ $# -gt 0 ]; do
+  [ "$1" = dev ] && { _dev="$2"; break; }
+  shift
+done
+case "$_dev" in
+  ifb4*)
+    cat <<'M'
+qdisc cake 8002: root refcnt 2 bandwidth 50Mbit besteffort triple-isolate nonat wash ingress no-ack-filter split-gso rtt 100ms raw overhead 0
+ Sent 987654321 bytes 800000 pkt (dropped 34, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+M
+    ;;
+  ?*)
+    cat <<'M'
 qdisc cake 8001: root refcnt 2 bandwidth 50Mbit diffserv3 triple-isolate nonat nowash no-ack-filter split-gso rtt 100ms raw overhead 0
  Sent 123456789 bytes 100000 pkt (dropped 12, overlimits 0 requeues 0)
  backlog 0b 0p requeues 0
  memory used: 1Mb of 4Mb
 M
+    ;;
+  *) exit 1 ;;
+esac

@@ -1,7 +1,37 @@
 #!/bin/sh
+# nft stub.
+#   BK_STUB_NFT=noflow   the same fw4 ruleset WITHOUT a flowtable: offloading
+#                        is configured off and really is not in the kernel
+#   BK_STUB_NFT=foreign  mwan3's table and nothing else - the firewall never
+#                        loaded, but the kernel is not empty (G20)
+#   BK_STUB_NFT=empty    nft answers, the kernel holds no table at all
 [ "$1 $2" = "list ruleset" ] || exit 1
+if [ "$BK_STUB_NFT" = empty ]; then
+    exit 0
+fi
+if [ "$BK_STUB_NFT" = foreign ]; then
+cat <<'M'
+table inet mwan3 {
+	chain mwan3_hook {
+		type filter hook prerouting priority mangle; policy accept;
+		counter packets 11 bytes 900 jump mwan3_track
+	}
+}
+M
+    exit 0
+fi
 cat <<'M'
 table inet fw4 {
+M
+if [ "$BK_STUB_NFT" != noflow ]; then
+cat <<'M'
+	flowtable ft {
+		hook ingress priority filter
+		devices = { br-lan, eth2 }
+	}
+M
+fi
+cat <<'M'
 	chain input {
 		type filter hook input priority filter; policy drop;
 		iifname "lo" accept comment "!fw4: Accept traffic from loopback"

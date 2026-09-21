@@ -1,4 +1,16 @@
 #!/bin/sh
+# BK_STUB_UPTIME_BUMP=1: this call also moves the fake root's uptime 4.20 s
+# forward. G42 measures a run from the kernel uptime at its start to the
+# uptime at payload assembly, and inside ONE run both reads would hit the same
+# static fixture and answer 0 ms. logread is the one command every full run
+# makes exactly once, between those two reads, so it is where the clock of the
+# fake router can be advanced - no sleep, no wall clock, and the expected
+# answer is exactly 4200 ms.
+if [ "$BK_STUB_UPTIME_BUMP" = 1 ] && [ -f "$STATUS_TEST_ROOT/proc/uptime" ]; then
+    read -r _u _i < "$STATUS_TEST_ROOT/proc/uptime"
+    awk -v u="$_u" -v i="$_i" 'BEGIN { printf "%.2f %.2f\n", u + 4.20, i }' \
+        > "$STATUS_TEST_ROOT/proc/uptime.new" && mv "$STATUS_TEST_ROOT/proc/uptime.new" "$STATUS_TEST_ROOT/proc/uptime"
+fi
 cat <<'M'
 Tue Sep  2 09:00:01 2026 daemon.info dnsmasq[123]: started, version 2.90 cachesize 150
 Tue Sep  2 09:00:02 2026 daemon.info uhttpd[200]: starting

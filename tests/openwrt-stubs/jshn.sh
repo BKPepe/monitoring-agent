@@ -2,6 +2,25 @@
 # `network.interface dump` (wan / lan / lte). Paths are what the agent
 # selects; anything else reads as empty, like a missing key in jshn.
 BK_SEL=""
+# BK_STUB_WAN picks the WAN line of the canned dump; bin/ubus follows the same
+# switch. The default is a plain DHCP port on eth0, which exists both in the
+# container and in the fake root. The rest are the branches of the WAN walk
+# (WAN 3.1.1), one netdev chain each, built by mkroot.sh:
+#   pppoe  the owner's line, PPPoE over VLAN 848 over eth2
+#   ppp0   a lone ppp netdev with nothing below it
+#   eth2   the port itself, DHCP
+#   brwan  a bridge over the single port eth2
+#   brwan2 a bridge over two ports
+#   dsa    a DSA user port whose carrier is down, above the conduit eth1
+case "$BK_STUB_WAN" in
+    pppoe)  BK_STUB_PROTO=pppoe; BK_STUB_DEV=eth2.848; BK_STUB_L3=pppoe-wan ;;
+    ppp0)   BK_STUB_PROTO=pppoe; BK_STUB_DEV=ppp0; BK_STUB_L3=ppp0 ;;
+    eth2)   BK_STUB_PROTO=dhcp; BK_STUB_DEV=eth2; BK_STUB_L3=eth2 ;;
+    brwan)  BK_STUB_PROTO=dhcp; BK_STUB_DEV=br-wan; BK_STUB_L3=br-wan ;;
+    brwan2) BK_STUB_PROTO=dhcp; BK_STUB_DEV=br-wan2; BK_STUB_L3=br-wan2 ;;
+    dsa)    BK_STUB_PROTO=dhcp; BK_STUB_DEV=wan; BK_STUB_L3=wan ;;
+    *)      BK_STUB_PROTO=dhcp; BK_STUB_DEV=eth0; BK_STUB_L3=eth0 ;;
+esac
 json_init() { BK_SEL=""; }
 json_load() { BK_SEL=""; }
 json_cleanup() { BK_SEL=""; }
@@ -23,16 +42,27 @@ json_get_keys() {
 }
 json_get_values() {
     case "$BK_SEL:$2" in
-        /interface/0:dns-server) eval "$1='1.1.1.1 9.9.9.9'" ;;
+        # Documentation addresses (RFC 5737): no resolver anybody runs, and
+        # no address of the owner's line, ever reaches this repository.
+        /interface/0:dns-server) eval "$1='192.0.2.53 198.51.100.53'" ;;
         *) eval "$1=''" ;;
     esac
 }
 json_get_var() {
     case "$BK_SEL:$2" in
+        # `ubus call system board` (the cursor is at the root)
+        :hostname) eval "$1=turris" ;;
+        :kernel) eval "$1=5.15.148" ;;
+        :model) eval "$1='Turris Omnia'" ;;
+        :board_name) eval "$1=cznic,turris-omnia" ;;
+        /release:distribution) eval "$1=TurrisOS" ;;
+        /release:version) eval "$1=7.2.3" ;;
         /interface/0:interface) eval "$1=wan" ;;
         /interface/0:up) eval "$1=1" ;;
-        /interface/0:proto) eval "$1=dhcp" ;;
-        /interface/0:l3_device) eval "$1=eth0" ;;
+        # The WAN line comes from the BK_STUB_WAN switch at the top.
+        /interface/0:proto) eval "$1=$BK_STUB_PROTO" ;;
+        /interface/0:l3_device) eval "$1=$BK_STUB_L3" ;;
+        /interface/0:device) eval "$1=$BK_STUB_DEV" ;;
         /interface/0:uptime) eval "$1=3600" ;;
         /interface/0/ipv4-address/0:address) eval "$1=203.0.113.10" ;;
         /interface/0/ipv4-address/0:mask) eval "$1=24" ;;

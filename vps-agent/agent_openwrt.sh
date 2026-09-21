@@ -52,6 +52,8 @@ if [ -f "$ScriptPath/agent_openwrt.cfg" ]; then
                     HEAVY_OP_INTERVAL_HOURS) HEAVY_OP_INTERVAL_HOURS="$val" ;;
                     REMOTE_ACTIONS_ENABLED) REMOTE_ACTIONS_ENABLED="$val" ;;
                     ALLOWED_ACTIONS) ALLOWED_ACTIONS="$val" ;;
+                    SMART_INTERVAL_MINUTES) SMART_INTERVAL_MINUTES="$val" ;;
+                    SMART_TIMEOUT_SEC) SMART_TIMEOUT_SEC="$val" ;;
                 esac
                 ;;
         esac
@@ -62,6 +64,18 @@ fi
 # the first log line.
 case "$HEAVY_OP_INTERVAL_HOURS" in ''|*[!0-9]*) HEAVY_OP_INTERVAL_HOURS=24 ;; esac
 HEAVY_OP_INTERVAL_SEC=$(( HEAVY_OP_INTERVAL_HOURS * 3600 ))
+
+# How often a disk may be woken for a SMART reading, and how long one smartctl
+# may run before the watchdog kills it. The interval has a floor of an hour:
+# a spin-up every minute would wear out the very disk the reading watches. The
+# timeout is clamped 10-180 s, because busybox has no `timeout` applet and the
+# watchdog below is what stands between a hung USB bridge and a stuck agent.
+case "$SMART_INTERVAL_MINUTES" in ''|*[!0-9]*) SMART_INTERVAL_MINUTES=60 ;; esac
+[ "$SMART_INTERVAL_MINUTES" -lt 60 ] && SMART_INTERVAL_MINUTES=60
+SMART_INTERVAL_SEC=$(( SMART_INTERVAL_MINUTES * 60 ))
+case "$SMART_TIMEOUT_SEC" in ''|*[!0-9]*) SMART_TIMEOUT_SEC=60 ;; esac
+[ "$SMART_TIMEOUT_SEC" -lt 10 ] && SMART_TIMEOUT_SEC=10
+[ "$SMART_TIMEOUT_SEC" -gt 180 ] && SMART_TIMEOUT_SEC=180
 
 if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     REG_TOKEN="$2"
@@ -101,9 +115,8 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.6"
+AGENT_VERSION="0.1.7"
 LOG_FILE="/tmp/status-agent-openwrt.log"
-CPU_STATE_FILE="/tmp/status-agent-openwrt-cpu.state"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
 
 VERBOSE="0"
@@ -125,6 +138,10 @@ for arg in "$@"; do
             echo "Konfigurace:"
             echo "  Cte nastaveni ze souboru agent_openwrt.cfg nebo z promendych prostredi:"
             echo "  STATUS_API_URL, STATUS_AGENT_KEY, STATUS_AUTO_UPDATE, STATUS_HEAVY_OP_INTERVAL_HOURS"
+            echo ""
+            echo "Volitelne balicky (bez nich zustanou jejich hodnoty prazdne, nikdy nulove):"
+            echo "  smartmontools, smartmontools-drivedb   zdravi disku (SMART)"
+            echo "  hostapd-utils                          generace a zabezpeceni Wi-Fi klientu"
             exit 0
             ;;
         --version|-V)
@@ -151,6 +168,44 @@ for arg in "$@"; do
     esac
 done
 
+# Test seam, honoured ONLY with --dry-run: a production cron run can never be
+# fed a canned server answer. STATUS_TEST_RESPONSE=<file>: line 1 is the HTTP
+# code (000 = transport failure), the rest is the body. A dry run stops before
+# the POST, so without it nothing the server's answer drives - remote actions
+# above all - could be tested end to end.
+BK_TEST_RESPONSE=""
+[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_RESPONSE" ] && BK_TEST_RESPONSE="$STATUS_TEST_RESPONSE"
+
+# The second seam, under the same guard: STATUS_TEST_ROOT=<dir> puts a fake
+# /sys and /proc in front of the collectors that name BK_SYS / BK_PROC (disks,
+# the WAN port, per-core CPU). Without it a test would read the CI runner's
+# own disks and eth0. Every other collector keeps its real path, and a cron
+# run can never be pointed at a fake /sys: no --dry-run, no root.
+BK_ROOT=""
+[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_ROOT" ] && BK_ROOT="$STATUS_TEST_ROOT"
+BK_SYS="$BK_ROOT/sys"; BK_PROC="$BK_ROOT/proc"
+
+# G42: how long the run takes is the one number that says whether a minute
+# report still fits into its minute. Both ends are read from the KERNEL
+# uptime, never from the clock: ntpd steps the clock on a router without an
+# RTC minutes after boot, and a run would come out negative or hours long.
+# Centiseconds, because that is the resolution /proc/uptime has; a partial or
+# missing read leaves the value empty, and the caller reports null.
+bk_uptime_cs() {
+    _up_cs=""
+    read -r _up_raw _ < "$BK_PROC/uptime" 2>/dev/null || return 0
+    case "$_up_raw" in *.*) ;; *) return 0 ;; esac
+    _up_w=${_up_raw%.*}
+    _up_f=${_up_raw#*.}
+    # Exactly two decimals, digits only: a kernel printing one would make the
+    # number ten times too small and nobody would see it.
+    case "$_up_f" in [0-9][0-9]) ;; *) return 0 ;; esac
+    case "$_up_w" in ''|*[!0-9]*) return 0 ;; esac
+    _up_cs="$_up_w$_up_f"
+}
+bk_uptime_cs
+BK_RUN_START_CS="$_up_cs"
+
 # Automatické vyčištění starých logů z flash paměti (/root) pro prevenci opotřebení disku
 for old_log in "$ScriptPath/agent_openwrt.log" "$ScriptPath/agent.log" /root/agent_openwrt.log /root/agent.log /root/status-agent-openwrt.log; do
     if [ -f "$old_log" ] && [ "$old_log" != "$LOG_FILE" ]; then
@@ -169,7 +224,17 @@ done
 # stara verze. Hodinu jsme hledali chybu v kodu, ktery uz byl spravne.
 BK_VERSION_STAMP="/tmp/status-agent-openwrt-version.stamp"
 if [ "$(cat "$BK_VERSION_STAMP" 2>/dev/null)" != "$AGENT_VERSION" ]; then
+    # The identity cache moved into the private directory (both of its
+    # possible places are named, the directory is chosen further down). The
+    # old last-payload file goes as well: 0.1.6 wrote it world-readable with
+    # the agent key inside, and nothing else would remove it before a reboot.
+    # 0.1.6's /proc/stat snapshot in /tmp is replaced by cores.now and
+    # cores.prev in the private directory, so the old file has no reader.
     rm -f /tmp/status-agent-openwrt-identity.cache \
+          /var/run/status-agent-openwrt/identity.cache \
+          /tmp/status-agent-openwrt-private/identity.cache \
+          /tmp/status-agent-openwrt-last-payload.json \
+          /tmp/status-agent-openwrt-cpu.state \
           /tmp/status-agent-openwrt-opkg.cache \
           /tmp/status-agent-openwrt-services.cache \
           /tmp/status-agent-openwrt-hilink-pin.cache \
@@ -178,6 +243,22 @@ if [ "$(cat "$BK_VERSION_STAMP" 2>/dev/null)" != "$AGENT_VERSION" ]; then
           /var/run/status-agent-openwrt/hilink-plmn.cache \
           /tmp/status-agent-openwrt-private/hilink-pin.cache \
           /tmp/status-agent-openwrt-private/hilink-plmn.cache 2>/dev/null || true
+    # Everything a parser of this version may read back from an older one:
+    # Wi-Fi survey counters and card facts, the disk list and the SMART
+    # readings, the WAN path and the rate states. NOT on the list, on purpose:
+    # probe.count, probe.attempts, pending.state, probe-out/ and skipped -
+    # spend the owner consented to and results not sent yet are no cache.
+    for _bk_pd in /var/run/status-agent-openwrt /tmp/status-agent-openwrt-private; do
+        # A planted symlink is never used as the private directory (see
+        # bk_private_dir_ok), so nothing behind it is ours to delete.
+        [ -L "$_bk_pd" ] && continue
+        rm -f "$_bk_pd/wifi-survey.state" "$_bk_pd"/wifi-caps.* \
+              "$_bk_pd/disks.static" "$_bk_pd/smart.cache" "$_bk_pd/smart.spawn" \
+              "$_bk_pd/wan-path.cache" "$_bk_pd"/cores.* "$_bk_pd/wan-rate.state" 2>/dev/null || true
+    done
+    # 0.1.6 remembered only the newest speedtest file here and so never sent
+    # the older ones; without the file the first run offers them all again.
+    rm -f /tmp/status-agent-librespeed.state 2>/dev/null || true
     echo "$AGENT_VERSION" > "$BK_VERSION_STAMP" 2>/dev/null || true
 fi
 
@@ -233,11 +314,223 @@ log_debug() {
 # the lock there (which in /tmp would stop the agent for good) or plant a
 # HiLink cache that forges the LTE-backup verdict. /tmp remains the fallback
 # for systems without it (the busybox test image).
+#
+# "Private" has to be checked, not assumed: in the /tmp fallback anybody can
+# make the directory first and then owns every cache the agent reads back as
+# root. So it must be a real directory (no symlink), ours (-O), and closed to
+# everyone else. The chmod also closes a 0755 directory left by 0.1.6.
+bk_private_dir_ok() {
+    [ -d "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] && chmod 700 "$1" 2>/dev/null
+}
 BK_PRIVATE_DIR="/var/run/status-agent-openwrt"
-if ! mkdir -p "$BK_PRIVATE_DIR" 2>/dev/null || [ -L "$BK_PRIVATE_DIR" ] || [ ! -d "$BK_PRIVATE_DIR" ]; then
+mkdir -p "$BK_PRIVATE_DIR" 2>/dev/null
+if ! bk_private_dir_ok "$BK_PRIVATE_DIR"; then
     BK_PRIVATE_DIR="/tmp/status-agent-openwrt-private"
-    mkdir -p "$BK_PRIVATE_DIR" 2>/dev/null || true
+    mkdir -p "$BK_PRIVATE_DIR" 2>/dev/null
+    if ! bk_private_dir_ok "$BK_PRIVATE_DIR"; then
+        # Planted by somebody else. The sticky bit of /tmp does not bind
+        # root, so the directory is replaced; rm does not follow a symlink.
+        rm -rf "$BK_PRIVATE_DIR" 2>/dev/null
+        mkdir "$BK_PRIVATE_DIR" 2>/dev/null
+        if ! bk_private_dir_ok "$BK_PRIVATE_DIR"; then
+            log_message "CHYBA: Soukromy adresar agenta ($BK_PRIVATE_DIR) nejde bezpecne vytvorit, koncim."
+            exit 1
+        fi
+    fi
 fi
+
+# --- SMART: the detached reader -----------------------------------------------
+#
+# `--smart-refresh <disk> ...` is this script in its second role: a child that
+# reads SMART and writes the cache the next minute run merges into the payload.
+# It is handled HERE, before the run lock and before the AGENT_KEY check,
+# because it reports nothing and must never queue behind a minute run that is
+# stuck on a dead server. A reading costs a drive access and can hang on a bad
+# USB bridge for minutes, and busybox has no `timeout` applet - so the minute
+# report never waits for a drive, it only reads what this child left behind.
+SMART_CACHE="$BK_PRIVATE_DIR/smart.cache"
+STORAGE_STATIC="$BK_PRIVATE_DIR/disks.static"
+
+# One smartctl reading -> one cache line. Input is the flat `--json=g` form
+# (json.a.b = v;): a router has no jsonfilter and no JSON parser this project
+# runs in CI, so the shape is read with awk, key by key. ONLY the keys matched
+# below are ever looked at - serial_number, wwn and every other identifier are
+# never read, let alone stored.
+# Vars: dev, size (sectors), rc (smartctl exit status), now (epoch), prev_file
+# Output: S|dev|size|probe_ts|values_ts|rc|state|rpm|<JSON members of smart>
+# The JSON keys are written \"key\": so that run_agent_metric_lint.php does
+# not read them as new top-level metrics.
+BK_SMART_AWK='
+function val(line,   v) { v = line; sub(/^[^=]*= /, "", v); sub(/;$/, "", v); if (v ~ /^".*"$/) v = substr(v, 2, length(v) - 2); return v }
+function num(v) { return (v ~ /^-?[0-9]+$/) ? v : "" }
+function lead(v) { if (match(v, /^[0-9]+/)) return substr(v, RSTART, RLENGTH); return "" }
+function j(k, v) { return "\"" k "\":" (v == "" ? "null" : v) }
+function js(k, v) { return "\"" k "\":" (v == "" ? "null" : "\"" v "\"") }
+BEGIN { while ((getline l < prev_file) > 0) { n = split(l, q, "|"); if (q[1] == "S" && q[2] == dev && q[3] == size) old = l } close(prev_file) }
+{
+    key = $0; sub(/ = .*/, "", key)
+    if (key == "json.device.protocol") proto = val($0)
+    else if (key == "json.model_name") model = val($0)
+    else if (key == "json.in_smartctl_database") indb = val($0)
+    else if (key == "json.smart_support.available") avail = val($0)
+    else if (key ~ /^json\.smartctl\.messages\[[0-9]+\]\.string$/) { if (val($0) ~ /Unknown USB bridge|Please specify device type/) bridge = 1 }
+    else if (key == "json.rotation_rate") rpm = num(val($0))
+    else if (key == "json.logical_block_size") lbs = num(val($0))
+    else if (key == "json.smart_status.passed") passed = val($0)
+    # The packed raw of attribute 194 is a different number entirely
+    # (292058955843 on the owners disk); the temperature is this key.
+    else if (key == "json.temperature.current") temp = num(val($0))
+    else if (key == "json.power_on_time.hours") poh = num(val($0))
+    else if (key == "json.power_cycle_count") cycles = num(val($0))
+    else if (key == "json.ata_smart_error_log.summary.count") errlog = num(val($0))
+    else if (key == "json.ata_smart_self_test_log.standard.count") selftests = num(val($0))
+    else if (key == "json.nvme_smart_health_information_log.percentage_used") n_used = num(val($0))
+    else if (key == "json.nvme_smart_health_information_log.data_units_written") n_duw = num(val($0))
+    else if (key == "json.nvme_smart_health_information_log.media_errors") media = num(val($0))
+    else if (key == "json.nvme_smart_health_information_log.critical_warning") crit = num(val($0))
+    else if (key == "json.nvme_smart_health_information_log.available_spare") spare = num(val($0))
+    else if (key == "json.nvme_smart_health_information_log.unsafe_shutdowns") unsafe = num(val($0))
+    else if (key ~ /^json\.ata_smart_attributes\.table\[[0-9]+\]\.(id|name|value|raw\.string)$/) {
+        i = key; sub(/^json\.ata_smart_attributes\.table\[/, "", i); f = i; sub(/\].*/, "", i); sub(/^[0-9]+\]\./, "", f)
+        a[i, f] = val($0); if (f == "id") at[val($0) + 0] = i
+    }
+    else if (key ~ /^json\.ata_device_statistics\.pages\[[0-9]+\]\.table\[[0-9]+\]\.(name|value)$/) {
+        p = key; sub(/^json\.ata_device_statistics\.pages\[/, "", p); t = p; sub(/\].*/, "", p)
+        sub(/^[0-9]+\]\.table\[/, "", t); f = t; sub(/\].*/, "", t); sub(/^[0-9]+\]\./, "", f)
+        ds[p, t, f] = val($0); if (f == "name") dsrow[p SUBSEP t] = 1
+    }
+}
+function raw(id) { return (id in at) ? lead(a[at[id], "raw.string"]) : "" }
+function named(id, re) { return ((id in at) && a[at[id], "name"] ~ re) }
+END {
+    rc += 0
+    # Read by ID: the meaning of 5 / 197 / 198 / 187 / 199 is standard, the
+    # NAME of an attribute is whatever the drive database calls it.
+    realloc = raw(5); reported = raw(187); pending = raw(197); offline = raw(198); crc = raw(199)
+    # These are read by NAME, so they need the database. Without it smartctl
+    # falls back to generic guesses (OpenWrt compiles in a single DEFAULT
+    # entry: 241 = Total_LBAs_Written, 231 = Temperature_Celsius) and 183 is
+    # SATA_Downshift_Count on most other drives - interpreting those would
+    # invent a wear figure and a bad-block count out of unrelated counters.
+    if (indb == "true") {
+        if (named(183, "^Runtime_Bad_Block$")) badblk = raw(183)
+        if (named(174, "^Unexpect_Power_Loss")) unsafe = raw(174)
+        else if (named(192, "^(Unsafe_Shutdown_Count|Unexpect_Power_Loss_Ct)$")) unsafe = raw(192)
+    }
+    for (k in dsrow) { split(k, kk, SUBSEP); nm = ds[kk[1], kk[2], "name"]; v = num(ds[kk[1], kk[2], "value"])
+        if (nm == "Percentage Used Endurance Indicator" && v != "") { wear = v; wsrc = "devstat" }
+        if (nm == "Logical Sectors Written" && v != "") lsw = v }
+    if (wear == "" && indb == "true") {
+        nc = split("231 ^SSD_Life_Left$,169 ^Remaining_Lifetime_Perc$,202 ^Percent_Lifetime_Remain$,233 ^Media_Wearout_Indicator$,177 ^Wear_Leveling_Count$", cand, ",")
+        for (c = 1; c <= nc; c++) { split(cand[c], cc, " "); if (!named(cc[1] + 0, cc[2])) continue
+            nv = num(a[at[cc[1] + 0], "value"]); if (nv != "" && nv + 0 >= 1 && nv + 0 <= 100) { wear = 100 - nv; wsrc = "attr" cc[1]; break } }
+    }
+    if (n_used != "") { wear = n_used; wsrc = "nvme" }
+    if (lbs == "") lbs = 512
+    # 241 counts different things on different drives - LBAs, MiB, GiB, 32 MiB
+    # blocks - and the unit is only in the NAME. A fixed x 512 turns 420 GiB
+    # written into 215 kB. Device statistics are exact, so they win.
+    if (lsw != "") { written = sprintf("%.0f", lsw * lbs); wrsrc = "devstat" }
+    else if (n_duw != "") { written = sprintf("%.0f", n_duw * 512000); wrsrc = "nvme" }
+    else if (indb == "true" && (241 in at)) { nm = a[at[241], "name"]; r = raw(241)
+        if (r != "") {
+            if (nm == "Host_Writes_GiB") written = sprintf("%.0f", r * 1073741824)
+            else if (nm == "Host_Writes_MiB") written = sprintf("%.0f", r * 1048576)
+            else if (nm == "Host_Writes_32MiB") written = sprintf("%.0f", r * 33554432)
+            else if (nm == "Total_LBAs_Written") written = sprintf("%.0f", r * lbs)
+            if (written != "") wrsrc = "attr241" } }
+    if (rc == 3) state = "standby"
+    else if (bridge) state = "unsupported"
+    else if (rc % 2 == 1 || rc == 124) state = "error"
+    else if (passed == "" && avail == "false") state = "unsupported"
+    else if (passed == "") state = (int(rc / 2) % 2 == 1) ? "error" : "unsupported"
+    else if (passed == "false" || int(rc / 8) % 2 == 1 || int(rc / 16) % 2 == 1) state = "failing"
+    else state = "ok"
+    if ((state == "standby" || state == "error") && old != "") {
+        # Nothing new was read: keep the last real reading, stamped with ITS
+        # time. Overwriting it with nulls would turn a sleeping disk into a
+        # disk whose temperature and hours are suddenly unknown.
+        n = split(old, q, "|"); line = "S|" dev "|" size "|" now "|" q[5] "|" rc "|" state
+        for (i = 8; i <= n; i++) line = line "|" q[i]
+        print line; exit
+    }
+    gsub(/[^A-Za-z0-9 ._()+\/-]/, "", model); model = substr(model, 1, 64)
+    gsub(/[^A-Za-z]/, "", proto)
+    vts = (state == "ok" || state == "failing") ? now : ""
+    body = j("exit_bits", rc) "," j("passed", (passed == "true" || passed == "false") ? passed : "") "," j("in_drivedb", (indb == "true" || indb == "false") ? indb : "") \
+        "," js("protocol", proto) "," js("model", model) "," j("rotation_rpm", rpm) "," j("temperature_c", temp) "," j("power_on_hours", poh) \
+        "," j("power_cycles", cycles) "," j("unsafe_shutdowns", unsafe) "," j("reallocated_sectors", realloc) "," j("pending_sectors", pending) \
+        "," j("offline_uncorrectable", offline) "," j("reported_uncorrect", reported) "," j("crc_errors", crc) "," j("runtime_bad_blocks", badblk) \
+        "," j("media_errors", media) "," j("critical_warning", crit) "," j("available_spare_pct", spare) "," j("wear_pct", wear) "," js("wear_source", wsrc) \
+        "," j("written_bytes", written) "," js("written_source", wrsrc) "," j("error_log_count", errlog) "," j("selftest_count", selftests)
+    # A state that carries no reading (unsupported, and error without a
+    # previous line) sends no values at all, not a row of zeros.
+    if (vts == "") body = ""
+    printf "S|%s|%s|%s|%s|%s|%s|%s|%s\n", dev, size, now, vts, rc, state, rpm, body
+}
+'
+
+# Reads SMART for the named disks and rewrites their lines in the cache.
+#
+# The lock is a directory with the PID inside: mkdir is atomic and flock is
+# not part of stock OpenWrt. `dev` and `since` are written per DISK, not per
+# batch, so "how long has this probe been running" is the truth about the
+# drive that is actually being read.
+bk_smart_refresh() {
+    _lock="$BK_PRIVATE_DIR/smart.lock"
+    if ! mkdir "$_lock" 2>/dev/null; then
+        _p=""; [ -r "$_lock/pid" ] && read -r _p < "$_lock/pid"
+        case "$_p" in ''|*[!0-9]*) _p="" ;; esac
+        [ -n "$_p" ] && [ -d "/proc/$_p" ] && return 0       # a probe is still running
+        rm -rf "$_lock"; mkdir "$_lock" 2>/dev/null || return 0
+    fi
+    echo "$$" > "$_lock/pid"; _now=$(date +%s); _new="$SMART_CACHE.new"; : > "$_new"; _hung=""
+    for _d in "$@"; do
+        case "$_d" in ''|*[!a-z0-9]*) continue ;; esac
+        [ -r "$BK_SYS/block/$_d/size" ] || continue
+        read -r _size < "$BK_SYS/block/$_d/size"
+        echo "$_d" > "$_lock/dev"; date +%s > "$_lock/since"
+        # -n standby,3: a sleeping disk answers with exit status 3 instead of
+        # being spun up. -q noserial: the serial number is never even printed.
+        # No -a / -x: they add logs nobody reads and cost seconds on a slow bus.
+        case "$_d" in nvme*) _args="-i -H -A -l error -l selftest" ;; *) _args="-n standby,3 -i -H -A -l error -l selftest -l devstat" ;; esac
+        _raw="$_lock/out"                                     # root-only tmpfs, no serial in it, removed at once
+        # shellcheck disable=SC2086
+        nice -n 19 smartctl --json=g -q noserial $_args "/dev/$_d" > "$_raw" 2>/dev/null &
+        _pid=$!; _w=0
+        while [ -d "/proc/$_pid" ] && [ "$_w" -lt "$SMART_TIMEOUT_SEC" ]; do sleep 1; _w=$((_w + 1)); done
+        if [ -d "/proc/$_pid" ]; then
+            # Watchdog: TERM, then KILL, and CHECK that it died. A smartctl in
+            # D state (a hung USB bridge) survives both signals.
+            kill "$_pid" 2>/dev/null; sleep 1
+            if [ -d "/proc/$_pid" ]; then kill -9 "$_pid" 2>/dev/null; sleep 1; fi
+            _rc=124
+            [ -d "/proc/$_pid" ] && _hung=$_pid
+        else wait "$_pid"; _rc=$?; fi
+        awk -v dev="$_d" -v size="$_size" -v rc="$_rc" -v now="$_now" -v prev_file="$SMART_CACHE" "$BK_SMART_AWK" "$_raw" >> "$_new"
+        rm -f "$_raw"
+        [ -n "$_hung" ] && break                             # never start another smartctl behind a hung one
+    done
+    awk -F'|' 'NR == FNR { seen[$2] = 1; print; next } !($2 in seen)' "$_new" "$SMART_CACHE" > "$_new.all" && mv "$_new.all" "$SMART_CACHE"
+    rm -f "$_new"
+    if [ -n "$_hung" ]; then
+        # The lock STAYS, now owned by the unkillable smartctl: what was read
+        # so far is merged above, no new probe can start (reclaiming the lock
+        # needs a dead PID), the disk becomes `stuck` and the collection issue
+        # shows up on the server - and the lock frees itself when the kernel
+        # finally lets the process go. Removing it here would hide the hang
+        # and start a fresh smartctl against the same dead bridge every hour.
+        echo "$_hung" > "$_lock/pid"; return 0
+    fi
+    rm -rf "$_lock"
+}
+
+if [ "$1" = "--smart-refresh" ]; then
+    shift
+    bk_smart_refresh "$@"
+    exit 0
+fi
+
 BK_LOCK_DIR="$BK_PRIVATE_DIR/run.lock"
 if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
     _lock_pid=$(cat "$BK_LOCK_DIR/pid" 2>/dev/null)
@@ -246,13 +539,37 @@ if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
     case "$_lock_pid" in ''|*[!0-9]*) _lock_pid="" ;; esac
     if [ -n "$_lock_pid" ] && [ -d "/proc/$_lock_pid" ]; then
         log_message "Predchozi beh (PID $_lock_pid) jeste bezi, tento koncim."
+        # G42: the minute that produced no report is remembered here, because
+        # the report that WOULD have said so is exactly the one not sent. One
+        # line per skip; the next accepted report carries the count and drops
+        # the lines it counted. Without it the server cannot tell a router
+        # that was switched off from an agent that cannot keep up.
+        printf 'l\n' >> "$BK_PRIVATE_DIR/skipped" 2>/dev/null || true
         exit 0
     fi
     rm -rf "$BK_LOCK_DIR" 2>/dev/null
     mkdir "$BK_LOCK_DIR" 2>/dev/null || exit 0
 fi
 echo "$$" > "$BK_LOCK_DIR/pid" 2>/dev/null
-trap 'rm -rf "$BK_LOCK_DIR"' EXIT
+
+# G42: the WHOLE previous run, its POST included. The payload is assembled
+# before the POST, so a run can never report its own total - and the POST is
+# what usually pushes a minute run past its minute, which is the thing worth
+# reporting. It is written by the EXIT trap below and read here.
+BK_RUN_TOTAL_FILE="$BK_PRIVATE_DIR/run.total"
+agent_prev_total_ms="null"
+if read -r _prev_total < "$BK_RUN_TOTAL_FILE" 2>/dev/null; then
+    case "$_prev_total" in ''|*[!0-9]*) ;; *) agent_prev_total_ms="$_prev_total" ;; esac
+fi
+
+bk_run_end() {
+    bk_uptime_cs
+    if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
+        printf '%s\n' "$(( (_up_cs - BK_RUN_START_CS) * 10 ))" > "$BK_RUN_TOTAL_FILE" 2>/dev/null || true
+    fi
+    rm -rf "$BK_LOCK_DIR"
+}
+trap bk_run_end EXIT
 
 # V rezimu --dry-run se klic nekontroluje: smysl toho rezimu je podivat se,
 # co agent na novem routeru nasbira, jeste nez ho nekdo zaregistruje.
@@ -280,27 +597,34 @@ log_debug "Ziskavam statistiky routeru (OpenWrt agent v$AGENT_VERSION)..."
 # CPU % pres dvouvzorkovy delta. Router bezi z cronu (ne kazdou sekundu jako
 # s "sleep 1"), takze tick/tock stavovy soubor srovnava se vzorkem z
 # predchoziho behu misto blokujiciho spani uvnitr skriptu.
+#
+# Only the SAMPLE is taken here; the arithmetic happens in section 4c, after
+# the WAN device is known. The aggregate, the per-core values and the WAN
+# byte rates then come out of ONE awk over ONE snapshot, so "cpu" and
+# "cpu_core_max_pct" can never describe two different intervals, and the
+# rates cost no second fork.
 cpu="null"
+cpu_cores="null"; cpu_core_max_pct="null"; cpu_core_max_index="null"; cpu_core_max_softirq_pct="null"
 now_ts=$(date +%s)
-stat_now=$(grep '^cpu ' /proc/stat)
-if [ -f "$CPU_STATE_FILE" ]; then
-    prev_stat=$(cut -d'|' -f2- "$CPU_STATE_FILE" 2>/dev/null)
-    if [ -n "$prev_stat" ]; then
-        cpu=$(awk -v s1="$prev_stat" -v s2="$stat_now" '
-        BEGIN {
-            split(s1, a1); split(s2, a2);
-            idle1 = a1[5] + a1[6]; total1 = a1[2]+a1[3]+a1[4]+a1[5]+a1[6]+a1[7]+a1[8];
-            idle2 = a2[5] + a2[6]; total2 = a2[2]+a2[3]+a2[4]+a2[5]+a2[6]+a2[7]+a2[8];
-            idle_delta = idle2 - idle1; total_delta = total2 - total1;
-            # Counters that did not move (same tick, overlapping runs) give
-            # no output - null upstream - not a 0.0 % nobody measured.
-            if (total_delta > 0) {
-                printf "%.1f", (1.0 - idle_delta / total_delta) * 100;
-            }
-        }')
-    fi
+BK_CORES_NOW="$BK_PRIVATE_DIR/cores.now"
+BK_CORES_PREV="$BK_PRIVATE_DIR/cores.prev"
+# One builtin loop instead of the `grep '^cpu '` fork: the aggregate line and
+# every core line, up to `intr` - everything below it is interrupts, context
+# switches and boot time, which this run never reads.
+stat_now=""
+while read -r _st_line; do
+    case "$_st_line" in
+        "cpu "*|cpu[0-9]*) stat_now="$stat_now$_st_line
+" ;;
+        intr*) break ;;
+    esac
+done < "$BK_PROC/stat" 2>/dev/null
+# The snapshot of the previous run becomes cores.prev, this one cores.now.
+# Both are plain text in the private directory, read back with `read` (X18).
+if [ -n "$stat_now" ]; then
+    [ -f "$BK_CORES_NOW" ] && mv "$BK_CORES_NOW" "$BK_CORES_PREV" 2>/dev/null
+    printf '%s' "$stat_now" > "$BK_CORES_NOW" 2>/dev/null || true
 fi
-echo "${now_ts}|${stat_now}" > "$CPU_STATE_FILE" 2>/dev/null || true
 
 # RAM % and MB breakdown - MemAvailable stejne jako moderni "free" (used = total - available),
 # se zalohou na free+buffers+cached na starsich jadrech bez MemAvailable.
@@ -407,12 +731,36 @@ if [ -f /proc/diskstats ]; then
 fi
 
 # --- 3. Identita routeru (kešovaná v RAM pro eliminaci ubus volání a log spamu) ---
-ID_CACHE_FILE="/tmp/status-agent-openwrt-identity.cache"
+# The cache is DATA: one value per line, read back with `read`. It used to be
+# shell assignments in world-writable /tmp that the agent eval'ed as root, so
+# any local user could run a command as root within a minute. Now it lives in
+# the private directory, and a file that does not look like ours (no digits
+# on the first line, no end marker on the last) is simply fetched again.
+# 24 h, not forever: a renamed router or a sysupgrade kept the old identity
+# until the next reboot.
+ID_CACHE_FILE="$BK_PRIVATE_DIR/identity.cache"
+ID_CACHE_TTL_SEC=86400
 ow_hostname=""; ow_kernel=""; ow_model=""; ow_board_name=""; ow_distribution=""; ow_os_version=""; os_combined=""
 
+id_cache_ts=""; id_cache_end=""
 if [ -f "$ID_CACHE_FILE" ]; then
-    eval $(cat "$ID_CACHE_FILE" 2>/dev/null)
+    {
+        IFS= read -r id_cache_ts
+        IFS= read -r ow_hostname
+        IFS= read -r ow_kernel
+        IFS= read -r ow_model
+        IFS= read -r ow_board_name
+        IFS= read -r ow_distribution
+        IFS= read -r ow_os_version
+        IFS= read -r id_cache_end
+    } < "$ID_CACHE_FILE" 2>/dev/null
+fi
+case "$id_cache_ts" in ''|*[!0-9]*) id_cache_ts=0 ;; esac
+id_cache_age=$((now_ts - id_cache_ts))
+if [ "$id_cache_end" = "end" ] && [ "$id_cache_age" -ge 0 ] && [ "$id_cache_age" -lt "$ID_CACHE_TTL_SEC" ]; then
+    os_combined="$ow_distribution $ow_os_version"
 else
+    ow_hostname=""; ow_kernel=""; ow_model=""; ow_board_name=""; ow_distribution=""; ow_os_version=""
     board_json=$(ubus call system board 2>/dev/null)
     if [ -n "$board_json" ]; then
         json_load "$board_json"
@@ -426,9 +774,16 @@ else
         json_select ..
     fi
     os_combined="$ow_distribution $ow_os_version"
-    printf "ow_hostname='%s'\now_kernel='%s'\now_model='%s'\now_board_name='%s'\now_distribution='%s'\now_os_version='%s'\nos_combined='%s'\n" \
-        "$ow_hostname" "$ow_kernel" "$ow_model" "$ow_board_name" "$ow_distribution" "$ow_os_version" "$os_combined" > "$ID_CACHE_FILE" 2>/dev/null || true
-    log_message "Načtena identita routeru: hostname=$ow_hostname model=$ow_model os=$os_combined kernel=$ow_kernel"
+    # Written through a temporary name: a run killed half way must not leave
+    # a file whose lines have shifted by one. A value never holds a newline
+    # here (jshn hands out one line), and if it did, the end marker would be
+    # on the wrong line and the file would be thrown away on the next read.
+    # An answer ubus did not give is not kept for a day: the next run asks again.
+    if [ -n "$board_json" ]; then
+        printf '%s\n' "$now_ts" "$ow_hostname" "$ow_kernel" "$ow_model" "$ow_board_name" "$ow_distribution" "$ow_os_version" "end" \
+            > "$ID_CACHE_FILE.tmp" 2>/dev/null && mv "$ID_CACHE_FILE.tmp" "$ID_CACHE_FILE" 2>/dev/null
+        log_message "Načtena identita routeru: hostname=$ow_hostname model=$ow_model os=$os_combined kernel=$ow_kernel"
+    fi
 fi
 log_debug "Identita: hostname=$ow_hostname model=$ow_model board=$ow_board_name os=$os_combined kernel=$ow_kernel"
 # O btrfs se zminujeme jen tam, kde btrfs je.
@@ -446,7 +801,7 @@ fi
 # wan_up starts EMPTY, not false: a box with no netifd interface called "wan"
 # (access point, uplink on wwan or wan_pppoe) measured nothing, and "false"
 # would make the server raise a wan_lost alert on it forever.
-wan_up=""; wan_proto=""; wan_uptime="null"; wan_ipv4=""; wan_gateway=""; wan_dns=""; wan_l3_device=""
+wan_up=""; wan_proto=""; wan_uptime="null"; wan_ipv4=""; wan_gateway=""; wan_dns=""; wan_l3_device=""; wan_device=""
 # One `network.interface dump` for everything below (WAN, wan6, LAN, LTE):
 # it carries the same fields as the per-interface status calls, of which the
 # agent used to make up to eight a run.
@@ -515,10 +870,14 @@ if bk_iface_load wan; then
     json_get_var wan_proto proto
     json_get_var wan_uptime uptime
     json_get_var wan_l3_device l3_device
+    # The netifd "device" is where the port walk of section 4c starts: on
+    # PPPoE it is the VLAN netdev (eth2.848), whose speed the kernel really
+    # answers, while l3_device is the ppp netdev with no link settings.
+    json_get_var wan_device device
     # netifd reports l3_device only while the interface is up. Without this
     # fallback the primary link loses its device name for as long as the WAN
     # is down - exactly when someone is looking at which link carried what.
-    [ -z "$wan_l3_device" ] && json_get_var wan_l3_device device
+    [ -z "$wan_l3_device" ] && wan_l3_device="$wan_device"
 
     # Prvni IPv4 adresa (pole "ipv4-address")
     json_get_keys ipv4_keys "ipv4-address"
@@ -656,7 +1015,247 @@ if [ -n "$dump_json" ]; then
     done
     json_select ..
 fi
-log_debug "WAN: up=$wan_up proto=$wan_proto ipv4=$wan_ipv4 gateway=$wan_gateway dns=$wan_dns ipv6=$wan_ipv6 net=${net}KB/s (l3_device=$wan_l3_device)"
+# --- 4c. WAN port walk (WAN 3.1.1) - link rate and physical port, 0 forks ---
+# Two questions, one walk. A VLAN, bridge or macvlan netdev answers `speed` by
+# passing the question through to its real device, so "the first readable
+# speed" names eth2.848, not the port underneath it. Hence:
+#   (a) the LINK RATE is the first readable positive speed of the chain,
+#   (b) the PHYSICAL PORT is the first netdev of the chain with a `device`
+#       symlink - virtual netdevs (vlan, bridge, ppp) live under
+#       /sys/devices/virtual/net and have none.
+# Only that port's counters are a measurement: a VLAN's rx_dropped and
+# tx_errors are structurally 0 (vlan_dev_get_stats64 fills its own rx_errors
+# and tx_dropped only), and a zero nobody measured is not data.
+#
+# Reads one sysfs number into $_wv, no fork; empty when the file cannot be
+# read or does not hold a plain number.
+bk_netnum() {
+    _wv=""
+    [ -r "$1" ] && read -r _wv < "$1" 2>/dev/null
+    case "$_wv" in ''|*[!0-9]*) _wv="" ;; esac
+}
+wan_link_dev=""; wan_link_mbit="null"; wan_carrier_down_count="null"
+# Every netdev the walk passed through, for the SQM match of the path cache:
+# a queue on ANY device of the chain shapes this WAN.
+bk_wan_chain=""
+_w_cands="$wan_device $wan_l3_device"
+case "$wan_proto" in
+    # A modem's usbnet "speed" is a USB descriptor, not a line rate.
+    qmi|mbim|ncm|modemmanager|3g) _w_cands="" ;;
+esac
+_w_rate_done=""
+for _w_start in $_w_cands; do
+    case " $bk_wan_chain " in *" $_w_start "*) continue ;; esac
+    _wd="$_w_start"; _w_depth=0
+    while [ -n "$_wd" ] && [ -d "$BK_SYS/class/net/$_wd" ]; do
+        case " $bk_wan_chain " in *" $_wd "*) break ;; esac
+        bk_wan_chain="$bk_wan_chain $_wd"
+        [ -z "$wan_link_dev" ] && [ -e "$BK_SYS/class/net/$_wd/device" ] && wan_link_dev="$_wd"
+        if [ -z "$_w_rate_done" ]; then
+            # `read` fails with EINVAL on a netdev without link settings (ppp
+            # has no get_link_ksettings): only THEN does the rate question move
+            # one level down. A -1 or a 0 IS an answer - link down or unknown -
+            # and ends it, or a dead DSA port would inherit the fixed 1000 of
+            # its conduit.
+            _w_speed=""
+            if read -r _w_speed < "$BK_SYS/class/net/$_wd/speed" 2>/dev/null; then
+                _w_rate_done=1
+                case "$_w_speed" in
+                    ''|0|*[!0-9]*) : ;;
+                    *) wan_link_mbit="$_w_speed" ;;
+                esac
+            fi
+        fi
+        [ -n "$wan_link_dev" ] && [ -n "$_w_rate_done" ] && break
+        [ "$_w_depth" -ge 4 ] && break
+        _w_depth=$((_w_depth + 1))
+        # Exactly one lower device, or the chain ends here: a bridge with two
+        # ports has no single physical port to charge the counters to.
+        _w_next=""; _w_lowers=0
+        for _w_l in "$BK_SYS/class/net/$_wd"/lower_*; do
+            [ -e "$_w_l" ] || continue
+            _w_lowers=$((_w_lowers + 1)); _w_next="${_w_l##*/lower_}"
+        done
+        [ "$_w_lowers" -eq 1 ] || break
+        _wd="$_w_next"
+    done
+    [ -n "$wan_link_dev" ] && [ -n "$_w_rate_done" ] && break
+done
+
+# --- 4c2. Counters of the physical port (WAN 3.1.3), cumulative ---
+# rx_crc_errors, rx_missed_errors and rx_fifo_errors are never sent: on mvneta
+# they are always 0 (mvneta_get_stats64 fills packets, bytes, rx_dropped,
+# rx_errors and tx_dropped only).
+wan_rx_errors="null"; wan_tx_errors="null"; wan_rx_dropped="null"; wan_tx_dropped="null"
+if [ -n "$wan_link_dev" ]; then
+    _w_st="$BK_SYS/class/net/$wan_link_dev/statistics"
+    bk_netnum "$_w_st/rx_errors"; [ -n "$_wv" ] && wan_rx_errors="$_wv"
+    bk_netnum "$_w_st/tx_errors"; [ -n "$_wv" ] && wan_tx_errors="$_wv"
+    bk_netnum "$_w_st/rx_dropped"; [ -n "$_wv" ] && wan_rx_dropped="$_wv"
+    bk_netnum "$_w_st/tx_dropped"; [ -n "$_wv" ] && wan_tx_dropped="$_wv"
+    bk_netnum "$BK_SYS/class/net/$wan_link_dev/carrier_down_count"
+    [ -n "$_wv" ] && wan_carrier_down_count="$_wv"
+fi
+
+# --- 4d. Per-core CPU and WAN byte rates (WAN 3.1.2, 3.1.3) - one awk ---
+# The snapshot of $BK_PROC/stat was taken at the top of the run; cores.prev
+# holds the one of the previous run. The aggregate keeps the formula of
+# 0.1.6 and is computed HERE, from the same snapshot as the per-core values,
+# so the two can never describe different intervals.
+#
+# The rate rides in the same awk (no second fork) and is measured on the l3
+# device, which is the one that carries the WAN traffic - on PPPoE that is
+# the ppp netdev, not the port. Elapsed time comes from the uptime in
+# centiseconds, never from the clock: a router whose NTP jumps would
+# otherwise report a made-up rate.
+BK_WAN_RATE_STATE="$BK_PRIVATE_DIR/wan-rate.state"
+_wr_prev_cs=""; _wr_prev_dev=""; _wr_prev_rx=""; _wr_prev_tx=""
+[ -r "$BK_WAN_RATE_STATE" ] && IFS='|' read -r _wr_prev_cs _wr_prev_dev _wr_prev_rx _wr_prev_tx < "$BK_WAN_RATE_STATE"
+_wr_cs=""
+if read -r _wr_up _wr_idle < "$BK_PROC/uptime" 2>/dev/null; then
+    # "1000.00" -> 100000 centiseconds, with the builtins only. The kernel
+    # always prints two decimals; anything else is not this file.
+    case "$_wr_up" in
+        *.[0-9][0-9]) _wr_cs="${_wr_up%.*}${_wr_up#*.}" ;;
+    esac
+fi
+_wr_rx=""; _wr_tx=""
+if [ -n "$wan_l3_device" ]; then
+    bk_netnum "$BK_SYS/class/net/$wan_l3_device/statistics/rx_bytes"; _wr_rx="$_wv"
+    bk_netnum "$BK_SYS/class/net/$wan_l3_device/statistics/tx_bytes"; _wr_tx="$_wv"
+fi
+_cores_prev_file="$BK_CORES_PREV"
+[ -f "$_cores_prev_file" ] || _cores_prev_file=/dev/null
+_bk_min=$(awk -v now="$stat_now" \
+    -v rdev="$wan_l3_device" -v ncs="$_wr_cs" -v nrx="$_wr_rx" -v ntx="$_wr_tx" \
+    -v pdev="$_wr_prev_dev" -v pcs="$_wr_prev_cs" -v prx="$_wr_prev_rx" -v ptx="$_wr_prev_tx" '
+$1 ~ /^cpu/ { prev[$1] = $0 }
+END {
+    nl = split(now, L, "\n")
+    for (i = 1; i <= nl; i++) {
+        if (L[i] == "") continue
+        split(L[i], f)
+        cur[f[1]] = L[i]
+    }
+    agg = ""
+    if (("cpu" in prev) && ("cpu" in cur)) {
+        split(prev["cpu"], a1); split(cur["cpu"], a2)
+        i1 = a1[5] + a1[6]; t1 = a1[2]+a1[3]+a1[4]+a1[5]+a1[6]+a1[7]+a1[8]
+        i2 = a2[5] + a2[6]; t2 = a2[2]+a2[3]+a2[4]+a2[5]+a2[6]+a2[7]+a2[8]
+        # Counters that did not move (same tick, overlapping runs) give no
+        # output - null upstream - not a 0.0 % nobody measured.
+        if (t2 - t1 + 0 > 0) agg = sprintf("%.1f", (1.0 - (i2 - i1) / (t2 - t1)) * 100)
+    }
+    cores = 0; maxi = -1
+    for (k in cur) {
+        if (k == "cpu") continue
+        cores++
+        if (substr(k, 4) + 0 > maxi + 0) maxi = substr(k, 4) + 0
+    }
+    # By index, not by hash order: two cores with the same load must always
+    # give the same answer, and that is the lower index.
+    back = 0; moved = 0; best = -1; bidx = ""; bsq = ""
+    for (n = 0; n + 0 <= maxi + 0; n++) {
+        k = "cpu" n
+        if (!(k in cur)) continue
+        if (!(k in prev)) { back = 1; continue }
+        split(prev[k], p); split(cur[k], c)
+        tot = 0
+        # user, nice, system, idle, iowait, irq, softirq, steal
+        for (j = 2; j <= 9; j++) {
+            dv[j] = c[j] - p[j]
+            if (dv[j] + 0 < 0) back = 1
+            tot += dv[j]
+        }
+        if (tot + 0 <= 0) continue
+        moved = 1
+        busy = 1 - (dv[5] + dv[6]) / tot
+        if (busy + 0 > best + 0) {
+            best = busy; bidx = n + 0
+            # Threaded NAPI and the mt76 workers are charged to system, not to
+            # softirq, so irq and softirq together are what "the packet path
+            # is eating this core" looks like.
+            bsq = (dv[7] + dv[8]) / tot
+        }
+    }
+    ncores = ""; mx = ""; mi = ""; sq = ""
+    # A counter that went backwards (a reboot, a core that came back online)
+    # makes the whole reading a guess, and so does a snapshot in which not a
+    # single core moved.
+    if (back + 0 == 0 && moved + 0 == 1 && cores + 0 > 0) {
+        ncores = cores + 0; mx = sprintf("%.1f", best * 100)
+        mi = bidx; sq = sprintf("%.1f", bsq * 100)
+    }
+    rx = ""; tx = ""
+    if (rdev != "" && rdev == pdev && pcs != "" && prx != "" && ptx != "" && nrx != "" && ntx != "" && ncs != "") {
+        dt = (ncs - pcs) / 100
+        drx = nrx - prx; dtx = ntx - ptx
+        # A negative delta is a counter reset, not traffic that flowed backwards.
+        if (dt + 0 > 0 && drx + 0 >= 0 && dtx + 0 >= 0) {
+            rx = sprintf("%.1f", drx * 8 / dt / 1000000)
+            tx = sprintf("%.1f", dtx * 8 / dt / 1000000)
+        }
+    }
+    printf "%s|%s|%s|%s|%s|%s|%s", agg, ncores, mx, mi, sq, rx, tx
+}' "$_cores_prev_file" 2>/dev/null)
+wan_rx_mbps="null"; wan_tx_mbps="null"
+if [ -n "$_bk_min" ]; then
+    cpu=${_bk_min%%|*}; _bk_r=${_bk_min#*|}
+    cpu_cores=${_bk_r%%|*}; _bk_r=${_bk_r#*|}
+    cpu_core_max_pct=${_bk_r%%|*}; _bk_r=${_bk_r#*|}
+    cpu_core_max_index=${_bk_r%%|*}; _bk_r=${_bk_r#*|}
+    cpu_core_max_softirq_pct=${_bk_r%%|*}; _bk_r=${_bk_r#*|}
+    wan_rx_mbps=${_bk_r%%|*}; wan_tx_mbps=${_bk_r#*|}
+    # An empty field is "not measured", never a zero somebody could chart.
+    [ -z "$cpu" ] && cpu="null"
+    [ -z "$cpu_cores" ] && cpu_cores="null"
+    [ -z "$cpu_core_max_pct" ] && cpu_core_max_pct="null"
+    [ -z "$cpu_core_max_index" ] && cpu_core_max_index="null"
+    [ -z "$cpu_core_max_softirq_pct" ] && cpu_core_max_softirq_pct="null"
+    [ -z "$wan_rx_mbps" ] && wan_rx_mbps="null"
+    [ -z "$wan_tx_mbps" ] && wan_tx_mbps="null"
+fi
+# The device belongs in the state: after a failover (pppoe-wan -> wwan0) a
+# delta between two different counters charged a whole session to one minute.
+if [ -n "$wan_l3_device" ] && [ -n "$_wr_rx" ] && [ -n "$_wr_tx" ] && [ -n "$_wr_cs" ]; then
+    printf '%s|%s|%s|%s\n' "$_wr_cs" "$wan_l3_device" "$_wr_rx" "$_wr_tx" > "$BK_WAN_RATE_STATE" 2>/dev/null || true
+fi
+
+# --- 4e. conntrack event counters (WAN 3.1.4), cumulative ---
+# Columns 10-12 of /proc/net/stat/nf_conntrack, one line per CPU, hexadecimal
+# without a 0x prefix; the header line is skipped because its column 10 is not
+# hex. busybox awk cannot read hex at all, so the sum is done in the shell
+# with $((0x..)).
+#
+# The three are NOT one number: insert_failed grows on confirm races, dying
+# entries and long hash chains, early_drop counts entries evicted to make
+# room (nothing was refused), and only drop with a full table is a connection
+# the router turned away. The server keeps them apart.
+conntrack_insert_failed="null"; conntrack_drop="null"; conntrack_early_drop="null"
+_ct_a=0; _ct_b=0; _ct_c=0; _ct_seen=""; _ct_cols=""
+while read -r _ct1 _ct2 _ct3 _ct4 _ct5 _ct6 _ct7 _ct8 _ct9 _ct10 _ct11 _ct12 _ct_rest; do
+    # The first line names the columns, and it is READ, not skipped: kernels
+    # print a different number of counters here (3.x had `searched` and
+    # `delete_list`, 6.x has `clashres` and `chainlength`), so a file whose
+    # 10th to 12th column mean something else would give three numbers nobody
+    # measured. Without the three names nothing is summed at all.
+    if [ -z "$_ct_cols" ]; then
+        [ "$_ct10" = "insert_failed" ] && [ "$_ct11" = "drop" ] && [ "$_ct12" = "early_drop" ] && _ct_cols=1
+        continue
+    fi
+    # Each column on its own: a short line would leave one empty, and "0x"
+    # alone is an arithmetic error that ends the whole run.
+    case "$_ct10" in ''|*[!0-9a-fA-F]*) continue ;; esac
+    case "$_ct11" in ''|*[!0-9a-fA-F]*) continue ;; esac
+    case "$_ct12" in ''|*[!0-9a-fA-F]*) continue ;; esac
+    _ct_a=$((_ct_a + 0x$_ct10)); _ct_b=$((_ct_b + 0x$_ct11)); _ct_c=$((_ct_c + 0x$_ct12))
+    _ct_seen=1
+done < "$BK_PROC/net/stat/nf_conntrack" 2>/dev/null
+if [ -n "$_ct_seen" ]; then
+    conntrack_insert_failed="$_ct_a"; conntrack_drop="$_ct_b"; conntrack_early_drop="$_ct_c"
+fi
+
+log_debug "WAN: up=$wan_up proto=$wan_proto ipv4=$wan_ipv4 gateway=$wan_gateway dns=$wan_dns ipv6=$wan_ipv6 net=${net}KB/s (l3_device=$wan_l3_device port=${wan_link_dev:-none} link=${wan_link_mbit}Mbit rx=${wan_rx_mbps}Mbps)"
 
 # --- 5. Sestaveni JSON payloadu ---
 # jshn muze vracet bool jako "1"/"0" nebo "true"/"false" v zavislosti na
@@ -853,7 +1452,8 @@ _ipt_target_packets() {
 # - hundreds of lines each on fw4) and reused for the three sums and the
 # enabled check below.
 bk_nft_rules=""
-command -v nft >/dev/null 2>&1 && bk_nft_rules=$(nft list ruleset 2>/dev/null)
+bk_have_nft=0
+command -v nft >/dev/null 2>&1 && { bk_have_nft=1; bk_nft_rules=$(nft list ruleset 2>/dev/null); }
 if [ -n "$bk_nft_rules" ]; then
     fw_accepted=$(_nft_verdict_packets accept)
     fw_dropped=$(_nft_verdict_packets drop)
@@ -868,18 +1468,28 @@ fi
 #
 # Tenhle udaj agent nikdy neposilal, takze dlazdice "Firewall & NAT" v aplikaci
 # hlasila "Neznamy stav" porad - i na routeru, ktery prave zahodil tri tisice
-# paketu. Poradi zjistovani jde od nejsilnejsiho dukazu k nejslabsimu a kdyz
-# nevyjde ani jeden, zustava null: "nevime" je jina informace nez "vypnuty".
+# paketu.
+#
+# G20: the question is whether the router's OWN rules are in the kernel, and
+# fw4 answers it exactly - it loads one table, `inet fw4`, and loads it whole.
+# The three weaker signals this used to accept all say something else:
+#  - "any non-empty ruleset" is true on a router whose firewall never came up
+#    but which runs mwan3, docker or a wireguard table;
+#  - `/etc/init.d/firewall enabled` says the service MAY start, not that it
+#    did - a fw4 syntax error leaves it enabled and the network wide open;
+#  - a legacy `iptables -S` always prints the policy lines, so "output starts
+#    with a dash" was true wherever the applet existed at all.
+# No nft and no iptables is still null: "we do not know" is not "off", and the
+# server raises nothing on a null.
 firewall_enabled="null"
-if [ -n "$bk_nft_rules" ]; then
-    # A loaded ruleset is proof the rules are in the kernel.
-    firewall_enabled="true"
-elif command -v iptables >/dev/null 2>&1 && iptables -S 2>/dev/null | grep -q '^-'; then
-    firewall_enabled="true"
-elif [ -x /etc/init.d/firewall ]; then
-    # Slabsi dukaz: sluzba je povolena k autostartu. Rika to, ze ma bezet,
-    # ne ze bezi - proto az jako posledni.
-    if /etc/init.d/firewall enabled 2>/dev/null; then
+if [ "$bk_have_nft" = 1 ]; then
+    case "$bk_nft_rules" in
+        *"table inet fw4"*) firewall_enabled="true" ;;
+        *) firewall_enabled="false" ;;
+    esac
+elif command -v iptables >/dev/null 2>&1; then
+    # Legacy-only router: a real rule (`-A <chain> ...`), not a policy line.
+    if iptables -S 2>/dev/null | grep -q '^-A'; then
         firewall_enabled="true"
     else
         firewall_enabled="false"
@@ -937,84 +1547,155 @@ fi
 
 # --- Vysledky mereni rychlosti (librespeed-cli) ---
 #
-# Router si vysledky odklada do /tmp/librespeed-data/<rok-mesic>/<cas>.json.
-# /tmp je na OpenWrt ramdisk, takze po restartu je historie pryc - proto se
-# posilaji na server, kde prezijou.
+# Router si vysledky odklada do <data_dir>/<rok-mesic>/<cas>.json. /tmp je na
+# OpenWrt ramdisk, takze po restartu je historie pryc - proto se posilaji na
+# server, kde prezijou.
 #
-# Posila se jen to, co je novejsi nez posledni odeslany zaznam (stav v
-# LIBRESPEED_STATE_FILE). Pri prvnim behu odejde cela dostupna historie,
-# server si poradi s duplicitami sam (unikatni klic na cas mereni).
+# Kam presne, rika uci: reForis i cron wrapper ctou librespeed.client.data_dir
+# (files/librespeed.sh:14-17), takze router s jinym nastavenim se cetl uplne
+# spatne. Bez toho klice plati puvodni /tmp/librespeed-data.
 #
-# Nazvy poli se u ruznych verzi librespeed lisi, proto se hleda vic variant.
-# Rychlost muze byt v Mbit/s i v bajtech za sekundu - rozlisuje se podle
-# radove velikosti, protoze 100 000 000 neni 100 Mbit/s zapsanych jinak,
-# ale bajty.
-LIBRESPEED_DIR="/tmp/librespeed-data"
-LIBRESPEED_STATE_FILE="/tmp/status-agent-librespeed.state"
+# Posila se jen to, co je novejsi nez posledni POTVRZENY zaznam. Stav se
+# 0.1.7 nezij v /tmp, ale v soukromem adresari; stary soubor se pri zmene
+# verze maze (viz uklid nahore), takze prvni behy nabidnou celou historii
+# znovu a server si opravi rady, ktere 0.1.6 ulozil s prepoctem na bajty.
+#
+# Rychlosti jsou Mbit/s, tecka. Puvodni heuristika "vic nez 1000 jsou bajty"
+# delila gigabitove vysledky osmi miliony a delala z 1850 Mbit/s 0,0148.
+LIBRESPEED_DIR=""
+if [ -f /etc/config/librespeed ]; then
+    LIBRESPEED_DIR=$(uci -q get librespeed.client.data_dir 2>/dev/null)
+fi
+[ -z "$LIBRESPEED_DIR" ] && LIBRESPEED_DIR="/tmp/librespeed-data"
+LIBRESPEED_STATE_FILE="$BK_PRIVATE_DIR/librespeed.state"
+BK_SPEED_PENDING="$BK_PRIVATE_DIR/pending.state"
+BK_NL='
+'
 speedtests_json="[]"
+speedtests_newest=""
+# An INTERVAL flag: the report covers the last ~60 s, so a test that ended
+# half a minute ago still owns this report's CPU numbers. The file-name
+# format of the result files is not confirmed on hardware (data_dir was empty
+# when the router was read), so "new in this listing" alone sets it, which
+# errs towards skipping one alert evaluation rather than raising a false one.
+speedtest_active="false"
 if [ -d "$LIBRESPEED_DIR" ]; then
     last_sent=""
-    [ -f "$LIBRESPEED_STATE_FILE" ] && last_sent=$(head -n 1 "$LIBRESPEED_STATE_FILE" 2>/dev/null)
+    [ -f "$LIBRESPEED_STATE_FILE" ] && IFS= read -r last_sent < "$LIBRESPEED_STATE_FILE" 2>/dev/null
 
-    # Nejnovejsi soubory posledni - razeni podle nazvu funguje, protoze
-    # jmeno je ISO cas.
-    speed_files=$(find "$LIBRESPEED_DIR" -type f -name '*.json' 2>/dev/null | sort | tail -n 60)
-
-    if [ -n "$speed_files" ]; then
-        speedtests_json=$(
-            printf '%s\n' "$speed_files" | while IFS= read -r f; do
-                [ -f "$f" ] || continue
-                # Cas mereni je v nazvu souboru (ISO 8601). printf zaruci, ze
-                # kazdy zaznam skonci vlastnim radkem - jinak se obsahy
-                # souboru slijou do jednoho a JSON se rozpadne.
-                printf '%s|%s\n' "$(basename "$f" .json)" "$(tr -d '\n\r' < "$f")"
-            done | awk -F'|' -v last_sent="$last_sent" '
-                function num(s,   v) { v = s + 0; return v }
-                function pick(json, keys,   i, n, arr, re, m) {
-                    n = split(keys, arr, ",");
-                    for (i = 1; i <= n; i++) {
-                        re = "\"" arr[i] "\"[[:space:]]*:[[:space:]]*-?[0-9.]+";
-                        if (match(json, re)) {
-                            m = substr(json, RSTART, RLENGTH);
-                            sub(/.*:[[:space:]]*/, "", m);
-                            return m;
-                        }
-                    }
-                    return "";
+    # ONE awk decides which files are opened at all. 0.1.6 ran basename + tr
+    # per file per run (two forks each, on the whole directory) only to throw
+    # the result away a moment later. The name IS the measurement time, so a
+    # string comparison on the path answers it without opening anything.
+    #
+    # At most 50 per report and OLDEST first: a router that was offline for a
+    # week catches up report by report instead of sending a 500-item payload
+    # that the 64-key / 8 KB pass-through would shed.
+    speed_sel=$(find "$LIBRESPEED_DIR" -type f -name '*.json' 2>/dev/null | sort | awk -v last_sent="$last_sent" '
+        {
+            n = split($0, p, "/"); base = p[n]; sub(/\.json$/, "", base);
+            if (base == "") next;
+            # A path with a space cannot be handed to awk as an argument list
+            # below; such a name is not ours and is left alone.
+            if (index($0, " ") > 0) next;
+            # The name is an ISO time, which sorts the same way as a clock.
+            if (last_sent != "" && base <= last_sent) next;
+            c++; path[c] = $0;
+        }
+        END {
+            print (c ? 1 : 0);
+            for (i = 1; i <= c && i <= 50; i++) print path[i];
+        }')
+    speed_files=""
+    case "$speed_sel" in
+        1*) speedtest_active="true" ;;
+    esac
+    case "$speed_sel" in
+        *"$BK_NL"*) speed_files=${speed_sel#*"$BK_NL"} ;;
+    esac
+fi
+if [ -n "$speed_files" ]; then
+    # The selected files are read by awk itself - one fork for the whole
+    # batch instead of a `tr` per file. Line 1 of the output is the newest
+    # timestamp that really went into the array (a file without a speed is
+    # not an item), the rest is the array.
+    #
+    # link_mbit comes from THIS run's state: what the port was linked at when
+    # the result was picked up. Nothing else is invented for a result the
+    # router started - iface is unknown, and the tool is only named when the
+    # file itself proves it.
+    # shellcheck disable=SC2086
+    _sp_out=$(awk -v link_mbit="$wan_link_mbit" '
+        function pick(json, keys,   i, n, arr, re, m) {
+            n = split(keys, arr, ",");
+            for (i = 1; i <= n; i++) {
+                re = "\"" arr[i] "\"[[:space:]]*:[[:space:]]*-?[0-9.]+";
+                if (match(json, re)) {
+                    m = substr(json, RSTART, RLENGTH);
+                    sub(/.*:[[:space:]]*/, "", m);
+                    return m;
                 }
-                {
-                    ts = $1;
-                    # Zbytek radku je JSON; mohl obsahovat "|", proto se
-                    # neskláda z $2, ale ze zbytku puvodniho radku.
-                    body = substr($0, length(ts) + 2);
-
-                    # Retezcove porovnani staci: nazev je ISO cas, ktery se
-                    # radi stejne jako chronologicky.
-                    if (last_sent != "" && ts <= last_sent) next;
-
-                    dl = pick(body, "download,download_mbps,dl,downloadMbps");
-                    ul = pick(body, "upload,upload_mbps,ul,uploadMbps");
-                    pg = pick(body, "ping,ping_ms,latency");
-                    ji = pick(body, "jitter,jitter_ms");
-                    if (dl == "" && ul == "") next;
-
-                    # Bajty za sekundu prevest na Mbit/s. Linka nad 1 Gbit/s
-                    # by dala pres 1000, takze prah 1000 rozlisi jednotky.
-                    if (dl != "" && num(dl) > 1000) dl = sprintf("%.2f", num(dl) * 8 / 1000000);
-                    if (ul != "" && num(ul) > 1000) ul = sprintf("%.2f", num(ul) * 8 / 1000000);
-
-                    printf "%s{\"timestamp\":\"%s\",\"download_mbps\":%s,\"upload_mbps\":%s,\"ping_ms\":%s,\"jitter_ms\":%s}",
-                           (c++ ? "," : "["), ts,
-                           (dl == "" ? "null" : dl), (ul == "" ? "null" : ul),
-                           (pg == "" ? "null" : pg), (ji == "" ? "null" : ji);
-                }
-                END { printf "%s", (c ? "]" : "[]") }'
-        )
-        newest=$(printf '%s\n' "$speed_files" | tail -n 1)
-        [ -n "$newest" ] && basename "$newest" .json > "$LIBRESPEED_STATE_FILE" 2>/dev/null
-    fi
+            }
+            return "";
+        }
+        # Only the server block is searched. The client block holds the
+        # public address and the ISP name, and neither may ever leave the
+        # router; server.url carries query strings and is not wanted either.
+        function server_name(json,   part, m) {
+            if (!match(json, /"server"[[:space:]]*:[[:space:]]*\{[^}]*\}/)) return "";
+            part = substr(json, RSTART, RLENGTH);
+            if (!match(part, /"name"[[:space:]]*:[[:space:]]*"[^"]*"/)) return "";
+            m = substr(part, RSTART, RLENGTH);
+            sub(/.*:[[:space:]]*"/, "", m); sub(/"$/, "", m);
+            # A name with an escape would have been cut in the middle by the
+            # match above; send nothing rather than broken JSON.
+            if (index(m, "\\") > 0) return "";
+            return m;
+        }
+        function emit(   ts, n, p, dl, ul, pg, ji, br, bs, sv, tl) {
+            if (fname == "") return;
+            n = split(fname, p, "/"); ts = p[n]; sub(/\.json$/, "", ts);
+            dl = pick(body, "download,download_mbps,dl,downloadMbps");
+            ul = pick(body, "upload,upload_mbps,ul,uploadMbps");
+            pg = pick(body, "ping,ping_ms,latency");
+            ji = pick(body, "jitter,jitter_ms");
+            if (dl == "" && ul == "") return;
+            br = pick(body, "bytes_received");
+            bs = pick(body, "bytes_sent");
+            sv = server_name(body);
+            # The result file names no tool and no version. Only the Rust
+            # port writes a "tls" block (the Go client has none), so that is
+            # evidence; without it the tool stays null instead of a guess.
+            tl = (match(body, /"tls"[[:space:]]*:[[:space:]]*\{/) ? "\"rust\"" : "null");
+            out = out sprintf("%s{\"timestamp\":\"%s\",\"download_mbps\":%s,\"upload_mbps\":%s,\"ping_ms\":%s,\"jitter_ms\":%s,\"server\":%s,\"bytes_received\":%s,\"bytes_sent\":%s,\"started_by\":\"turris\",\"iface\":null,\"tool\":%s,\"link_mbit\":%s,\"diagnostics\":{\"v\":1,\"cpu_measured\":false}}",
+                (c++ ? "," : "["), ts,
+                (dl == "" ? "null" : dl), (ul == "" ? "null" : ul),
+                (pg == "" ? "null" : pg), (ji == "" ? "null" : ji),
+                (sv == "" ? "null" : "\"" sv "\""),
+                (br == "" ? "null" : br), (bs == "" ? "null" : bs),
+                tl, (link_mbit == "" ? "null" : link_mbit));
+            newest = ts;
+        }
+        FNR == 1 { emit(); body = ""; fname = FILENAME }
+        { body = body $0 }
+        END { emit(); print newest; printf "%s", (c ? out "]" : "[]") }' $speed_files)
+    speedtests_newest=${_sp_out%%"$BK_NL"*}
+    case "$_sp_out" in
+        *"$BK_NL"*) speedtests_json=${_sp_out#*"$BK_NL"} ;;
+    esac
 fi
 [ -z "$speedtests_json" ] && speedtests_json="[]"
+# A test running right now writes no file yet, so the listing above cannot
+# see it. One fork, and only when the listing did not answer already.
+if [ "$speedtest_active" = "false" ] && command -v pidof >/dev/null 2>&1; then
+    pidof librespeed-cli >/dev/null 2>&1 && speedtest_active="true"
+fi
+# Written BEFORE the POST: until the server says what it stored, the results
+# are still the router's. 0.1.6 advanced the state right here and lost every
+# result of a report that never arrived.
+if [ -n "$speedtests_newest" ]; then
+    printf '%s\n' "$speedtests_newest" > "$BK_SPEED_PENDING" 2>/dev/null || true
+fi
 
 # --- Vsechny pripojene filesystemy ---
 #
@@ -1062,7 +1743,14 @@ fi
 # protoze z jednoho odectu rychlost spocitat nelze.
 DISKDEV_STATE_FILE="/tmp/status-agent-openwrt-diskdev.state"
 disk_devices_json="[]"
-if [ -f /proc/diskstats ]; then
+# Which disks moved since the previous run. The storage collector below
+# needs it to tell a sleeping disk from a working one, and it comes out of
+# the same awk - reading /proc/diskstats a second time would cost a fork.
+diskdev_active=" "
+# $BK_PROC is /proc except under the dry-run test seam. The per-disk rates
+# and the disk health list have to describe the same disks, and in a test
+# those are the fake root's, not the CI runner's.
+if [ -f "$BK_PROC/diskstats" ]; then
     diskdev_now=$(date +%s)
     # Kotva $ za nazvem znamenala, ze `mmcblk` sedelo jen na zarizeni doslova
     # pojmenovane "mmcblk" - jenze skutecne se jmenuje mmcblk0. Stejne tak
@@ -1073,13 +1761,13 @@ if [ -f /proc/diskstats ]; then
     #
     # Oddily (mmcblk0p1, sda1) se schvalne vynechavaji: /proc/diskstats je
     # zapocitava i do celeho disku, takze by se stejny zapis vypsal dvakrat.
-    diskdev_cur=$(awk '$3 ~ /^(mtdblock[0-9]+|mmcblk[0-9]+|sd[a-z]|ubiblock[0-9_]+|nvme[0-9]+n[0-9]+|hd[a-z])$/ { print $3 "|" $6 "|" $10 }' /proc/diskstats 2>/dev/null)
+    diskdev_cur=$(awk '$3 ~ /^(mtdblock[0-9]+|mmcblk[0-9]+|sd[a-z]|ubiblock[0-9_]+|nvme[0-9]+n[0-9]+|hd[a-z])$/ { print $3 "|" $6 "|" $10 }' "$BK_PROC/diskstats" 2>/dev/null)
 
     if [ -n "$diskdev_cur" ]; then
         diskdev_prev_ts=""
         [ -f "$DISKDEV_STATE_FILE" ] && diskdev_prev_ts=$(head -n 1 "$DISKDEV_STATE_FILE" 2>/dev/null)
 
-        disk_devices_json=$(printf '%s\n' "$diskdev_cur" | awk -F'|' \
+        _diskdev_out=$(printf '%s\n' "$diskdev_cur" | awk -F'|' \
             -v prev_file="$DISKDEV_STATE_FILE" -v now_ts="$diskdev_now" -v prev_ts="$diskdev_prev_ts" '
             BEGIN {
                 elapsed = 0;
@@ -1097,15 +1785,200 @@ if [ -f /proc/diskstats ]; then
                     rk = sprintf("%.1f", ((r - prev_r[dev]) * 512 / elapsed) / 1024);
                     wk = sprintf("%.1f", ((w - prev_w[dev]) * 512 / elapsed) / 1024);
                 }
+                # Awake = the counters moved. A first run knows nothing yet and
+                # says nothing, which keeps a spinning disk asleep one more run.
+                if ((dev in prev_r) && (r != prev_r[dev] || w != prev_w[dev])) act = act (act == "" ? "" : " ") dev;
                 printf "%s{\"device\":\"%s\",\"read_kbps\":%s,\"write_kbps\":%s,\"read_sectors_total\":%s,\"write_sectors_total\":%s}",
                        (c++ ? "," : "["), dev, rk, wk, r, w;
             }
-            END { printf "%s", (c ? "]" : "[]") }')
+            END { printf "%s#%s", (c ? "]" : "[]"), act }')
+        # Last '#': a device name cannot contain one, so the split is safe.
+        disk_devices_json=${_diskdev_out%#*}
+        diskdev_active=" ${_diskdev_out##*#} "
 
         { echo "$diskdev_now"; printf '%s\n' "$diskdev_cur"; } > "$DISKDEV_STATE_FILE" 2>/dev/null
     fi
 fi
 [ -z "$disk_devices_json" ] && disk_devices_json="[]"
+
+# --- Fyzicke disky, oddily a SMART -------------------------------------------
+#
+# `filesystems` above says how full a mount point is, `disk_devices` how much
+# is written to a device. Neither says WHICH disk that is, how it is attached,
+# or whether it is about to die. This block adds the disk itself: the list is
+# rebuilt only when it changes (or hourly), the SMART values come from the
+# cache a detached child fills, and the minute run touches no drive at all.
+
+# Reads one sysfs value. `[ -r f ] && read` rather than `read v < f 2>/dev/null`:
+# a directory or a write-only attribute in place of the file makes read fail,
+# and without the reset the PREVIOUS disk value would silently carry over.
+bk_rd() { _v=""; [ -r "$1" ] && IFS= read -r _v < "$1"; printf '%s' "$_v"; }
+
+# D|name|transport|port|sectors|rot|removable|life_a|life_b|pre_eol|model  and
+# P|disk|part|sectors. The model goes LAST: it may contain the separator.
+# Only size, removable, queue/rotational, device/{model,vendor,name,type,
+# life_time,pre_eol_info} and <part>/{partition,size} are ever opened - never
+# serial, cid, wwid, vpd_pg80/83, eui or nguid. `readlink -f` and the small
+# path awk run only on a rebuild, which is at most once an hour.
+bk_disk_static() {
+    _sys="$1/sys"
+    for _dp in "$_sys"/block/*; do
+        _n=${_dp##*/}
+        case "$_n" in sd[a-z]|sd[a-z][a-z]|vd[a-z]|hd[a-z]|mmcblk[0-9]|mmcblk[0-9][0-9]|nvme[0-9]n[0-9]|nvme[0-9][0-9]n[0-9]) ;; *) continue ;; esac
+        # loop*, zram* and ubiblock* never get here; mtdblock* would (raw NOR
+        # flash HAS a device link), which is why the name pattern decides.
+        [ -e "$_dp/device" ] || continue
+        _size=$(bk_rd "$_dp/size"); case "$_size" in ''|0|*[!0-9]*) continue ;; esac
+        _path=$(readlink -f "$_dp" 2>/dev/null); _tr="other"; _port=""
+        case "$_path" in
+            */usb[0-9]*) _tr="usb"; _port=$(printf '%s\n' "$_path" | awk -F/ '{ for (i = NF; i > 0; i--) if ($i ~ /^[0-9]+-[0-9]+(\.[0-9]+)*$/) { print "usb:" $i; exit } }') ;;
+            */nvme/nvme[0-9]*) _tr="nvme"; _port=$(printf '%s\n' "$_path" | awk -F/ '{ for (i = NF; i > 0; i--) if ($i ~ /^nvme[0-9]+$/) { print $i; exit } }') ;;
+            */mmc_host/mmc[0-9]*) _tr="sd"; [ "$(bk_rd "$_dp/device/type")" = "MMC" ] && _tr="emmc"
+                _port=$(printf '%s\n' "$_path" | awk -F/ '{ for (i = NF; i > 0; i--) if ($i ~ /^mmc[0-9]+$/) { print $i; exit } }') ;;
+            */ata[0-9]*) _tr="sata"; _port=$(printf '%s\n' "$_path" | awk -F/ '{ for (i = NF; i > 0; i--) if ($i ~ /^ata[0-9]+$/) { print $i; exit } }') ;;
+            */virtio[0-9]*) _tr="virtio" ;;
+        esac
+        _model=$(bk_rd "$_dp/device/model"); [ -z "$_model" ] && _model=$(bk_rd "$_dp/device/name")
+        # SCSI inquiry gives 16 characters, so the sysfs model is a prefix of
+        # the SMART one ("KINGSTON SUV500M" vs "KINGSTON SUV500MS120G"). It is
+        # still the stable half of the disk key: SMART may not be readable.
+        _vendor=$(bk_rd "$_dp/device/vendor"); _vendor=${_vendor%% *}
+        case "$_vendor" in ''|ATA) ;; *) _model="$_vendor $_model" ;; esac
+        _la=""; _lb=""; _eol=""
+        if [ "$_tr" = "emmc" ]; then
+            # eMMC wear is static between boots (drivers/mmc/core/mmc.c reads
+            # it once from the EXT_CSD), so it belongs here, not in the minute.
+            _lt=$(bk_rd "$_dp/device/life_time"); _la=${_lt%% *}; _lb=${_lt##* }; _eol=$(bk_rd "$_dp/device/pre_eol_info")
+        fi
+        printf 'D|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$_n" "$_tr" "$_port" "$_size" "$(bk_rd "$_dp/queue/rotational")" "$(bk_rd "$_dp/removable")" "$_la" "$_lb" "$_eol" "$_model"
+        for _pp in "$_dp/$_n"*; do
+            [ -r "$_pp/partition" ] || continue
+            printf 'P|%s|%s|%s\n' "$_n" "${_pp##*/}" "$(bk_rd "$_pp/size")"
+        done
+    done
+}
+
+# The fingerprint is name:size of every candidate, read with builtins only.
+# A disk list that is rebuilt every minute would cost a readlink and an awk per
+# disk for a value that changes when somebody plugs something in - so it is
+# rebuilt on a change, and once an hour in case a change was missed.
+_disks_fp=""
+for _dp in "$BK_SYS"/block/*; do
+    _n=${_dp##*/}
+    case "$_n" in sd[a-z]|sd[a-z][a-z]|vd[a-z]|hd[a-z]|mmcblk[0-9]|mmcblk[0-9][0-9]|nvme[0-9]n[0-9]|nvme[0-9][0-9]n[0-9]) ;; *) continue ;; esac
+    [ -e "$_dp/device" ] || continue
+    _dsz=""; [ -r "$_dp/size" ] && read -r _dsz < "$_dp/size"
+    _disks_fp="$_disks_fp $_n:$_dsz"
+done
+_disks_fp=${_disks_fp# }
+_disks_hdr=""; [ -r "$STORAGE_STATIC" ] && IFS= read -r _disks_hdr < "$STORAGE_STATIC"
+_disks_hdr=${_disks_hdr#\#fp }
+_disks_old_fp=${_disks_hdr#* }; _disks_ts=${_disks_hdr%% *}
+case "$_disks_ts" in ''|*[!0-9]*) _disks_ts=0 ;; esac
+if [ "$_disks_old_fp" != "$_disks_fp" ] || [ $((now_ts - _disks_ts)) -ge 3600 ]; then
+    { printf '#fp %s %s\n' "$now_ts" "$_disks_fp"; bk_disk_static "$BK_ROOT"; } > "$STORAGE_STATIC.tmp" 2>/dev/null \
+        && mv "$STORAGE_STATIC.tmp" "$STORAGE_STATIC" 2>/dev/null
+    rm -f "$STORAGE_STATIC.tmp" 2>/dev/null
+fi
+
+# What the SMART child is doing right now. `since` is written per disk, so the
+# number answers "how long has THIS drive been read", and a later spawn cannot
+# reset the clock the way smart.spawn would. Over 900 s is only reachable
+# through an unkillable smartctl, which keeps the lock on purpose.
+smart_probe_running_s="null"
+smart_probe_age_s="null"
+smart_stuck=""
+_smart_lock_pid=""; [ -r "$BK_PRIVATE_DIR/smart.lock/pid" ] && read -r _smart_lock_pid < "$BK_PRIVATE_DIR/smart.lock/pid"
+case "$_smart_lock_pid" in ''|*[!0-9]*) _smart_lock_pid="" ;; esac
+if [ -n "$_smart_lock_pid" ] && [ -d "/proc/$_smart_lock_pid" ]; then
+    _smart_since=""; [ -r "$BK_PRIVATE_DIR/smart.lock/since" ] && read -r _smart_since < "$BK_PRIVATE_DIR/smart.lock/since"
+    case "$_smart_since" in ''|*[!0-9]*) _smart_since="" ;; esac
+    if [ -n "$_smart_since" ]; then
+        smart_probe_running_s=$((now_ts - _smart_since))
+        if [ "$smart_probe_running_s" -gt 900 ]; then
+            [ -r "$BK_PRIVATE_DIR/smart.lock/dev" ] && read -r smart_stuck < "$BK_PRIVATE_DIR/smart.lock/dev"
+            case "$smart_stuck" in ''|*[!a-z0-9]*) smart_stuck="" ;; esac
+        fi
+    fi
+fi
+smart_spawn_last=""; [ -r "$BK_PRIVATE_DIR/smart.spawn" ] && IFS= read -r smart_spawn_last < "$BK_PRIVATE_DIR/smart.spawn"
+_smart_spawn_ts=${smart_spawn_last%%|*}
+case "$_smart_spawn_ts" in ''|*[!0-9]*) _smart_spawn_ts="" ;; esac
+[ -n "$_smart_spawn_ts" ] && smart_probe_age_s=$((now_ts - _smart_spawn_ts))
+
+# Files: disks.static, smart.cache; stdin: the `df -PT` body.
+# Vars: smartctl (1|0), active (" sda sdb "), now, stuck (device name or ""),
+#       interval (s, floor 3600)
+# Output: <storage_disks JSON>#<disks whose SMART reading is due>
+# The JSON keys are written \"key\": so that run_agent_metric_lint.php does
+# not read them as new top-level metrics.
+BK_STORAGE_AWK='
+function jn(v) { return (v == "") ? "null" : v }
+function jq(v) { return (v == "") ? "null" : "\"" v "\"" }
+function jb(v) { return (v == "1") ? "true" : (v == "0" ? "false" : "null") }
+# A mount point is a path a person chose: it may hold a quote or a backslash,
+# and printed raw it makes the whole report invalid JSON, which the server
+# answers with 400 - the router would stop reporting over a directory name.
+function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/[\001-\037]/, "", s); return s }
+function hexn(s,   v) { s = tolower(s); sub(/^0x/, "", s); if (s !~ /^[0-9a-f]+$/) return ""; v = 0; while (s != "") { v = v * 16 + index("0123456789abcdef", substr(s, 1, 1)) - 1; s = substr(s, 2) } return v }
+FILENAME != "-" && $0 ~ /^D\|/ { n = split($0, f, "|"); nd++; name[nd] = f[2]; tr[nd] = f[3]; port[nd] = f[4]; size[nd] = f[5]; rot[nd] = f[6]; rem[nd] = f[7]; la[nd] = hexn(f[8]); lb[nd] = hexn(f[9]); eol[nd] = hexn(f[10])
+    m = f[11]; for (i = 12; i <= n; i++) m = m "|" f[i]; gsub(/[^A-Za-z0-9 ._()+\/-]/, "", m); gsub(/  +/, " ", m); sub(/^ /, "", m); sub(/ $/, "", m); model[nd] = substr(m, 1, 64); next }
+FILENAME != "-" && $0 ~ /^P\|/ { split($0, f, "|"); np[f[2]]++; pn[f[2], np[f[2]]] = f[3]; ps[f[2], np[f[2]]] = f[4]; next }
+FILENAME != "-" && $0 ~ /^S\|/ { n = split($0, f, "|"); k = f[2]; s_size[k] = f[3]; s_probe[k] = f[4]; s_vts[k] = f[5]; s_state[k] = f[7]; s_rpm[k] = f[8]; b = f[9]; for (i = 10; i <= n; i++) b = b "|" f[i]; s_body[k] = b; next }
+# The df header does not start with /dev/, so it needs no separate skip. The
+# mount is $7..NF: it may contain spaces. The shortest one wins - / and /srv
+# are the same btrfs, and the disk belongs under the one that is the volume.
+FILENAME == "-" { if ($1 ~ /^\/dev\//) { d = $1; sub(/^\/dev\//, "", d); mnt = $7; for (i = 8; i <= NF; i++) mnt = mnt " " $i
+        if (!(d in fs_m) || length(mnt) < length(fs_m[d])) { fs_m[d] = mnt; fs_t[d] = $2; p = $6; sub(/%/, "", p); fs_p[d] = (p ~ /^[0-9]+$/) ? p : "" } } next }
+END {
+    for (x = 1; x <= nd && x <= 8; x++) { k = name[x]
+        st = ""; vts = ""; body = ""
+        if (tr[x] == "emmc" || tr[x] == "sd" || tr[x] == "virtio") st = "not_applicable"
+        else if (smartctl != 1) st = "not_installed"
+        else {
+            # Matched on name AND size: a USB slot that got another disk keeps
+            # the name and must not inherit the old disk temperature.
+            have = ((k in s_size) && s_size[k] == size[x])
+            spinning = (have && s_rpm[k] != "") ? (s_rpm[k] + 0 > 0) : (rot[x] != "0")
+            isdue = (!have || now - s_probe[k] >= (interval + 0 >= 3600 ? interval + 0 : 3600))
+            if (have) { st = s_state[k]; vts = s_vts[k]; body = s_body[k] } else st = "pending"
+            if (k == stuck) st = "stuck"
+            # A spinning disk that nobody is using is left alone: reading SMART
+            # spins it up, and doing that every hour is the wear this check is
+            # supposed to watch. It is read the first minute it is working.
+            if (isdue && k != stuck) { if (spinning && index(active, " " k " ") == 0) { if (!have) st = "idle_skipped" } else due = due (due == "" ? "" : " ") k }
+        }
+        if (body == "") body = "\"exit_bits\":null,\"passed\":null,\"in_drivedb\":null,\"protocol\":null,\"model\":null,\"rotation_rpm\":null,\"temperature_c\":null,\"power_on_hours\":null,\"power_cycles\":null,\"unsafe_shutdowns\":null,\"reallocated_sectors\":null,\"pending_sectors\":null,\"offline_uncorrectable\":null,\"reported_uncorrect\":null,\"crc_errors\":null,\"runtime_bad_blocks\":null,\"media_errors\":null,\"critical_warning\":null,\"available_spare_pct\":null,\"wear_pct\":null,\"wear_source\":null,\"written_bytes\":null,\"written_source\":null,\"error_log_count\":null,\"selftest_count\":null"
+        parts = ""
+        for (i = 1; i <= np[k] && i <= 16; i++) { pk = pn[k, i]
+            parts = parts (i > 1 ? "," : "") "{\"name\":\"" pk "\",\"size_bytes\":" jn(ps[k, i] == "" ? "" : sprintf("%.0f", ps[k, i] * 512)) ",\"mount\":" ((pk in fs_m) ? "\"" esc(fs_m[pk]) "\"" : "null") ",\"fstype\":" ((pk in fs_t) ? "\"" esc(fs_t[pk]) "\"" : "null") ",\"used_pct\":" ((pk in fs_p) ? jn(fs_p[pk]) : "null") "}" }
+        em = "null"
+        # 0x00 means the card does not report it: not a zero, not level one.
+        if (tr[x] == "emmc") em = "{\"life_a\":" jn((la[x] + 0 >= 1 && la[x] + 0 <= 11) ? la[x] : "") ",\"life_b\":" jn((lb[x] + 0 >= 1 && lb[x] + 0 <= 11) ? lb[x] : "") ",\"pre_eol\":" jn((eol[x] + 0 >= 1 && eol[x] + 0 <= 3) ? eol[x] : "") "}"
+        out = out (x > 1 ? "," : "") "{\"name\":\"" k "\",\"transport\":\"" tr[x] "\",\"port\":" jq(port[x]) ",\"model\":" jq(model[x]) ",\"size_bytes\":" sprintf("%.0f", size[x] * 512) \
+            ",\"rotational\":" jb(rot[x]) ",\"removable\":" jb(rem[x]) ",\"partitions\":[" parts "],\"emmc\":" em \
+            ",\"smart\":{\"state\":\"" st "\",\"checked_at\":" jn(vts) "," body "}}"
+    }
+    printf "[%s]#%s", out, due
+}
+'
+
+have_smartctl=0; command -v smartctl >/dev/null 2>&1 && have_smartctl=1
+storage_disks_json="null"
+smart_due=""
+# busybox awk dies on a missing input FILE argument; both are cheap to create.
+: >> "$STORAGE_STATIC"; : >> "$SMART_CACHE"
+# Without `df -T` the type column is missing and every other column shifts, so
+# the join would read a size as a mount point. Better no mount than a wrong one.
+_df_body=""
+[ "$df_has_type" = 1 ] && _df_body="$df_out"
+_storage_out=$(printf '%s\n' "$_df_body" | awk -v smartctl="$have_smartctl" -v active="$diskdev_active" -v now="$now_ts" \
+    -v stuck="$smart_stuck" -v interval="$SMART_INTERVAL_SEC" "$BK_STORAGE_AWK" "$STORAGE_STATIC" "$SMART_CACHE" -)
+# Last '#': a mount path may contain one, a device name cannot.
+storage_disks_json=${_storage_out%#*}
+smart_due=${_storage_out##*#}
+[ -d "$BK_SYS/block" ] || storage_disks_json="null"
+[ -z "$storage_disks_json" ] && storage_disks_json="null"
 
 # --- Procesy, ktere nejvic zapisuji ---
 #
@@ -1295,34 +2168,404 @@ if [ -f /etc/config/mwan3 ]; then
 fi
 [ -z "$mwan3_active_gw" ] && mwan3_active_gw="null" || mwan3_active_gw="\"$mwan3_active_gw\""
 
-# --- SQM (Smart Queue Management / CAKE) ---
-sqm_enabled="false"
+# --- Cesta paketu skrz router (hodinova cache) -----------------------------
+#
+# Everything below is configuration or a runtime switch: it changes when
+# somebody changes it, not from minute to minute. Reading it every minute
+# would cost a uci fork per option, a tc call per queue and one ubus dump of
+# every netdev, so it is read once an hour into a cache and sent from there
+# on every run. A cache that cannot be read whole is made again, never
+# guessed: the file carries a timestamp, the finished object and an end
+# marker, exactly like the identity cache.
+BK_WAN_PATH_CACHE="$BK_PRIVATE_DIR/wan-path.cache"
+BK_WAN_PATH_TTL_SEC=3600
+wan_path_json="null"
+# The legacy SQM keys keep the charts alive, but they no longer come from
+# sqm.@queue[0] - that is "the first section in the file", which on this
+# router is a disabled leftover on the LAN conduit. They now come from the
+# queue that sits on the WAN path, and sqm_enabled is null (not false) when
+# the router has no SQM configuration at all: "not installed" is not "off".
+sqm_enabled="null"
 sqm_download_kbps="null"
 sqm_upload_kbps="null"
 sqm_dropped="null"
+# ECN marks are a per-tin table of `tc -s qdisc`; not parsed here.
 sqm_ecn="null"
-if [ -f /etc/config/sqm ]; then
-    sqm_enabled=$(uci get sqm.@queue[0].enabled 2>/dev/null)
-    [ "$sqm_enabled" = "1" ] && sqm_enabled="true" || sqm_enabled="false"
-    if [ "$sqm_enabled" = "true" ]; then
-        sqm_download_kbps=$(uci get sqm.@queue[0].download 2>/dev/null)
-        sqm_upload_kbps=$(uci get sqm.@queue[0].upload 2>/dev/null)
-        [ -z "$sqm_download_kbps" ] && sqm_download_kbps="null"
-        [ -z "$sqm_upload_kbps" ] && sqm_upload_kbps="null"
-        # CAKE stats from tc
-        sqm_iface=$(uci get sqm.@queue[0].interface 2>/dev/null)
-        if [ -n "$sqm_iface" ] && command -v tc >/dev/null 2>&1; then
-            tc_out=$(tc -s qdisc show dev "$sqm_iface" 2>/dev/null | grep -A5 "cake")
-            # "(dropped 12, overlimits 0 requeues 0)": the value follows the
-            # word; the old $NF took "0)" from the end of the line, which the
-            # sanitizer then turned into null every time.
-            sqm_dropped=$(printf '%s\n' "$tc_out" | sed -n 's/.*dropped \([0-9]*\),.*/\1/p' | head -1)
-            # ECN marks are a per-tin table beyond this excerpt - not measured here.
-            sqm_ecn=""
-        fi
-        [ -z "$sqm_dropped" ] && sqm_dropped="null"
-        [ -z "$sqm_ecn" ] && sqm_ecn="null"
+
+# Drops of one qdisc. The value FOLLOWS the word: "(dropped 12, overlimits 0
+# requeues 0)". Answer in $_tc_v, so the caller needs no subshell.
+bk_tc_dropped() {
+    _tc_v=""
+    _tc_out=$(tc -s qdisc show dev "$1" 2>/dev/null)
+    case "$_tc_out" in
+        *"dropped "*)
+            _tc_n=${_tc_out#*dropped }
+            _tc_n=${_tc_n%%,*}
+            case "$_tc_n" in
+                ''|*[!0-9]*) ;;
+                *) _tc_v="$_tc_n" ;;
+            esac
+            ;;
+    esac
+}
+
+# One queue of `uci show sqm`, once its section is complete. Only an ENABLED
+# queue on a device of the WAN chain is reported: a queue is often configured
+# on the physical port while the WAN runs over pppoe-wan on top of it, and
+# the other way round, so the whole chain of the 4c walk is matched.
+bk_sqm_flush() {
+    [ -n "$_wp_sect" ] || return 0
+    [ "$_wp_en" = "1" ] || return 0
+    [ -n "$_wp_if" ] || return 0
+    case "$_wp_if" in *[!A-Za-z0-9._-]*) return 0 ;; esac
+    case " $bk_wan_chain $wan_l3_device $wan_link_dev " in
+        *" $_wp_if "*) ;;
+        *) return 0 ;;
+    esac
+    # A rate of 0 means "this direction is not shaped", not "0 kbit/s".
+    _wp_dlk="null"
+    case "$_wp_dl" in
+        ''|*[!0-9]*|0) ;;
+        *) _wp_dlk="$_wp_dl" ;;
+    esac
+    _wp_ulk="null"
+    case "$_wp_ul" in
+        ''|*[!0-9]*|0) ;;
+        *) _wp_ulk="$_wp_ul" ;;
+    esac
+    _wp_eg="null"; _wp_in="null"
+    if [ "$bk_have_tc" = 1 ]; then
+        bk_tc_dropped "$_wp_if"
+        [ -n "$_tc_v" ] && _wp_eg="$_tc_v"
+        # Ingress is shaped on SQM's own ifb device, whose name the kernel
+        # cuts to 15 bytes - so the lookup has to cut it the same way.
+        _wp_ifb="ifb4$_wp_if"
+        while [ ${#_wp_ifb} -gt 15 ]; do _wp_ifb=${_wp_ifb%?}; done
+        bk_tc_dropped "$_wp_ifb"
+        [ -n "$_tc_v" ] && _wp_in="$_tc_v"
     fi
+    wp_sqm="$wp_sqm${wp_sqm:+,}{\"iface\":\"$_wp_if\",\"download_kbps\":$_wp_dlk,\"upload_kbps\":$_wp_ulk,\"egress_dropped\":$_wp_eg,\"ingress_dropped\":$_wp_in}"
+    # The legacy keys describe the WAN queue; the first match wins, as the
+    # router has one WAN path.
+    if [ "$sqm_enabled" != "true" ]; then
+        sqm_enabled="true"
+        sqm_download_kbps="$_wp_dlk"
+        sqm_upload_kbps="$_wp_ulk"
+        sqm_dropped="$_wp_eg"
+    fi
+}
+
+# LAN ports behind the bridge, read from ubus's pretty-printed output with
+# `read` - never with jsonfilter, which this image does not carry and which
+# no test of this repository runs (X5). What the parser has to survive is
+# the printer's format, not JSON's: tab indentation, an EMPTY array printed
+# over three lines, `"speed"` a string such as "1000F" or "150H", and no
+# `"speed"` line at all when there is no carrier.
+#
+# Three answers come out of one dump:
+#   lan_port_max_mbit - the fastest LAN port linked RIGHT NOW. A current
+#     state: a lone 100 Mbit printer makes it 100.
+#   lan_port_cap_mbit - what those ports can do at all, from netifd's
+#     link-supported list. Never derived from `speed`: a negotiated rate is
+#     not a capability.
+#   lan_conduits[]    - the DSA conduit the user ports share, with ITS rate.
+#     Five gigabit ports behind one gigabit conduit share 1 Gbit.
+# Only members of the LAN bridge with devtype dsa or ethernet count: an LTE
+# modem on USB is an "ethernet" device too and is not a LAN port.
+bk_lan_rec() {
+    [ -n "$_lc_dev" ] || return 0
+    case "$_lc_dev" in *[!A-Za-z0-9._-]*) return 0 ;; esac
+    _lc_recs="$_lc_recs$_lc_dev|$_lc_type|$_lc_cond|$_lc_speed|$_lc_cap$BK_NL"
+}
+
+bk_lan_caps() {
+    lan_port_max=""; lan_port_cap=""; lan_conduits=""
+    _lc_dev=""; _lc_type=""; _lc_speed=""; _lc_cond=""; _lc_cap=""
+    _lc_members=""; _lc_recs=""; _lc_arr=""; _lc_conds=""; _lc_any=0
+    while IFS= read -r _lc_ln; do
+        # A device opens at ONE tab; every key inside it is deeper, so the
+        # depth alone tells the two apart.
+        case "$_lc_ln" in
+            "$_lc_t1"'"'*': {')
+                bk_lan_rec
+                _lc_dev=${_lc_ln#*\"}
+                _lc_dev=${_lc_dev%%\"*}
+                _lc_type=""; _lc_speed=""; _lc_cond=""; _lc_cap=""; _lc_arr=""
+                _lc_any=1
+                continue
+                ;;
+        esac
+        [ -n "$_lc_dev" ] || continue
+        case "$_lc_ln" in
+            "$_lc_t2"'"devtype": "'*)
+                _lc_type=${_lc_ln#*: \"}
+                _lc_type=${_lc_type%%\"*}
+                ;;
+            "$_lc_t2"'"conduit": "'*)
+                _lc_cond=${_lc_ln#*: \"}
+                _lc_cond=${_lc_cond%%\"*}
+                case "$_lc_cond" in *[!A-Za-z0-9._-]*) _lc_cond="" ;; esac
+                ;;
+            "$_lc_t2"'"speed": "'*)
+                # "1000F" / "150H": F and H are the duplex, the digits the rate.
+                _lc_v=${_lc_ln#*: \"}
+                _lc_v=${_lc_v%%\"*}
+                _lc_v=${_lc_v%[FH]}
+                case "$_lc_v" in
+                    ''|*[!0-9]*) ;;
+                    *) _lc_speed="$_lc_v" ;;
+                esac
+                ;;
+            "$_lc_t2"'"link-supported": ['*) _lc_arr="ls" ;;
+            "$_lc_t2"'"bridge-members": ['*) _lc_arr="bm" ;;
+            "$_lc_t2"']'*) _lc_arr="" ;;
+            "$_lc_t3"'"'*)
+                case "$_lc_arr" in
+                    ls)
+                        # The rate is the builtin prefix of the mode name:
+                        # 1000baseT-F -> 1000.
+                        _lc_v=${_lc_ln#*\"}
+                        _lc_v=${_lc_v%%\"*}
+                        _lc_v=${_lc_v%%base*}
+                        case "$_lc_v" in
+                            ''|*[!0-9]*) ;;
+                            *)
+                                if [ -z "$_lc_cap" ] || [ "$_lc_v" -gt "$_lc_cap" ]; then
+                                    _lc_cap="$_lc_v"
+                                fi
+                                ;;
+                        esac
+                        ;;
+                    bm)
+                        if [ "$_lc_dev" = "$BK_LAN_BRIDGE" ]; then
+                            _lc_v=${_lc_ln#*\"}
+                            _lc_v=${_lc_v%%\"*}
+                            _lc_members="$_lc_members $_lc_v"
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+    done
+    bk_lan_rec
+    [ "$_lc_any" = 1 ] || return 0
+
+    while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp; do
+        [ -n "$_lc_d" ] || continue
+        case " $_lc_members " in *" $_lc_d "*) ;; *) continue ;; esac
+        case "$_lc_ty" in dsa|ethernet) ;; *) continue ;; esac
+        if [ -n "$_lc_s" ]; then
+            if [ -z "$lan_port_max" ] || [ "$_lc_s" -gt "$lan_port_max" ]; then
+                lan_port_max="$_lc_s"
+            fi
+        fi
+        if [ -n "$_lc_cp" ]; then
+            if [ -z "$lan_port_cap" ] || [ "$_lc_cp" -gt "$lan_port_cap" ]; then
+                lan_port_cap="$_lc_cp"
+            fi
+        fi
+        if [ -n "$_lc_c" ]; then
+            case " $_lc_conds " in
+                *" $_lc_c "*) ;;
+                *) _lc_conds="$_lc_conds $_lc_c" ;;
+            esac
+        fi
+    done <<EOF_LAN
+$_lc_recs
+EOF_LAN
+
+    lan_conduits="[]"
+    for _lc_c in $_lc_conds; do
+        _lc_cs=""
+        while IFS='|' read -r _lc_d _lc_ty _lc_c2 _lc_s _lc_cp; do
+            [ "$_lc_d" = "$_lc_c" ] && _lc_cs="$_lc_s"
+        done <<EOF_CON
+$_lc_recs
+EOF_CON
+        case "$lan_conduits" in
+            '[]') lan_conduits="[{\"dev\":\"$_lc_c\",\"mbit\":${_lc_cs:-null}}" ;;
+            *) lan_conduits="$lan_conduits,{\"dev\":\"$_lc_c\",\"mbit\":${_lc_cs:-null}}" ;;
+        esac
+    done
+    case "$lan_conduits" in
+        '[]') ;;
+        *) lan_conduits="$lan_conduits]" ;;
+    esac
+}
+
+_lc_t1='	'
+_lc_t2='		'
+_lc_t3='			'
+
+wp_ts=""; wp_body=""; wp_sq_en=""; wp_sq_dl=""; wp_sq_ul=""; wp_sq_dr=""; wp_end=""
+if [ -f "$BK_WAN_PATH_CACHE" ]; then
+    {
+        IFS= read -r wp_ts
+        IFS= read -r wp_body
+        IFS= read -r wp_sq_en
+        IFS= read -r wp_sq_dl
+        IFS= read -r wp_sq_ul
+        IFS= read -r wp_sq_dr
+        IFS= read -r wp_end
+    } < "$BK_WAN_PATH_CACHE" 2>/dev/null
+fi
+case "$wp_ts" in ''|*[!0-9]*) wp_ts=0 ;; esac
+wp_age=$((now_ts - wp_ts))
+if [ "$wp_end" = "end" ] && [ "$wp_age" -ge 0 ] && [ "$wp_age" -lt "$BK_WAN_PATH_TTL_SEC" ]; then
+    wan_path_json="$wp_body"
+    sqm_enabled="$wp_sq_en"
+    sqm_download_kbps="$wp_sq_dl"
+    sqm_upload_kbps="$wp_sq_ul"
+    sqm_dropped="$wp_sq_dr"
+else
+    bk_have_uci=0; command -v uci >/dev/null 2>&1 && bk_have_uci=1
+    bk_have_tc=0; command -v tc >/dev/null 2>&1 && bk_have_tc=1
+
+    # Configured, not measured. No uci at all is "we cannot tell"; the option
+    # simply unset is fw4's own default (off), which is an answer.
+    wp_flow="null"; wp_flow_hw="null"
+    if [ "$bk_have_uci" = 1 ]; then
+        _wp_v=$(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null)
+        if [ "$_wp_v" = "1" ]; then wp_flow="true"; else wp_flow="false"; fi
+        _wp_v=$(uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
+        if [ "$_wp_v" = "1" ]; then wp_flow_hw="true"; else wp_flow_hw="false"; fi
+    fi
+
+    # Runtime, not configuration: a flowtable in the LOADED ruleset is proof
+    # that offloading really is in the kernel. The ruleset was fetched once
+    # for the firewall counters, so this costs no fork.
+    wp_flowtable="null"
+    if command -v nft >/dev/null 2>&1; then
+        case "$bk_nft_rules" in
+            *"flowtable "*) wp_flowtable="true" ;;
+            *) wp_flowtable="false" ;;
+        esac
+    fi
+
+    # A LABEL, deliberately not a boolean: in this tree an unset option means
+    # packet steering is ON and only "0" disables it, while on 22.03/23.05
+    # based systems unset means OFF. No rule reads it; the runtime masks
+    # below are what the recommendations are allowed to believe.
+    wp_steering="null"
+    if [ "$bk_have_uci" = 1 ]; then
+        _wp_v=$(uci -q get network.@globals[0].packet_steering 2>/dev/null)
+        [ -z "$_wp_v" ] && _wp_v="unset"
+        case "$_wp_v" in
+            *[!A-Za-z0-9_-]*) wp_steering="null" ;;
+            *) wp_steering="\"$_wp_v\"" ;;
+        esac
+    fi
+
+    # RPS on the WAN PORT itself, never on the l3 device: mvneta has several
+    # RX queues and the init script fills them all, so any mask with a bit
+    # set means steering is really running.
+    wp_steer_active="null"; wp_rps_mask="null"; wp_threaded="null"
+    if [ -n "$wan_link_dev" ]; then
+        _wp_seen=0; _wp_on=0
+        for _wp_q in "$BK_SYS/class/net/$wan_link_dev"/queues/rx-*/rps_cpus; do
+            [ -r "$_wp_q" ] || continue
+            _wp_m=""
+            IFS= read -r _wp_m < "$_wp_q" 2>/dev/null
+            [ -n "$_wp_m" ] || continue
+            _wp_seen=1
+            case "$_wp_m" in *[!0,]*) _wp_on=1 ;; esac
+        done
+        if [ "$_wp_seen" = 1 ]; then
+            if [ "$_wp_on" = 1 ]; then wp_steer_active="true"; else wp_steer_active="false"; fi
+        fi
+        _wp_m=""
+        [ -r "$BK_SYS/class/net/$wan_link_dev/queues/rx-0/rps_cpus" ] && IFS= read -r _wp_m < "$BK_SYS/class/net/$wan_link_dev/queues/rx-0/rps_cpus" 2>/dev/null
+        case "$_wp_m" in
+            ''|*[!0-9a-fA-F,]*) ;;
+            *) wp_rps_mask="\"$_wp_m\"" ;;
+        esac
+        _wp_m=""
+        [ -r "$BK_SYS/class/net/$wan_link_dev/threaded" ] && IFS= read -r _wp_m < "$BK_SYS/class/net/$wan_link_dev/threaded" 2>/dev/null
+        case "$_wp_m" in
+            0) wp_threaded="false" ;;
+            1) wp_threaded="true" ;;
+        esac
+    fi
+
+    # Ring drops of the port. ethtool is not in every image, and a driver
+    # that does not carry these two counter names answers nothing - which is
+    # null, never 0 (R7: on this router ethtool is not installed at all).
+    wp_ring="null"
+    if [ -n "$wan_link_dev" ] && command -v ethtool >/dev/null 2>&1; then
+        _wp_sum=""
+        while read -r _wp_k _wp_n; do
+            case "$_wp_k" in
+                rx_discard:|rx_overrun:)
+                    case "$_wp_n" in
+                        ''|*[!0-9]*) continue ;;
+                    esac
+                    _wp_sum=$(( ${_wp_sum:-0} + _wp_n ))
+                    ;;
+            esac
+        done <<EOF_ETH
+$(ethtool -S "$wan_link_dev" 2>/dev/null)
+EOF_ETH
+        [ -n "$_wp_sum" ] && wp_ring="$_wp_sum"
+    fi
+
+    # SQM. An empty list means "checked, no queue on the WAN path"; null
+    # means "could not check" - two different answers.
+    wp_sqm="null"
+    if [ "$bk_have_uci" = 1 ] && [ -f /etc/config/sqm ]; then
+        wp_sqm=""
+        sqm_enabled="false"
+        _wp_sect=""; _wp_en=""; _wp_if=""; _wp_dl=""; _wp_ul=""
+        while IFS= read -r _wp_ln; do
+            case "$_wp_ln" in sqm.*) ;; *) continue ;; esac
+            _wp_rest=${_wp_ln#sqm.}
+            _wp_key=${_wp_rest%%=*}
+            _wp_val=${_wp_rest#*=}
+            _wp_val=${_wp_val#\'}
+            _wp_val=${_wp_val%\'}
+            case "$_wp_key" in
+                *.*) _wp_s=${_wp_key%%.*}; _wp_o=${_wp_key#*.} ;;
+                *) _wp_s=$_wp_key; _wp_o="" ;;
+            esac
+            if [ "$_wp_s" != "$_wp_sect" ]; then
+                bk_sqm_flush
+                _wp_sect="$_wp_s"; _wp_en=""; _wp_if=""; _wp_dl=""; _wp_ul=""
+            fi
+            case "$_wp_o" in
+                enabled) _wp_en="$_wp_val" ;;
+                interface) _wp_if="$_wp_val" ;;
+                download) _wp_dl="$_wp_val" ;;
+                upload) _wp_ul="$_wp_val" ;;
+            esac
+        done <<EOF_SQM
+$(uci -q show sqm 2>/dev/null)
+EOF_SQM
+        bk_sqm_flush
+        wp_sqm="[$wp_sqm]"
+    fi
+
+    # The LAN side. One ubus dump an hour, parsed with `read`.
+    lan_port_max=""; lan_port_cap=""; lan_conduits=""
+    if command -v ubus >/dev/null 2>&1; then
+        BK_LAN_BRIDGE="br-lan"
+        if bk_iface_load lan; then
+            _wp_lan=""
+            json_get_var _wp_lan l3_device
+            [ -z "$_wp_lan" ] && json_get_var _wp_lan device
+            [ -n "$_wp_lan" ] && BK_LAN_BRIDGE="$_wp_lan"
+        fi
+        bk_lan_caps <<EOF_UBUS
+$(ubus call network.device status 2>/dev/null)
+EOF_UBUS
+    fi
+
+    wan_path_json="{\"checked_at\":$now_ts,\"flow_offloading\":$wp_flow,\"flow_offloading_hw\":$wp_flow_hw,\"flowtable_active\":$wp_flowtable,\"packet_steering\":$wp_steering,\"packet_steering_active\":$wp_steer_active,\"wan_rps_mask\":$wp_rps_mask,\"wan_threaded_napi\":$wp_threaded,\"wan_rx_ring_drops\":$wp_ring,\"sqm\":$wp_sqm,\"lan_port_max_mbit\":${lan_port_max:-null},\"lan_port_cap_mbit\":${lan_port_cap:-null},\"lan_conduits\":${lan_conduits:-null}}"
+
+    # Written through a temporary name, like the identity cache: a run killed
+    # half way must not leave a file whose lines have shifted by one.
+    printf '%s\n' "$now_ts" "$wan_path_json" "$sqm_enabled" "$sqm_download_kbps" \
+        "$sqm_upload_kbps" "$sqm_dropped" "end" \
+        > "$BK_WAN_PATH_CACHE.tmp" 2>/dev/null && mv "$BK_WAN_PATH_CACHE.tmp" "$BK_WAN_PATH_CACHE" 2>/dev/null
+    log_debug "WAN cesta: flow=$wp_flow flowtable=$wp_flowtable steering=$wp_steering/$wp_steer_active ring=$wp_ring sqm=$sqm_enabled"
 fi
 
 # --- LTE/WWAN pripojeni pres ubus -----------------------------------------
@@ -1693,7 +2936,13 @@ if [ -n "$bk_log_full" ]; then
 fi
 
 # --- WAN reconnect stats (state file) ---
-wan_reconnect_count=0
+#
+# G24: the counter starts as null, not 0. A reconnect is only visible as a
+# DROP of the WAN uptime between two runs, so the very first run - and every
+# run after the state file was lost with /tmp on a reboot - has watched
+# nothing and has nothing to report. From the second run on, 0 is a measured
+# zero: the agent did compare two samples and saw no reset.
+wan_reconnect_count="null"
 wan_last_reconnect="null"
 bk_state_file="/tmp/bk_wan_state"
 if [ -n "$wan_uptime" ] && [ "$wan_uptime" != "null" ] && [ "$wan_uptime" -gt 0 ] 2>/dev/null; then
@@ -1701,10 +2950,15 @@ if [ -n "$wan_uptime" ] && [ "$wan_uptime" != "null" ] && [ "$wan_uptime" -gt 0 
         prev_uptime=$(awk -F= '/^uptime=/{print $2}' "$bk_state_file" 2>/dev/null)
         prev_count=$(awk -F= '/^count=/{print $2}' "$bk_state_file" 2>/dev/null)
         prev_reconnect=$(awk -F= '/^reconnect=/{print $2}' "$bk_state_file" 2>/dev/null)
-        wan_reconnect_count=${prev_count:-0}
+        # A previous sample exists, so the comparison below is real. A state
+        # file written before the upgrade carries "count=0"; a file that was
+        # never written carries nothing, and then this run is the first sample.
+        case "$prev_uptime" in ''|*[!0-9]*) ;; *) wan_reconnect_count=0 ;; esac
+        case "$prev_count" in ''|*[!0-9]*) ;; *) wan_reconnect_count="$prev_count" ;; esac
         [ -n "$prev_reconnect" ] && wan_last_reconnect="$prev_reconnect"
         # WAN uptime reset = reconnect detected
         if [ -n "$prev_uptime" ] && [ "$wan_uptime" -lt "$prev_uptime" ] 2>/dev/null; then
+            [ "$wan_reconnect_count" = "null" ] && wan_reconnect_count=0
             wan_reconnect_count=$((wan_reconnect_count + 1))
             wan_last_reconnect=$(date +%s)
         fi
@@ -1789,13 +3043,53 @@ boot_time="null"
 
 # DNS latence: realny dotaz pres lokalni resolver. Busybox time vypisuje
 # "real 0m 0.03s" na stderr; bez time/nslookup zustava null.
+#
+# G41: the probe keeps its EXIT STATUS. Until now only the wall clock was
+# read, so a resolver that refused the query in 3 ms was filed as the fastest
+# DNS on the network, and a ten-second timeout as a slow one - both are the
+# same failure, and neither is a latency. `echo "rc $?"` rides along inside
+# the group that `time` already measures, and the one sed that was there
+# picks it up with a second expression, so this costs no extra fork. The
+# latency is only computed when the lookup answered, which SAVES the awk on
+# every failing run.
+#
+# The `2>&1` that used to sit on the lookup is gone on purpose: busybox has no
+# `time` KEYWORD, `time` is the applet /bin/time, and it writes its report to
+# the stderr of the command it runs - which that redirection sent to
+# /dev/null. `dns_latency_ms` was therefore null on every busybox router since
+# the day it was written. Only the lookup's stdout is discarded now; whatever
+# nslookup says on stderr cannot match either sed expression.
+dns_resolver_ok="null"
 dns_latency_ms="null"
 if command -v nslookup >/dev/null 2>&1 && command -v time >/dev/null 2>&1; then
-    dns_t=$( { time nslookup example.com 127.0.0.1 >/dev/null 2>&1; } 2>&1 | sed -n 's/.*real[[:space:]]*\([0-9]*\)m[[:space:]]*\([0-9.]*\)s.*/\1 \2/p')
-    if [ -n "$dns_t" ]; then
-        dns_min=$(echo "$dns_t" | awk '{print $1}')
-        dns_sec=$(echo "$dns_t" | awk '{print $2}')
-        dns_latency_ms=$(awk -v m="$dns_min" -v s="$dns_sec" 'BEGIN { printf "%.0f", (m*60+s)*1000 }')
+    dns_probe=$( { time nslookup example.com 127.0.0.1 >/dev/null; echo "rc $?"; } 2>&1 \
+        | sed -n -e 's/.*real[[:space:]]*\([0-9]*\)m[[:space:]]*\([0-9.]*\)s.*/real=\1 \2/p' -e 's/^rc \([0-9][0-9]*\)$/rc=\1/p')
+    dns_rc=""
+    case "$dns_probe" in
+        *rc=*)
+            dns_rc=${dns_probe##*rc=}
+            dns_rc=${dns_rc%%[!0-9]*}
+            ;;
+    esac
+    if [ -n "$dns_rc" ]; then
+        if [ "$dns_rc" = "0" ]; then
+            dns_resolver_ok="true"
+            case "$dns_probe" in
+                *real=*)
+                    dns_t=${dns_probe#*real=}
+                    dns_t=${dns_t%%rc=*}
+                    dns_min=${dns_t%% *}
+                    dns_sec=${dns_t#* }
+                    dns_sec=${dns_sec%%[!0-9.]*}
+                    case "$dns_min$dns_sec" in
+                        ''|*[!0-9.]*) ;;
+                        *) dns_latency_ms=$(awk -v m="$dns_min" -v s="$dns_sec" 'BEGIN { printf "%.0f", (m*60+s)*1000 }') ;;
+                    esac
+                    ;;
+            esac
+        else
+            dns_resolver_ok="false"
+        fi
     fi
 fi
 
@@ -1836,35 +3130,12 @@ if [ -n "$wan_l3_device" ] && command -v ping >/dev/null 2>&1; then
     fi
 fi
 
-# Rychlost WAN linky (Mbit/s) podle vyjednaneho rezimu rozhrani. Neni to
-# rychlost internetu od poskytovatele, ale strop fyzicke linky - kdyz
-# gigabitovy port spadne na 100 Mbit, je to prave tady videt.
-wan_link_mbit="null"
-if [ -n "$wan_l3_device" ]; then
-    link_dev="$wan_l3_device"
-    # U PPPoE/VLAN je l3_device virtualni (pppoe-wan, eth0.2) a rychlost ma
-    # jen fyzicky rodic. Odriznuti prefixu "pppoe-" davalo "wan", coz neni
-    # nazev zarizeni - skutecny rodic je v uci konfiguraci.
-    if [ ! -e "/sys/class/net/$link_dev/speed" ]; then
-        uci_dev=$(uci get network.wan.device 2>/dev/null)
-        [ -z "$uci_dev" ] && uci_dev=$(uci get network.wan.ifname 2>/dev/null)
-        # VLAN (eth0.2) ma rychlost az na rodicovskem rozhrani.
-        [ -n "$uci_dev" ] && [ ! -e "/sys/class/net/$uci_dev/speed" ] && uci_dev=$(echo "$uci_dev" | sed 's/\..*$//')
-        [ -n "$uci_dev" ] && link_dev="$uci_dev"
-    fi
-    # Posledni pokus: odriznout jen VLAN priponu z l3_device.
-    [ ! -e "/sys/class/net/$link_dev/speed" ] && link_dev=$(echo "$wan_l3_device" | sed 's/\..*$//')
-    if [ -r "/sys/class/net/$link_dev/speed" ]; then
-        link_raw=$(cat "/sys/class/net/$link_dev/speed" 2>/dev/null)
-        # -1 = link down nebo neznama rychlost; to neni mereni.
-        case "$link_raw" in
-            ''|*[!0-9-]*) : ;;
-            -*) : ;;
-            0) : ;;
-            *) wan_link_mbit="$link_raw" ;;
-        esac
-    fi
-fi
+# The WAN link rate and the port it belongs to were walked in section 4c
+# (WAN 3.1.1). What stood here read `speed` off the first name it could
+# guess from uci - on the PPPoE-over-VLAN line of this router that was the
+# VLAN, whose speed the kernel passes through, and on a box without uci it
+# was nothing at all. The fallback could never run either: /sys/class/net/
+# <dev>/speed exists for EVERY netdev, so `[ ! -e ... ]` was never true.
 
 openvpn_tunnels="null"
 if command -v pidof >/dev/null 2>&1; then
@@ -1882,91 +3153,292 @@ if [ -d /sys/bus/usb/devices ]; then
     [ -z "$usb_devices" ] && usb_devices=0
 fi
 
-# --- WiFi per-radio detail (iwinfo) ---
+# The one awk that parses every radio (CORE 2.6). It is kept in a variable
+# so the program is written down once and every radio streams through the
+# same process; the shell below only collects the tool output. Its JSON
+# keys are escaped on purpose: run_agent_metric_lint.php collects every
+# unescaped JSON key literal of the agent source and would ask for a stored
+# metric per nested field.
+BK_WIFI_AWK='
+# One awk for all radios. Input, per radio:
+#   @@RADIO <ifname> <sta source: hostapd_cli|ubus|none> <iw: 1|0>
+#   <iwinfo IF info><iwinfo IF assoclist>   (two forks, one command each)
+#   @@STA      <hostapd_cli -i IF all_sta | ubus call hostapd.IF get_clients>
+#   @@SURVEY   <iw dev IF survey dump>
+#   @@CAPS     <cached iwinfo IF htmodelist + freqlist, refreshed daily>
+# Vars: prev (survey state file), nstate (new state file), now (epoch)
+# Output: <wifi_radios JSON>#<sum of clients or empty>
+# MAC addresses are used only as array keys inside this process; nothing
+# derived from them is printed. The JSON keys are written \"key\": so that
+# run_agent_metric_lint.php does not read them as new top-level metrics.
+function hexval(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+function jn(v) { return (v == "") ? "null" : v }
+function jq(v) { return (v == "") ? "null" : "\"" v "\"" }
+function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/[\001-\037]/, "", s); return s }
+function genof(fl) { if (fl ~ /\[EHT\]/) return 7; if (fl ~ /\[HE\]/) return 6; if (fl ~ /\[VHT\]/) return 5; if (fl ~ /\[HT\]/) return 4; return 0 }
+function reset() {
+    ssid = ""; ssid_set = 0; mode = ""; freq = ""; chan = ""; htmode = ""; txp = ""; noise = ""; enc = ""; phy = ""
+    nsta = 0; clients = ""; ninfo = 0; delete sig; delete snr; delete txr; delete mac_i
+    nst = 0; delete st_fl; delete st_oc; delete st_akm; delete st_mac; delete st_has
+    s_f = ""; s_use = 0; sv_a = ""; sv_b = ""; sv_r = ""; sv_bss = ""; sv_t = ""; htlist = ""; has6 = ""; caps_seen = 0
+}
+function flush_radio(   i, j, k, t, n, band, g, known, c6, oc_known, c5, akm_known, wpa2, wpa3, eap, ap_he, med, mn, smin, weak, wk, wgen, rs, gl, g4, g5, g6, g7, busy, other, bstate, da, db, dr, dbss, dt, el, line, q, encm, ent, six, five, v, h, cap6, m, out) {
+    if (radio == "") return
+    band = ""
+    if (freq != "") { if (freq + 0 >= 2400 && freq + 0 < 2500) band = "2.4GHz"; else if (freq + 0 >= 5150 && freq + 0 < 5925) band = "5GHz"; else if (freq + 0 >= 5925 && freq + 0 <= 7125) band = "6GHz" }
+    ap_he = (htmode ~ /^(HE|EHT)/)
+    # --- encryption mode. WPA version 1 next to a newer one is tested BEFORE
+    # plain WPA2: the psk-mixed mode of OpenWrt prints as "mixed WPA/WPA2 PSK (TKIP,
+    # CCMP)", and read as "wpa2" the owner would be told the network is fine
+    # while TKIP is still on the air.
+    encm = ""; ent = ""
+    if (enc != "" && enc != "unknown") {
+        ent = (enc ~ /802\.1X/) ? "true" : "false"
+        if (enc == "none") { encm = "open"; ent = "" }
+        else if (enc ~ /^WEP/) encm = "wep"
+        else if (enc ~ /OWE/) encm = "owe"
+        else if (enc ~ /(^| )WPA[\/ ]/ && enc ~ /WPA[23]/) encm = "wpa_wpa2"
+        else if (enc ~ /WPA2/ && enc ~ /WPA3/) encm = "wpa2_wpa3"
+        else if (enc ~ /WPA3/) encm = "wpa3"
+        else if (enc ~ /WPA2/) encm = "wpa2"
+        else if (enc ~ /WPA/) encm = "wpa"
+    }
+    # --- stations from assoclist: median / min signal, weakest SNR, mean TX rate
+    n = 0; rs = 0; rn = 0; smin = ""; mn = ""; weak = ""; wk = 0
+    for (i = 1; i <= nsta; i++) {
+        if (sig[i] != "") { n++; o[n] = sig[i] + 0; if (smin == "" || sig[i] + 0 < smin + 0) { smin = sig[i]; wk = i }; if (sig[i] + 0 <= -75) weak++
+            # An SNR printed next to an unknown noise is arithmetic on a zero,
+            # so it is absent here - and absent must not win the minimum.
+            if (snr[i] != "" && (mn == "" || snr[i] + 0 < mn + 0)) mn = snr[i] }
+        if (txr[i] != "") { rs += txr[i]; rn++ }
+    }
+    for (i = 2; i <= n; i++) { v = o[i]; for (j = i - 1; j >= 1 && o[j] > v; j--) o[j + 1] = o[j]; o[j + 1] = v }
+    med = ""; if (n > 0) med = (n % 2) ? o[(n + 1) / 2] : sprintf("%d", (o[n / 2] + o[n / 2 + 1]) / 2 - 0.5)
+    # --- stations from hostapd: generations, band capability, AKM
+    gl = g4 = g5 = g6 = g7 = 0; known = c6 = oc_known = c5 = akm_known = wpa2 = wpa3 = eap = 0; wgen = ""
+    for (k = 1; k <= nst; k++) {
+        if (!st_has[k]) continue
+        g = genof(st_fl[k]); if (g == 7) g7++; else if (g == 6) g6++; else if (g == 5) g5++; else if (g == 4) g4++; else gl++
+        if (wk && (st_mac[k] in mac_i) && mac_i[st_mac[k]] == wk) wgen = g
+        six = 0; five = 0; h = st_oc[k]
+        if (h != "") {
+            # byte 0 = current operating class; the list ends at the first 0x00 / 0x82 delimiter.
+            for (i = 1; i < length(h); i += 2) { v = hexval(substr(h, i, 1)) * 16 + hexval(substr(h, i + 1, 1))
+                if (i > 1 && (v == 0 || v == 130)) break
+                if (v >= 131 && v <= 137) six = 1; if (v >= 115 && v <= 130) five = 1 }
+            oc_known++; c5 += five
+        }
+        # 6 GHz needs HE. hostapd sets [HE] only while the AP itself runs HE/EHT, so a station
+        # without [HE] is known-not-capable only then.
+        if (g >= 6) { if (h != "") { known++; c6 += six } }
+        else if (ap_he) known++
+        else if (h != "") { known++; c6 += six }
+        if (st_akm[k] != "") { akm_known++
+            if (st_akm[k] ~ /^00-0f-ac-(2|6|4|19|20)$/) wpa2++; else if (st_akm[k] ~ /^00-0f-ac-(8|9|24|25)$/) wpa3++; else if (st_akm[k] ~ /^00-0f-ac-(1|3|5|11|12|13)$/) eap++ }
+        # Older hostapd builds print no AKMSuiteSelector (the whole second radio
+        # of the owner is such a build). SAE cannot run without management frame
+        # protection, so on wpa2 / wpa2_wpa3 personal a station WITHOUT [MFP] is
+        # a WPA2 one. A station WITH [MFP] stays unknown - it may be SAE or just
+        # WPA2 with PMF on. NOT on wpa_wpa2: there a station without [MFP] may
+        # equally be a WPA version 1 station, and counting it as WPA2 would hide
+        # exactly the TKIP client the mixed mode exists to surface.
+        else if (sta_src == "hostapd_cli" && (encm == "wpa2" || encm == "wpa2_wpa3") && ent != "true" && st_fl[k] !~ /\[MFP\]/) { akm_known++; wpa2++ }
+    }
+    if (clients == "" && sta_src != "none") clients = nst_assoc
+    # An empty network has zero weak clients - a measured zero. The signal
+    # statistics above stay null: there is nobody to measure.
+    if (weak == "" && (n > 0 || (clients != "" && clients + 0 == 0))) weak = 0
+    # --- channel airtime from survey deltas
+    busy = ""; other = ""; bstate = ""
+    if (freq != "") {
+        if (!iw) bstate = "not_installed"
+        else if (sv_a == "" || sv_b == "") bstate = "unsupported"
+        else {
+            bstate = "warming_up"
+            if ((radio in p_f) && p_f[radio] == freq) {
+                da = sv_a - p_a[radio]; db = sv_b - p_b[radio]; el = (now - p_ts[radio]) * 1000
+                if (da >= 10000 && db >= 0 && db <= da && da <= el * 1.2 + 2000) {
+                    busy = sprintf("%.1f", db * 100 / da); bstate = "measured"
+                    if (sv_t != "" && sv_bss != "" && p_t[radio] != "" && p_bss[radio] != "") {
+                        dt = sv_t - p_t[radio]; dbss = sv_bss - p_bss[radio]
+                        if (dt >= 0 && dbss >= 0 && dt + dbss <= db) other = sprintf("%.1f", (db - dt - dbss) * 100 / da) } }
+            }
+            printf "%s|%s|%s|%s|%s|%s|%s\n", radio, freq, sv_a, sv_b, sv_t, sv_bss, now >> nstate
+        }
+    }
+    out = "{\"radio\":\"" radio "\",\"ssid\":" (ssid_set ? "\"" esc(ssid) "\"" : "null") ",\"mode\":" jq(mode) ",\"band\":" jq(band) ",\"frequency_mhz\":" jn(freq) ",\"channel\":" jn(chan) \
+        ",\"htmode\":" jq(htmode) ",\"htmodes_supported\":" (htlist == "" ? "null" : "[" htlist "]") ",\"phy_has_6ghz\":" jn(has6) ",\"phy\":" jq(phy) \
+        ",\"encryption\":" jq(encm) ",\"encryption_enterprise\":" jn(ent) ",\"tx_power\":" jn(txp) ",\"noise\":" jn(noise) ",\"clients\":" jn(clients) \
+        ",\"signal_median\":" jn(med) ",\"signal_min\":" jn(smin) ",\"snr_min\":" jn(mn) ",\"clients_weak\":" jn(weak) ",\"weakest_gen\":" jn(wgen) \
+        ",\"bitrate_tx_avg_mbps\":" (rn ? sprintf("%.1f", rs / rn) : "null")
+    if (sta_src == "none") out = out ",\"clients_gen\":null"
+    else out = out ",\"clients_gen\":{\"source\":\"" sta_src "\",\"legacy\":" gl ",\"wifi4\":" g4 ",\"wifi5\":" g5 ",\"wifi6\":" g6 ",\"wifi7\":" (sta_src == "ubus" ? "null" : g7) "}"
+    out = out ",\"clients_caps_known\":" (sta_src == "none" ? "null" : known) ",\"clients_6ghz_capable\":" (sta_src == "none" ? "null" : c6) \
+        ",\"clients_opclass_known\":" (sta_src == "hostapd_cli" ? oc_known : "null") ",\"clients_5ghz_capable\":" (sta_src == "hostapd_cli" && band == "2.4GHz" ? c5 : "null") \
+        ",\"clients_akm_known\":" (sta_src == "hostapd_cli" ? akm_known : "null") ",\"clients_wpa2\":" (sta_src == "hostapd_cli" ? wpa2 : "null") \
+        ",\"clients_wpa3\":" (sta_src == "hostapd_cli" ? wpa3 : "null") ",\"clients_8021x\":" (sta_src == "hostapd_cli" ? eap : "null") \
+        ",\"busy_pct\":" jn(busy) ",\"busy_other_pct\":" jn(other) ",\"busy_state\":" jq(bstate) "}"
+    json = json (json == "" ? "" : ",") out
+    if (clients != "") { total += clients; have_total = 1 }
+}
+BEGIN {
+    while ((getline l < prev) > 0) { split(l, q, "|"); p_f[q[1]] = q[2]; p_a[q[1]] = q[3]; p_b[q[1]] = q[4]; p_t[q[1]] = q[5]; p_bss[q[1]] = q[6]; p_ts[q[1]] = q[7] }
+    close(prev); radio = ""
+}
+/^@@RADIO / { flush_radio(); reset(); radio = $2; sta_src = $3; iw = $4 + 0; sect = "info"; nst_assoc = 0; next }
+/^@@STA$/ { sect = "sta"; next }
+/^@@SURVEY$/ { sect = "survey"; next }
+/^@@CAPS$/ { sect = "caps"; next }
+sect == "info" {
+    if (!ninfo++ && match($0, /ESSID: ".*"$/)) { ssid = substr($0, RSTART + 8, RLENGTH - 9); ssid_set = 1 }
+    if (match($0, /Channel: [0-9]+ \([0-9]+\.[0-9]+ GHz\)/)) { t = substr($0, RSTART, RLENGTH); chan = t; sub(/^Channel: /, "", chan); sub(/ .*/, "", chan); sub(/^.*\(/, "", t); sub(/ GHz\)/, "", t); freq = sprintf("%d", t * 1000 + 0.5) }
+    if (match($0, /Mode: (Master|Client|Mesh Point|Ad-Hoc|Monitor|Unknown)/)) { t = substr($0, RSTART + 6, RLENGTH - 6); mode = (t == "Master") ? "ap" : (t == "Client") ? "client" : (t == "Mesh Point") ? "mesh" : (t == "Unknown") ? "" : "other" }
+    if (match($0, /HT Mode: (NOHT|(HT|VHT|HE|EHT)[0-9]+(\+80)?)/)) htmode = substr($0, RSTART + 9, RLENGTH - 9)
+    if (match($0, /Tx-Power: [0-9]+ dBm/)) { txp = substr($0, RSTART + 10, RLENGTH - 14) }
+    if (match($0, /Noise: -[0-9]+ dBm/)) { noise = substr($0, RSTART + 7, RLENGTH - 11) }
+    if ($0 ~ /^ +Encryption: /) { enc = $0; sub(/^ +Encryption: /, "", enc) }
+    if (match($0, /PHY name: phy[0-9]+/)) phy = substr($0, RSTART + 10, RLENGTH - 10)
+    if ($0 ~ /^[0-9A-Fa-f][0-9A-Fa-f](:[0-9A-Fa-f][0-9A-Fa-f])+  /) {
+        nsta++; mac_i[tolower($1)] = nsta; sig[nsta] = ($2 ~ /^-[0-9]+$/ && $3 == "dBm") ? $2 : ""
+        # iwinfo prints signal - noise even when the noise is unknown (it uses
+        # 0), e.g. "-47 dBm / unknown (SNR -47)". Only a line with a KNOWN
+        # noise field carries a real SNR, and a real one is never negative.
+        snr[nsta] = ""
+        if ($5 ~ /^-[0-9]+$/ && $6 == "dBm" && match($0, /\(SNR [0-9]+\)/)) snr[nsta] = substr($0, RSTART + 5, RLENGTH - 6)
+        if (sig[nsta] == "") snr[nsta] = ""
+        clients = nsta
+    }
+    else if ($0 ~ /^[ \t]+TX: [0-9.]+ MBit\/s/ && nsta) txr[nsta] = $2
+    else if ($0 ~ /^No station connected/) clients = 0
+    next
+}
+sect == "sta" && sta_src == "hostapd_cli" {
+    if ($0 ~ /^Failed to connect/) { sta_src = "none"; next }
+    if ($0 ~ /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f])+$/) { nst++; st_mac[nst] = $0; st_has[nst] = 0; next }
+    if (!nst) next
+    if ($0 ~ /^flags=/) { st_fl[nst] = $0; if ($0 ~ /\[ASSOC\]/) { st_has[nst] = 1; nst_assoc++ } }
+    else if ($0 ~ /^supp_op_classes=[0-9a-fA-F]+$/) st_oc[nst] = substr($0, 17)
+    else if ($0 ~ /^AKMSuiteSelector=/) st_akm[nst] = substr($0, 18)
+    next
+}
+sect == "sta" && sta_src == "ubus" {
+    # Depth 3 only, and written "key"[:] so that the metric lint does not read
+    # these ubus field names as payload keys: capabilities.vht sits one level
+    # deeper and must never become the VHT flag of the station.
+    if ($0 ~ /^\t\t"[0-9a-f:]+": \{$/) { nst++; t = $1; gsub(/[":]/, "", t); st_mac[nst] = ""; st_has[nst] = 0; st_fl[nst] = ""; next }
+    if (!nst) next
+    if ($0 ~ /^\t\t\t"assoc"[:] true/) { st_has[nst] = 1; nst_assoc++ }
+    else if ($0 ~ /^\t\t\t"ht"[:] true/) st_fl[nst] = st_fl[nst] "[HT]"
+    else if ($0 ~ /^\t\t\t"vht"[:] true/) st_fl[nst] = st_fl[nst] "[VHT]"
+    else if ($0 ~ /^\t\t\t"he"[:] true/) st_fl[nst] = st_fl[nst] "[HE]"
+    next
+}
+sect == "survey" {
+    if ($0 ~ /^Survey data from /) { s_f = ""; s_use = 0 }
+    else if ($0 ~ /^[ \t]+frequency:/) { s_f = $2; s_use = ($0 ~ /\[in use\]/ && s_f == freq) }
+    else if (s_use && $0 ~ /^[ \t]+channel active time:/) sv_a = $(NF - 1)
+    else if (s_use && $0 ~ /^[ \t]+channel busy time:/) sv_b = $(NF - 1)
+    else if (s_use && $0 ~ /^[ \t]+channel BSS receive time:/) sv_bss = $(NF - 1)
+    else if (s_use && $0 ~ /^[ \t]+channel transmit time:/) sv_t = $(NF - 1)
+    next
+}
+sect == "caps" {
+    if ($0 ~ /^(NOHT |HT20|VHT20|HE20|EHT20)/ || $0 ~ /^HT[0-9]/) { n = split($0, m, " "); for (i = 1; i <= n; i++) if (m[i] ~ /^(HT|VHT|HE|EHT)[0-9]+(\+80)?$/) htlist = htlist (htlist == "" ? "" : ",") "\"" m[i] "\"" }
+    else if ($0 ~ /\(Band: [0-9.]+ GHz, Channel/) { caps_seen = 1; if (has6 == "") has6 = "false"; if ($0 ~ /\(Band: 6 GHz/) has6 = "true" }
+    next
+}
+END { flush_radio(); printf "[%s]#%s", json, (have_total ? total : "") }
+'
+
+# --- WiFi per-radio detail (iwinfo, hostapd_cli/ubus, iw) ---
+#
+# Forks per radio: iwinfo info + iwinfo assoclist (the CLI takes exactly ONE
+# command per call - with more it reads the first word as a backend name,
+# prints nothing and exits 1), the station source, and one `iw survey dump`.
+# ONE awk parses every radio; the card facts (htmodelist, freqlist) change
+# only with the hardware and are cached for a day like the package list.
+WIFI_SURVEY_STATE="$BK_PRIVATE_DIR/wifi-survey.state"
 wifi_radios_json="[]"
-if command -v iwinfo >/dev/null 2>&1; then
-    wifi_radios_json=$(for radio in $(iwinfo 2>/dev/null | awk '/^[a-z0-9]/ {print $1}'); do
-        info=$(iwinfo "$radio" info 2>/dev/null)
-        ssid=$(echo "$info" | sed -n 's/.*ESSID: "\([^"]*\)".*/\1/p' | head -1 | sed 's/["\\]//g')
-        [ -z "$ssid" ] && ssid=$(echo "$info" | sed -n 's/.*ESSID: \([^ ]*\).*/\1/p' | head -1 | sed 's/["\\]//g')
-
-        channel=$(echo "$info" | grep -i "channel" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p')
-        [ -z "$channel" ] && channel=$(echo "$info" | grep -i "channel" | tr -cd '0-9')
-
-        band="2.4GHz"
-        # (In an ERE "\?" is a literal question mark, so the frequency forms
-        #  "(5.180 GHz)" never matched and everything fell through to the
-        #  HW-mode guess - where "802.11a" also swallowed 802.11ax radios.)
-        if echo "$info" | grep -qi -E '5\.[0-9]+ ?GHz|5[0-9]{3} ?MHz|a/n/ac|802\.11a([^cx]|$)|802\.11ac|5GHz'; then
-            band="5GHz"
-        elif echo "$info" | grep -qi -E '6\.[0-9]+ ?GHz|6[0-9]{3} ?MHz|6GHz'; then
-            band="6GHz"
-        elif [ -n "$channel" ] && [ "$channel" -gt 14 ] 2>/dev/null; then
-            band="5GHz"
+have_hapd=0; command -v hostapd_cli >/dev/null 2>&1 && have_hapd=1
+have_iw=0; command -v iw >/dev/null 2>&1 && have_iw=1
+wifi_list=""
+for _n in "$BK_SYS"/class/net/*; do [ -e "$_n/phy80211" ] && wifi_list="$wifi_list ${_n##*/}"; done
+[ -z "$wifi_list" ] && command -v iwinfo >/dev/null 2>&1 && wifi_list=$(iwinfo 2>/dev/null | awk '/^[a-z0-9]/ {print $1}')
+if [ -n "$wifi_list" ] && command -v iwinfo >/dev/null 2>&1; then
+    rm -f "$WIFI_SURVEY_STATE.new"
+    # busybox awk dies on a missing input FILE argument; `getline < prev` on a
+    # missing file is harmless, but the file is cheap to guarantee.
+    : >> "$WIFI_SURVEY_STATE"
+    _wifi_n=0
+    _wifi_out=$(for r in $wifi_list; do
+        case "$r" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+        _wifi_n=$((_wifi_n + 1)); [ "$_wifi_n" -gt 16 ] && break
+        src=none; sta=""
+        # Selected by EXIT STATUS, not by non-empty output: with nobody connected hostapd_cli prints nothing and
+        # exits 0 (hostapd_cli.c: STA-FIRST answers FAIL -> all_sta returns, main returns 0); a socket it cannot
+        # open exits 255. An empty answer is a MEASURED zero - it must not fall through to ubus.
+        if [ "$have_hapd" = 1 ] && sta=$(hostapd_cli -i "$r" all_sta 2>/dev/null); then src=hostapd_cli
+        elif sta=$(ubus call "hostapd.$r" get_clients 2>/dev/null) && [ -n "$sta" ]; then src=ubus
+        else sta=""; fi
+        sv=""; [ "$have_iw" = 1 ] && sv=$(iw dev "$r" survey dump 2>/dev/null)
+        # Card facts change only with the hardware: once a day, like the package list.
+        _cf="$BK_PRIVATE_DIR/wifi-caps.$r"; _cm=""
+        [ -f "$_cf" ] && _cm=$(date -r "$_cf" +%s 2>/dev/null)
+        case "$_cm" in ''|*[!0-9]*) _cm=0 ;; esac
+        if [ $((now_ts - _cm)) -ge "$HEAVY_OP_INTERVAL_SEC" ]; then
+            # The cache is kept only when it is not empty, so a failed call is
+            # not frozen for 24 h as "this card knows no modes and no bands".
+            { iwinfo "$r" htmodelist; iwinfo "$r" freqlist; } > "$_cf.tmp" 2>/dev/null
+            if [ -s "$_cf.tmp" ]; then mv "$_cf.tmp" "$_cf"; else rm -f "$_cf.tmp"; fi
         fi
-
-        tx_power=$(echo "$info" | grep -i "tx-power" | sed -n 's/.*Tx-Power: \([0-9-]*\).*/\1/p')
-        [ -z "$tx_power" ] && tx_power="null"
-        noise=$(echo "$info" | grep -i "noise" | sed -n 's/.*Noise: \([0-9-]*\).*/\1/p')
-        [ -z "$noise" ] && noise="null"
-
-        # Count MAC addresses of connected stations
-        clients=$(iwinfo "$radio" assoclist 2>/dev/null | grep -iE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | wc -l | tr -cd '0-9')
-        if [ -z "$clients" ] || [ "$clients" -eq 0 ] 2>/dev/null; then
-            if command -v hostapd_cli >/dev/null 2>&1; then
-                clients=$(hostapd_cli -i "$radio" all_sta 2>/dev/null | grep -c "^dot11RSNAStatsSTAAddress=" | tr -cd '0-9')
-            fi
-        fi
-
-        # Wi-Fi 6E support of the connected stations. A client lists the
-        # operating classes it can use when it associates; 131-137 are the
-        # 6 GHz ones, so a station on 2.4 or 5 GHz that lists one of them could
-        # use 6 GHz. hostapd_cli (package hostapd-utils) prints that list as
-        # supp_op_classes=<hex>. Without hostapd_cli, or when hostapd does not
-        # answer for this radio, support is unknown: null, never "none". A
-        # station that sent no list is simply not counted in clients_caps_known.
-        clients_6ghz_capable="null"
-        clients_caps_known="null"
-        if command -v hostapd_cli >/dev/null 2>&1 \
-            && _sta=$(hostapd_cli -i "$radio" all_sta 2>/dev/null) \
-            && ! printf '%s' "$_sta" | grep -q 'Failed to connect'; then
-            _caps=$(printf '%s\n' "$_sta" | awk '
-                function hexval(c) { return index("0123456789abcdef", tolower(c)) - 1 }
-                /^supp_op_classes=/ {
-                    h = substr($0, 17); known++; six = 0
-                    for (i = 1; i < length(h); i += 2) {
-                        v = hexval(substr(h, i, 1)) * 16 + hexval(substr(h, i + 1, 1))
-                        if (v >= 131 && v <= 137) six = 1
-                    }
-                    capable += six
-                }
-                END { printf "%d %d", known, capable }')
-            clients_caps_known=${_caps% *}
-            clients_6ghz_capable=${_caps#* }
-        fi
-
-        # A disabled radio prints "unknown" everywhere: that is no SSID, no
-        # channel, not channel 0 at 0 dBm with 0 dBm of noise.
-        if [ -n "$ssid" ] && [ "$ssid" != "unknown" ]; then ssid_json="\"$(json_str "$ssid")\""; else ssid_json="null"; fi
-        for _rv in channel tx_power noise clients clients_6ghz_capable clients_caps_known; do
-            eval "_rx=\$$_rv"
-            # shellcheck disable=SC2154
-            case "${_rx#-}" in (''|*[!0-9]*) eval "$_rv=null" ;; esac
-        done
-
-        # Channel utilisation: `iwinfo <dev> survey` is not a CLI subcommand
-        # (only the library and rpcd expose it), so this was one failing fork
-        # per radio that never produced a value. Not measured here: null.
-        busy_pct="null"
-
-        printf "{\"radio\":\"%s\",\"ssid\":%s,\"band\":\"%s\",\"channel\":%s,\"tx_power\":%s,\"noise\":%s,\"clients\":%s,\"clients_6ghz_capable\":%s,\"clients_caps_known\":%s,\"busy_pct\":%s}, " \
-            "$radio" "$ssid_json" "$band" "$channel" "$tx_power" "$noise" "$clients" "$clients_6ghz_capable" "$clients_caps_known" "$busy_pct"
-    done | sed 's/, $//')
-    [ -n "$wifi_radios_json" ] && wifi_radios_json="[$wifi_radios_json]" || wifi_radios_json="[]"
-    # Total clients = the sum over radios that reported a count.
-    wifi_clients_count=$(printf '%s' "$wifi_radios_json" | awk -F'clients":' 'NF > 1 { for (i = 2; i <= NF; i++) { v = $i; sub(/[^0-9].*/, "", v); if (v != "") { s += v; n++ } } } END { if (n) print s }')
-    [ -z "$wifi_clients_count" ] && wifi_clients_count="null"
+        printf '@@RADIO %s %s %s\n' "$r" "$src" "$have_iw"
+        # A command whose first letter is an s would be a scan, which takes the radio off its channel: never one of those two.
+        iwinfo "$r" info 2>/dev/null
+        iwinfo "$r" assoclist 2>/dev/null
+        printf '@@STA\n%s\n@@SURVEY\n%s\n@@CAPS\n' "$sta" "$sv"
+        [ -r "$_cf" ] && cat "$_cf"
+    done | awk -v prev="$WIFI_SURVEY_STATE" -v nstate="$WIFI_SURVEY_STATE.new" -v now="$now_ts" "$BK_WIFI_AWK")
+    # Shortest suffix (%#*): cut at the LAST '#'. An SSID such as "Domov #5 GHz"
+    # contains '#', and %%#* would cut the JSON there and send a broken payload.
+    wifi_radios_json=${_wifi_out%#*}
+    wifi_clients_count=${_wifi_out##*#}
+    case "$wifi_clients_count" in ''|*[!0-9]*) wifi_clients_count="null" ;; esac
+    if [ -f "$WIFI_SURVEY_STATE.new" ]; then mv "$WIFI_SURVEY_STATE.new" "$WIFI_SURVEY_STATE"; else rm -f "$WIFI_SURVEY_STATE"; fi
 fi
+[ -z "$wifi_radios_json" ] && wifi_radios_json="[]"
+
+# --- agent_tools: co tenhle router vubec umi zmerit ---------------------------
+#
+# Not a metric and not an alert: it is the REASON a value is null. Without
+# smartmontools the disk health is unknown, not healthy; without its drive
+# database the attribute names are generic guesses; without hostapd-utils the
+# Wi-Fi generations are unknown. The server turns a missing package into an
+# install hint and knows not to warn about a disk nobody can read.
+have_drivedb=0; [ -s /usr/share/smartmontools/drivedb.h ] && have_drivedb=1
+have_librespeed=0; command -v librespeed-cli >/dev/null 2>&1 && have_librespeed=1
+have_ethtool=0; command -v ethtool >/dev/null 2>&1 && have_ethtool=1
+have_tc=0; command -v tc >/dev/null 2>&1 && have_tc=1
+# 0/1 -> true/false without a fork: the flags decide, these are only how they
+# are written down. Every one of the seven is a strict boolean, never null -
+# "is the package there" is always measurable.
+tool_smartctl=false; [ "$have_smartctl" = 1 ] && tool_smartctl=true
+tool_drivedb=false; [ "$have_drivedb" = 1 ] && tool_drivedb=true
+tool_hostapd=false; [ "$have_hapd" = 1 ] && tool_hostapd=true
+tool_iw=false; [ "$have_iw" = 1 ] && tool_iw=true
+tool_librespeed=false; [ "$have_librespeed" = 1 ] && tool_librespeed=true
+tool_ethtool=false; [ "$have_ethtool" = 1 ] && tool_ethtool=true
+tool_tc=false; [ "$have_tc" = 1 ] && tool_tc=true
+pkg_manager_json="null"
+if command -v opkg >/dev/null 2>&1; then pkg_manager_json="\"opkg\""
+elif command -v apk >/dev/null 2>&1; then pkg_manager_json="\"apk\""
+fi
+# Written with escaped quotes for the same reason as the two embedded awk
+# programs: run_agent_metric_lint.php would otherwise read these nested names
+# as new top-level metrics that nobody stores.
+agent_tools_json=$(printf "{\"smartctl\":%s,\"smart_drivedb\":%s,\"hostapd_cli\":%s,\"iw\":%s,\"pkg_manager\":%s,\"smart_probe_age_s\":%s,\"smart_probe_running_s\":%s,\"librespeed_cli\":%s,\"ethtool\":%s,\"tc\":%s}" \
+    "$tool_smartctl" "$tool_drivedb" "$tool_hostapd" "$tool_iw" "$pkg_manager_json" \
+    "$smart_probe_age_s" "$smart_probe_running_s" "$tool_librespeed" "$tool_ethtool" "$tool_tc")
+[ -z "$agent_tools_json" ] && agent_tools_json="null"
 
 # --- LAN / DHCP ---
 lan_subnet=""
@@ -1998,9 +3470,16 @@ if command -v uci >/dev/null 2>&1; then
 fi
 
 # --- DNS Engine, Upstream Servers & DoT/DoH Encryption ---
-dns_engine="Dnsmasq"
-dns_encryption="Nešifrované DNS (UDP/53)"
-dns_servers="$wan_dns"
+#
+# G24: none of these three starts as a claim any more. "Dnsmasq" was printed
+# for every router whose resolver the chain below did not recognise - on
+# Turris that is kresd behind a firewall the agent could not read - and
+# "Nešifrované DNS (UDP/53)" told the owner their DNS was in the clear when
+# nobody had looked. Unset means null in the payload, and the app shows a dash.
+dns_engine=""
+dns_encryption=""
+dns_servers=""
+case "$wan_dns" in ''|null) ;; *) dns_servers="$wan_dns" ;; esac
 
 # Sifrovani se URCUJE Z DUKAZU, netvrdi se podle jmena resolveru:
 #  1) aktivni spojeni na port 853 (DoT) nebo 443 na znamy DoH endpoint,
@@ -2055,6 +3534,12 @@ elif pidof stubby >/dev/null 2>&1; then
 elif pidof https_dns_proxy >/dev/null 2>&1 || pidof cloudflared >/dev/null 2>&1 || pidof dnscrypt-proxy >/dev/null 2>&1; then
     dns_engine="DoH proxy"
     dns_encryption="DoH - běží DoH proxy (https_dns_proxy/cloudflared/dnscrypt)"
+elif pidof dnsmasq >/dev/null 2>&1; then
+    # The default of 0.1.6, now an answer instead of an assumption: the
+    # process really is running, and dnsmasq has no encrypted upstream at all,
+    # so "plain UDP/53" is a property of the program, not a guess.
+    dns_engine="Dnsmasq"
+    dns_encryption="Nešifrované DNS (UDP/53)"
 elif [ "$dns_active_853" = "1" ]; then
     dns_encryption="DoT - ověřeno (aktivní spojení na port 853)"
 fi
@@ -2069,7 +3554,9 @@ if [ -f /tmp/resolv.conf.auto ]; then
         fi
     fi
 fi
-[ -z "$dns_servers" ] && dns_servers="Výchozí poskytovatel (WAN)"
+# G24: no "Výchozí poskytovatel (WAN)" fallback. Neither netifd nor
+# resolv.conf.auto named a server, so the agent does not know one; an empty
+# value becomes null below.
 
 
 
@@ -2210,6 +3697,8 @@ fi
 [ -z "$top_cpu_json" ] && top_cpu_json="[]"
 [ -z "$top_ram_json" ] && top_ram_json="[]"
 [ -z "$wifi_radios_json" ] && wifi_radios_json="[]"
+[ -z "$storage_disks_json" ] && storage_disks_json="null"
+[ -z "$agent_tools_json" ] && agent_tools_json="null"
 [ -z "$interfaces_json" ] && interfaces_json="[]"
 [ -z "$wireguard_peers_json" ] && wireguard_peers_json="[]"
 [ -z "$mwan3_policies_json" ] && mwan3_policies_json="[]"
@@ -2254,6 +3743,42 @@ if [ -n "$inode_usage" ] && [ "$inode_usage" -eq "$inode_usage" ] 2>/dev/null; t
     inode_usage_json="$inode_usage"
 fi
 
+# G42: the run's own length, measured at the last possible moment - the
+# payload is the last thing this run builds. Both ends come from the kernel
+# uptime (bk_uptime_cs), so a clock step cannot forge it, and null means one
+# of the two reads failed: a 0 would claim the run took no time at all.
+agent_run_ms="null"
+bk_uptime_cs
+if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
+    agent_run_ms=$(( (_up_cs - BK_RUN_START_CS) * 10 ))
+fi
+
+# G42: the skipped runs since the last ACCEPTED report. One line per skip
+# ("l" = the previous run still held the lock, "p" = the POST failed), so the
+# count is what happened and not what a counter survived; every line read
+# here is dropped again once the server has taken this report. Counting is a
+# builtin read loop - the file holds a handful of bytes even on a router that
+# has been unreachable for a day.
+runs_skipped_lock=0
+runs_skipped_post=0
+bk_skipped_counted=0
+BK_SKIPPED_FILE="$BK_PRIVATE_DIR/skipped"
+if [ -f "$BK_SKIPPED_FILE" ]; then
+    while read -r _sk_line; do
+        bk_skipped_counted=$((bk_skipped_counted + 1))
+        # A router that cannot reach the server at all appends a line every
+        # minute and nothing ever drains it, so the loop is capped at about
+        # two weeks of minute runs: the counters saturate instead of costing
+        # more CPU every day. An accepted report drops the counted lines, so
+        # a backlog drains at this rate per report.
+        case "$_sk_line" in
+            l) runs_skipped_lock=$((runs_skipped_lock + 1)) ;;
+            p) runs_skipped_post=$((runs_skipped_post + 1)) ;;
+        esac
+        [ "$bk_skipped_counted" -ge 20000 ] && break
+    done < "$BK_SKIPPED_FILE"
+fi
+
 payload=$(cat <<EOF
 {
   "agent_key": "$(json_str "$AGENT_KEY")",
@@ -2262,6 +3787,10 @@ payload=$(cat <<EOF
   "heavy_op_interval_hours": ${HEAVY_OP_INTERVAL_HOURS:-24},
   "os": "$(json_str "$os_combined")",
   "cpu": $cpu,
+  "cpu_cores": $cpu_cores,
+  "cpu_core_max_pct": $cpu_core_max_pct,
+  "cpu_core_max_index": $cpu_core_max_index,
+  "cpu_core_max_softirq_pct": $cpu_core_max_softirq_pct,
   "ram": $ram,
   "ram_total_mb": $ram_total_mb,
   "ram_used_mb": $ram_used_mb,
@@ -2272,10 +3801,15 @@ payload=$(cat <<EOF
   "conntrack_pct": $conntrack_pct,
   "tcp_retrans": $tcp_retrans_json,
   "conntrack_count": $conntrack_count_json,
+  "conntrack_insert_failed": $conntrack_insert_failed,
+  "conntrack_drop": $conntrack_drop,
+  "conntrack_early_drop": $conntrack_early_drop,
   "inode_usage": $inode_usage_json,
   "upgradable_packages": $upgradable_packages,
   "wifi_clients_count": $wifi_clients_count,
   "wifi_radios": $wifi_radios_json,
+  "storage_disks": $storage_disks_json,
+  "agent_tools": $agent_tools_json,
   "interfaces": $interfaces_json,
   "discovered_services": $discovered_services_json,
   "lan_subnet": $(json_val "$lan_subnet"),
@@ -2284,9 +3818,9 @@ payload=$(cat <<EOF
   "dns_queries": $dns_queries,
   "dns_cache_hits": $dns_cache_hits,
   "dns_cache_misses": $dns_cache_misses,
-  "dns_engine": "$(json_str "$dns_engine")",
-  "dns_encryption": "$(json_str "$dns_encryption")",
-  "dns_servers": "$(json_str "$dns_servers")",
+  "dns_engine": $(json_val "$dns_engine"),
+  "dns_encryption": $(json_val "$dns_encryption"),
+  "dns_servers": $(json_val "$dns_servers"),
   "firewall_enabled": $firewall_enabled,
   "fw_accepted": $fw_accepted,
   "fw_dropped": $fw_dropped,
@@ -2364,10 +3898,26 @@ payload=$(cat <<EOF
   "auto_update": $([ "$AUTO_UPDATE" = "1" ] && echo 1 || echo 0),
   "oom_kills": $oom_kills,
   "boot_time": $boot_time,
+  "agent_time": $now_sec,
+  "agent_run_ms": $agent_run_ms,
+  "agent_prev_total_ms": $agent_prev_total_ms,
+  "runs_skipped_lock": $runs_skipped_lock,
+  "runs_skipped_post": $runs_skipped_post,
+  "dns_resolver_ok": $dns_resolver_ok,
   "dns_latency_ms": $dns_latency_ms,
   "wan_latency_ms": $wan_latency_ms,
   "wan_internet": $wan_internet,
   "wan_link_mbit": $wan_link_mbit,
+  "wan_link_dev": $(json_val "$wan_link_dev"),
+  "wan_carrier_down_count": $wan_carrier_down_count,
+  "wan_rx_mbps": $wan_rx_mbps,
+  "wan_tx_mbps": $wan_tx_mbps,
+  "wan_rx_errors": $wan_rx_errors,
+  "wan_tx_errors": $wan_tx_errors,
+  "wan_rx_dropped": $wan_rx_dropped,
+  "wan_tx_dropped": $wan_tx_dropped,
+  "wan_path": $wan_path_json,
+  "speedtest_active": $speedtest_active,
   "openvpn_tunnels": $openvpn_tunnels,
   "usb_devices": $usb_devices,
   "log_warnings_24h": $log_warnings_24h
@@ -2375,12 +3925,61 @@ payload=$(cat <<EOF
 EOF
 )
 
-echo "$payload" > /tmp/status-agent-openwrt-last-payload.json 2>/dev/null || true
+# The last payload is kept for debugging ("what did the router send?"). It
+# used to be a world-readable file in /tmp with the agent key inside: any
+# local user could read the key and then report, or fetch remote actions, in
+# the router's name. Now it sits in the private directory, is created 0600
+# and carries no key. The key is cut out by position, not by pattern: the
+# copy is rebuilt from the text after the first "agent_type", so no quote or
+# backslash inside a key can leave a piece of it behind. If the cut did not
+# work, nothing is written at all.
+BK_LAST_PAYLOAD_FILE="$BK_PRIVATE_DIR/last-payload.json"
+lp_mark='"agent_type"'
+lp_tail=${payload#*"$lp_mark"}
+case "$lp_tail" in
+    "$payload"|*'"agent_key"'*) rm -f "$BK_LAST_PAYLOAD_FILE" 2>/dev/null ;;
+    *) ( umask 077; printf '{\n  "agent_key": "",\n  %s%s\n' "$lp_mark" "$lp_tail" > "$BK_LAST_PAYLOAD_FILE" ) 2>/dev/null || true ;;
+esac
+
+# The SMART reading itself happens OUTSIDE this run. It costs a drive access
+# and can hang for minutes behind a bad USB bridge, while the report has to go
+# out within the minute - so the minute run only decides WHICH disks are due
+# and hands them to a detached child. A live PID in the lock (a refresh that is
+# still running, or a smartctl that could not be killed) means: spawn nothing.
+_smart_lock_live=""; [ -r "$BK_PRIVATE_DIR/smart.lock/pid" ] && read -r _smart_lock_live < "$BK_PRIVATE_DIR/smart.lock/pid"
+case "$_smart_lock_live" in ''|*[!0-9]*) _smart_lock_live="" ;; esac
+[ -n "$_smart_lock_live" ] && [ -d "/proc/$_smart_lock_live" ] && smart_due=""
+if [ "$have_smartctl" = 1 ] && [ -n "$smart_due" ]; then
+    _smart_spawn_prev=${smart_spawn_last%%|*}
+    case "$_smart_spawn_prev" in ''|*[!0-9]*) _smart_spawn_prev=0 ;; esac
+    # The same set spawned less than five minutes ago is not spawned again: a
+    # full tmpfs or a child that dies at once would otherwise start one every
+    # minute, which is exactly the drive hammering the interval exists to stop.
+    if [ "${smart_spawn_last#*|}" != "$smart_due" ] || [ $((now_ts - _smart_spawn_prev)) -ge 300 ]; then
+        printf '%s|%s\n' "$now_ts" "$smart_due" > "$BK_PRIVATE_DIR/smart.spawn" 2>/dev/null
+        if [ "$DRY_RUN" = "1" ]; then
+            # Inline, so --dry-run and the e2e are deterministic: the reading
+            # happens after the payload was built, exactly as the detached
+            # child does on a router, and the NEXT run reports what it found.
+            # shellcheck disable=SC2086
+            bk_smart_refresh $smart_due
+        elif command -v setsid >/dev/null 2>&1; then
+            # setsid: cron kills the whole process group when the parent ends.
+            # shellcheck disable=SC2086
+            ( setsid sh "$0" --smart-refresh $smart_due </dev/null >/dev/null 2>&1 & )
+        else
+            # shellcheck disable=SC2086
+            ( sh "$0" --smart-refresh $smart_due </dev/null >/dev/null 2>&1 & )
+        fi
+    fi
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
     printf '%s\n' "$payload"
     log_debug "Rezim --dry-run: data se neodesilaji."
-    exit 0
+    # With the response seam the run goes on: the canned answer takes the
+    # place of the POST and everything below runs as on a router.
+    [ -z "$BK_TEST_RESPONSE" ] && exit 0
 fi
 
 log_debug "Odesilam data na $API_URL..."
@@ -2388,7 +3987,11 @@ log_debug "Odesilam data na $API_URL..."
 http_code=""
 body=""
 
-if command -v curl >/dev/null 2>&1; then
+if [ -n "$BK_TEST_RESPONSE" ]; then
+    http_code=$(sed -n '1p' "$BK_TEST_RESPONSE" 2>/dev/null | tr -cd '0-9')
+    [ -z "$http_code" ] && http_code="000"
+    body=$(sed -n '2,$p' "$BK_TEST_RESPONSE" 2>/dev/null)
+elif command -v curl >/dev/null 2>&1; then
     response=$(curl -s -m 20 --connect-timeout 5 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d "$payload" "$API_URL")
     http_code=$(echo "$response" | tail -n 1)
     body=$(echo "$response" | head -n -1)
@@ -2424,12 +4027,71 @@ fi
 if [ "$http_code" = "200" ]; then
     log_debug "OK: Statistiky uspesne odeslany."
 
+    # G42: the report is stored, so the skips it carried are dealt with. Only
+    # the lines this run COUNTED are dropped - a skip appended while the POST
+    # was in flight belongs to the next report, and truncating the file would
+    # lose it. Same reason the file is rewritten instead of deleted: an empty
+    # file is a measured "nothing skipped", a missing one would be too on the
+    # next run, but the rewrite keeps a parallel writer's line.
+    if [ "$bk_skipped_counted" -gt 0 ] 2>/dev/null; then
+        _sk_i=0
+        : > "$BK_SKIPPED_FILE.tmp" 2>/dev/null
+        while read -r _sk_line; do
+            _sk_i=$((_sk_i + 1))
+            [ "$_sk_i" -le "$bk_skipped_counted" ] && continue
+            printf '%s\n' "$_sk_line" >> "$BK_SKIPPED_FILE.tmp" 2>/dev/null
+        done < "$BK_SKIPPED_FILE"
+        mv "$BK_SKIPPED_FILE.tmp" "$BK_SKIPPED_FILE" 2>/dev/null || rm -f "$BK_SKIPPED_FILE.tmp" 2>/dev/null
+    fi
+
+    # A bare 200 is not a receipt. The server wraps its speedtest INSERT loop
+    # in a try/catch so that a broken result never brings telemetry ingestion
+    # down - it logs and still answers 200. Committing on the status code
+    # alone would advance the mark with nothing stored and nobody told, and
+    # /tmp is a ramdisk: the next reboot would be the end of those results.
+    #
+    # So the answer must name the newest item it DEALT WITH (stored, already
+    # present, or rejected for good), echoed exactly as it was sent, and only
+    # up to that timestamp is the state advanced. A timestamp this report did
+    # not send is not an answer to this report and is ignored.
+    if [ -n "$speedtests_newest" ]; then
+        sp_ack=""
+        case "$body" in
+            *'"speedtests_acked":"'*)
+                sp_ack=${body#*'"speedtests_acked":"'}
+                sp_ack=${sp_ack%%'"'*}
+                ;;
+            *'"speedtests_acked": "'*)
+                sp_ack=${body#*'"speedtests_acked": "'}
+                sp_ack=${sp_ack%%'"'*}
+                ;;
+        esac
+        case "$speedtests_json" in
+            *"\"timestamp\":\"$sp_ack\""*) ;;
+            *) sp_ack="" ;;
+        esac
+        if [ -n "$sp_ack" ]; then
+            printf '%s\n' "$sp_ack" > "$LIBRESPEED_STATE_FILE" 2>/dev/null || true
+            # The pending mark becomes the sent one instead of being deleted:
+            # what was handed over is then still readable on the router.
+            mv "$BK_SPEED_PENDING" "$BK_PRIVATE_DIR/sent.state" 2>/dev/null || true
+            log_debug "Vysledky mereni rychlosti potvrzeny do $sp_ack."
+        else
+            log_message "VAROVANI: Server prijal hlaseni, ale nepotvrdil vysledky mereni rychlosti - posilaji se znovu."
+        fi
+    fi
+
     # Potvrzeni provedeni akce zpet na server - bez tohohle by agent_actions.status
     # zustal navzdy na 'sent' ("odeslano, ceka na potvrzeni") v administraci, i kdyz
     # se akce ve skutecnosti provedla. Samostatny lehky POST, protoze hlavni
     # telemetrie uz pro tento cyklus odesla.
     send_action_result() {
         ar_id="$1"; ar_status="$2"; ar_msg="$3"
+        if [ -n "$BK_TEST_RESPONSE" ]; then
+            # Response seam: the result lands next to the canned answer, nothing is POSTed.
+            printf '%s|%s|%s\n' "$ar_id" "$ar_status" "$ar_msg" >> "$BK_TEST_RESPONSE.results" 2>/dev/null
+            return 0
+        fi
         ar_payload="{\"agent_key\":\"$(json_str "$AGENT_KEY")\",\"action_result\":{\"action_id\":${ar_id},\"status\":\"$(json_str "$ar_status")\",\"message\":\"$(json_str "$ar_msg")\"}}"
         if command -v curl >/dev/null 2>&1; then
             curl -s -m 10 -X POST -H "Content-Type: application/json" -d "$ar_payload" "$API_URL" >/dev/null 2>&1
@@ -2442,15 +4104,80 @@ if [ "$http_code" = "200" ]; then
 
     # --- Spracovani vzdalenych akci (Remote Actions) ---
     REMOTE_ACTIONS_ENABLED="${REMOTE_ACTIONS_ENABLED:-0}"
-    ALLOWED_ACTIONS="${ALLOWED_ACTIONS:-restart_wan,restart_wireguard,reboot_router,renew_dhcp,restart_service,reconnect_pppoe}"
-    
+    # "-", not ":-": a list the owner left EMPTY in the cfg allows nothing.
+    # Only a cfg without the line gets the full default.
+    ALLOWED_ACTIONS="${ALLOWED_ACTIONS-restart_wan,restart_wireguard,reboot_router,renew_dhcp,restart_service,reconnect_pppoe}"
+    BK_NONCE_FILE="$BK_PRIVATE_DIR/action-nonces"
+
+    # bk_action_gate: what a correctly SIGNED action still has to pass. Sets
+    # act_refused to the reason, or leaves it empty. Until 0.1.7 the list
+    # above was parsed and never looked at, a signed answer could be replayed
+    # for as long as its timestamp held, and service_name went into a path
+    # as it came.
+    bk_action_gate() {
+        act_refused=""
+        # Single use. A signature is good for 30 s either side of its
+        # timestamp, so at most 60 s after its first use - that long the
+        # nonce is remembered. Written BEFORE the action runs: a reboot
+        # would not come back to do it.
+        case "$act_nonce" in
+            ''|*[!A-Za-z0-9]*) act_refused="nonce chybi nebo ma nepovolene znaky"; return 0 ;;
+        esac
+        nonce_keep=""; nonce_seen=0
+        if [ -f "$BK_NONCE_FILE" ]; then
+            while read -r n_ts n_val; do
+                case "$n_ts" in ''|*[!0-9]*) continue ;; esac
+                [ $((now_ts - n_ts)) -gt 60 ] && continue
+                [ "$n_val" = "$act_nonce" ] && nonce_seen=1
+                nonce_keep="$nonce_keep$n_ts $n_val
+"
+            done < "$BK_NONCE_FILE"
+        fi
+        if [ "$nonce_seen" = "1" ]; then
+            act_refused="nonce uz byl pouzit (opakovana odpoved)"; return 0
+        fi
+        # A nonce that cannot be remembered could be replayed: refuse.
+        if ! printf '%s%s %s\n' "$nonce_keep" "$now_ts" "$act_nonce" > "$BK_NONCE_FILE.tmp" 2>/dev/null \
+            || ! mv "$BK_NONCE_FILE.tmp" "$BK_NONCE_FILE" 2>/dev/null; then
+            act_refused="nonce nejde ulozit do $BK_PRIVATE_DIR"; return 0
+        fi
+        # Allow-list. The type is checked first: a comma inside it would
+        # match across two entries of the list.
+        case "$act_type" in
+            *[!a-z_]*) act_refused="neplatny typ akce"; return 0 ;;
+        esac
+        allowed_list=$(printf '%s' "$ALLOWED_ACTIONS" | tr -d ' \t\r')
+        case ",$allowed_list," in
+            *",$act_type,"*) ;;
+            *) act_refused="akce '$act_type' neni v ALLOWED_ACTIONS"; return 0 ;;
+        esac
+        # The name becomes part of a path run as root: no "/", no "..".
+        if [ "$act_type" = "restart_service" ]; then
+            svc_name=$(echo "$body" | sed -n 's/.*"service_name":"\([^"]*\)".*/\1/p')
+            case "$svc_name" in
+                ''|.*|*[!A-Za-z0-9_.-]*) act_refused="neplatny nazev sluzby"; return 0 ;;
+            esac
+        fi
+        return 0
+    }
+
     if [ "$REMOTE_ACTIONS_ENABLED" = "1" ] && [ -n "$body" ]; then
         act_id=$(echo "$body" | awk -F'"action_id":' '{print $2}' | awk -F'[,}]' '{print $1}' | tr -d '[:space:]')
         act_type=$(echo "$body" | awk -F'"action":' '{print $2}' | awk -F'[,"]' '{print $2}' | tr -d '[:space:]')
         act_ts=$(echo "$body" | awk -F'"timestamp":' '{print $2}' | awk -F'[,}]' '{print $1}' | tr -d '[:space:]')
         act_sig=$(echo "$body" | awk -F'"signature":' '{print $2}' | awk -F'[,"]' '{print $2}' | tr -d '[:space:]')
         act_nonce=$(echo "$body" | awk -F'"nonce":' '{print $2}' | awk -F'[,"]' '{print $2}' | tr -d '[:space:]')
-        
+        # Both are used as numbers BEFORE any signature is checked: the
+        # timestamp in shell arithmetic, the id unquoted in the result JSON.
+        # A letter in the timestamp ended the whole run on an arithmetic
+        # error - no service checks, no self-update that minute. Not a
+        # number = no action.
+        case "$act_id$act_ts" in
+            *[!0-9]*)
+                log_message "VAROVANI: Vzdalena akce ma neciselne action_id nebo timestamp, ignoruji ji."
+                act_id=""; act_ts="" ;;
+        esac
+
         if [ -n "$act_id" ] && [ -n "$act_type" ] && [ -n "$act_ts" ] && [ -n "$act_sig" ]; then
             now_ts=$(date +%s 2>/dev/null || echo 0)
             time_diff=$((now_ts - act_ts))
@@ -2463,7 +4190,16 @@ if [ "$http_code" = "200" ]; then
                     calc_sig=$(echo -n "$calc_str" | openssl dgst -sha256 -hmac "$AGENT_KEY" 2>/dev/null | awk '{print $NF}')
                 fi
                 
+                act_refused=""
+                # The gate only ever sees a verified signature: an unsigned
+                # answer learns nothing about the list and burns no nonce.
                 if [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
+                    bk_action_gate
+                fi
+                if [ -n "$act_refused" ]; then
+                    log_message "VAROVANI: Odmitnuta vzdalena akce $act_type (ID: $act_id): $act_refused"
+                    send_action_result "$act_id" "failed" "Odmitnuto: $act_refused"
+                elif [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
                     log_message "Aktivovana bezpecna vzdalena akce: $act_type (ID: $act_id)"
                     case "$act_type" in
                         restart_wan)
@@ -2489,9 +4225,9 @@ if [ "$http_code" = "200" ]; then
                             send_action_result "$act_id" "executed" "PPPoE znovu pripojeno"
                             ;;
                         restart_service)
-                            # Service name je v poli "service_name" v payloadu akce
-                            svc_name=$(echo "$body" | sed -n 's/.*"service_name":"\([^"]*\)".*/\1/p')
-                            if [ -n "$svc_name" ] && [ -x "/etc/init.d/$svc_name" ]; then
+                            # svc_name was read and checked by bk_action_gate.
+                            # -f as well as -x: a directory passes -x.
+                            if [ -n "$svc_name" ] && [ -f "/etc/init.d/$svc_name" ] && [ -x "/etc/init.d/$svc_name" ]; then
                                 /etc/init.d/"$svc_name" restart >/dev/null 2>&1 || true
                                 log_message "Restartovana sluzba: $svc_name"
                                 send_action_result "$act_id" "executed" "Sluzba '$svc_name' restartovana"
@@ -2506,6 +4242,11 @@ if [ "$http_code" = "200" ]; then
                             # ukonci proces, uz se nic dalsiho neprovede.
                             send_action_result "$act_id" "executed" "Router se restartuje"
                             /sbin/reboot >/dev/null 2>&1 || true
+                            ;;
+                        *)
+                            # On the list but unknown to this version: say
+                            # so, or the action stays "sent" for ever.
+                            send_action_result "$act_id" "failed" "Tato verze agenta akci '$act_type' nezna"
                             ;;
                     esac
                 else
@@ -2559,7 +4300,9 @@ if [ "$http_code" = "200" ]; then
 
         if [ -n "$sc_results" ]; then
             sc_payload="{\"agent_key\":\"$(json_str "$AGENT_KEY")\",\"service_check_results\":[$sc_results]}"
-            if command -v curl >/dev/null 2>&1; then
+            if [ -n "$BK_TEST_RESPONSE" ]; then
+                : # response seam: a dry run never POSTs
+            elif command -v curl >/dev/null 2>&1; then
                 curl -s -m 10 -X POST -H "Content-Type: application/json" -d "$sc_payload" "$API_URL" >/dev/null 2>&1
             elif command -v uclient-fetch >/dev/null 2>&1; then
                 uclient-fetch -q -T 10 -O /dev/null --post-data="$sc_payload" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
@@ -2575,7 +4318,8 @@ if [ "$http_code" = "200" ]; then
     # se stáhne do dočasného souboru, ověří se checksum i syntaxe (sh -n) a teprve
     # potom se atomicky nahradí tento skript. Při dalším spuštění (cron) už poběží
     # nová verze.
-    if [ "$AUTO_UPDATE" = "1" ]; then
+    # Never under the response seam: a test must not replace the script it runs.
+    if [ "$AUTO_UPDATE" = "1" ] && [ -z "$BK_TEST_RESPONSE" ]; then
         update_available=$(echo "$body" | grep -o '"update_available":[a-z]*' | cut -d: -f2)
         if [ "$update_available" = "true" ]; then
             update_url=$(echo "$body" | sed -n 's/.*"update_url":"\([^"]*\)".*/\1/p' | sed 's,\\/,/,g')
@@ -2631,5 +4375,9 @@ if [ "$http_code" = "200" ]; then
     log_debug "Hotovo."
 else
     log_message "CHYBA: Odeslani selhalo (HTTP $http_code). Odpoved: $body"
+    # G42: this minute produced no stored report either. The line is written
+    # here and not where the POST is built, so a transport that came back
+    # with any other code is counted too.
+    printf 'p\n' >> "$BK_SKIPPED_FILE" 2>/dev/null || true
     exit 1
 fi

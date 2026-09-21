@@ -1,20 +1,57 @@
 #!/bin/sh
-# hostapd_cli -i <iface> all_sta, as hostapd-utils prints it. wlan0 has two
-# stations: the first lists 6 GHz operating classes (0x83-0x86 = 131-134), the
-# second only 2.4/5 GHz ones (the real list from a Turris test log). Any other
-# interface has no hostapd behind it.
+# hostapd_cli -i <iface> all_sta, as hostapd-utils prints it.
+#   phy0-ap0, phy3-ap0: the owner's Omnia (omnia/README.md).
+#   wlan0: A = the real list of a 6 GHz capable client, with the bytes that
+#          follow its 0x00 delimiter; B = the real list from a Turris test
+#          log, ending in the 0x82 delimiter (not capable); C = a decoy: no
+#          6 GHz class before the 0x00, but 0x87 0x85 (135, 133) after it - a
+#          parser that scans every byte calls it capable; D = authenticated,
+#          never associated, so it is not a client.
+#   wlan7: an AP with nobody on it. hostapd_cli prints NOTHING and exits 0: a
+#          measured zero that must not fall through to ubus.
+#   anything else: no hostapd socket, exit 255.
+D=/work/stubs/omnia
 case "$*" in
+  "-i phy0-ap0 all_sta") cat $D/hostapd_all_sta.txt ;;
+  "-i phy3-ap0 all_sta") cat $D/hostapd_phy3_all_sta.txt ;;
+  "-i wlan7 all_sta") exit 0 ;;
   "-i wlan0 all_sta") cat <<'S'
-11:22:33:44:55:66
-flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT][HE]
+02:00:00:00:00:21
+flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT]
 aid=1
-supp_op_classes=51515253547374757677787980818283848586
-dot11RSNAStatsSTAAddress=11:22:33:44:55:66
-77:88:99:aa:bb:cc
+capability=0x431
+listen_interval=10
+dot11RSNAStatsSTAAddress=02:00:00:00:00:21
+dot11RSNAStatsSelectedPairwiseCipher=00-0f-ac-4
+AKMSuiteSelector=00-0f-ac-2
+supp_op_classes=80515354737475767778797a7b7c7d7e7f8081838485860082808785
+connected_time=100
+02:00:00:00:00:22
 flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT]
 aid=2
+capability=0x431
+listen_interval=10
+dot11RSNAStatsSTAAddress=02:00:00:00:00:22
+dot11RSNAStatsSelectedPairwiseCipher=00-0f-ac-4
+AKMSuiteSelector=00-0f-ac-2
 supp_op_classes=80737475767778797a7b7c7d7e7f808182
-dot11RSNAStatsSTAAddress=77:88:99:aa:bb:cc
+connected_time=100
+02:00:00:00:00:23
+flags=[AUTH][ASSOC][AUTHORIZED][WMM][MFP][HT]
+aid=3
+capability=0x431
+listen_interval=10
+dot11RSNAStatsSTAAddress=02:00:00:00:00:23
+dot11RSNAStatsSelectedPairwiseCipher=00-0f-ac-4
+AKMSuiteSelector=00-0f-ac-8
+supp_op_classes=515153547374750082808785
+connected_time=100
+02:00:00:00:00:24
+flags=[AUTH]
+aid=0
+capability=0x0
+listen_interval=0
+supp_op_classes=8083848586
 S
   ;;
   *) echo "Failed to connect to hostapd - wpa_ctrl_open: No such file or directory" >&2; exit 255 ;;

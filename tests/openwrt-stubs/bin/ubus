@@ -1,8 +1,74 @@
 #!/bin/sh
-# BK_STUB_NO_WAN=1 simulates a box with no netifd interface at all (access point).
+# ubus, as far as the agent asks it. Every call is logged.
+D=/work/stubs/omnia
+echo "$*" >> /work/out/ubus_calls.log
+# One station of `hostapd.<if> get_clients`, in libubox's tab-indented form.
+# The nested capabilities.vht table is there on purpose: a parser that greps
+# for "vht" anywhere reads it as the station's VHT flag.
+sta() { # MAC HT VHT HE MFP
+    printf '\t\t"%s": {\n\t\t\t"auth": true,\n\t\t\t"assoc": true,\n\t\t\t"authorized": true,\n' "$1"
+    printf '\t\t\t"wmm": true,\n\t\t\t"ht": %s,\n\t\t\t"vht": %s,\n\t\t\t"he": %s,\n\t\t\t"mfp": %s,\n' "$2" "$3" "$4" "$5"
+    printf '\t\t\t"capabilities": {\n\t\t\t\t"vht": {\n\t\t\t\t\t"su_beamformee": true\n\t\t\t\t}\n\t\t\t},\n\t\t\t"aid": 1\n\t\t}'
+}
+clients() { # FREQ then "MAC HT VHT HE MFP" per station
+    printf '{\n\t"freq": %s,\n\t"clients": {\n' "$1"; shift
+    _sep=""
+    for _s; do
+        printf '%s' "$_sep"
+        # shellcheck disable=SC2086
+        sta $_s
+        _sep=',
+'
+    done
+    printf '\n\t}\n}\n'
+}
+case "$*" in
+  # hostapd answers whether or not netifd knows an interface, so these come
+  # BEFORE the no-WAN guard: run 3 has no hostapd_cli and must find them.
+  # phy0-ap0 carries the flags of the real hostapd_cli capture. wlan0 has no
+  # object here: without hostapd_cli its clients stay of unknown generation.
+  "call hostapd.phy0-ap0 get_clients")
+    clients 5180 "02:00:00:00:00:04 true true true true" "02:00:00:00:00:03 true true false true" \
+                 "02:00:00:00:00:02 true false false true" "02:00:00:00:00:01 true true true true"; exit 0 ;;
+  "call hostapd.phy3-ap0 get_clients")
+    clients 2432 "02:00:00:00:00:31 true false false true" "02:00:00:00:00:32 true false false true" \
+                 "02:00:00:00:00:33 true false false false" "02:00:00:00:00:34 true false false false" \
+                 "02:00:00:00:00:35 true false false false" "02:00:00:00:00:36 true false false true"; exit 0 ;;
+  "call hostapd.wlan6 get_clients") clients 5955 "02:00:00:00:00:77 true false true true"; exit 0 ;;
+  # Nobody connected. hostapd_cli already said so (empty answer, exit 0); if
+  # the agent asks here as well, the fall-through shows in ubus_calls.log.
+  "call hostapd.wlan7 get_clients") printf '{\n\t"freq": 5500,\n\t"clients": {\n\t\t\n\t}\n}\n'; exit 0 ;;
+esac
+# BK_STUB_NO_WAN=1 simulates a box with no netifd interface at all (access
+# point): "no interface", not "no ubus" - hence below the hostapd cases.
 [ -n "$BK_STUB_NO_WAN" ] && exit 1
 case "$*" in
-  "call network.interface.wan status") echo '{"up":true,"proto":"dhcp","l3_device":"eth0"}' ;;
+  # BK_STUB_WAN picks the WAN line; jshn.sh carries the same switch and the
+  # comment that names every branch.
+  "call network.interface.wan status")
+    case "$BK_STUB_WAN" in
+      pppoe)  echo '{"up":true,"proto":"pppoe","device":"eth2.848","l3_device":"pppoe-wan"}' ;;
+      ppp0)   echo '{"up":true,"proto":"pppoe","device":"ppp0","l3_device":"ppp0"}' ;;
+      eth2)   echo '{"up":true,"proto":"dhcp","device":"eth2","l3_device":"eth2"}' ;;
+      brwan)  echo '{"up":true,"proto":"dhcp","device":"br-wan","l3_device":"br-wan"}' ;;
+      brwan2) echo '{"up":true,"proto":"dhcp","device":"br-wan2","l3_device":"br-wan2"}' ;;
+      dsa)    echo '{"up":true,"proto":"dhcp","device":"wan","l3_device":"wan"}' ;;
+      *)      echo '{"up":true,"proto":"dhcp","device":"eth0","l3_device":"eth0"}' ;;
+    esac ;;
   "call network.interface dump") echo '{"interface":[]}' ;;
+  # The real capture, byte for byte: tab indentation, empty arrays over three lines.
+  # BK_STUB_UBUS_DEV=lan1only: the same capture with the two gigabit cables
+  # out (lan0 and lan4 lose their "speed" line and their carrier), so the
+  # fastest port LINKED is lan1 at 100 while every port still SUPPORTS 1000.
+  # Capability and current state part company, which on the real capture they
+  # never do - both answer 1000 there.
+  "call network.device status")
+    if [ "$BK_STUB_UBUS_DEV" = lan1only ]; then
+      cat $D/ubus_network_device_status_lan1_only.json
+    else
+      cat $D/ubus_network_device_status.json
+    fi ;;
+  # The values themselves come from jshn.sh (root cursor); generic, no identifiers.
+  "call system board") echo '{"hostname":"turris","model":"Turris Omnia"}' ;;
   *) exit 1 ;;
 esac

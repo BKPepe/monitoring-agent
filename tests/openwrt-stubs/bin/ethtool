@@ -1,0 +1,30 @@
+#!/bin/sh
+# ethtool stub, kept OFF the default PATH: the owner's router does not have
+# the package (REAL_FACTS), so every payload run has to answer "not measured".
+# The wpath runs put it back to prove the parser.
+#
+#   BK_STUB_ETHTOOL=other   a driver whose MIB has neither counter name
+echo "$*" >> /work/out/ethtool_calls.log 2>/dev/null
+[ "$1" = "-S" ] || exit 1
+[ -n "$2" ] || exit 1
+if [ "$BK_STUB_ETHTOOL" = other ]; then
+  cat <<'M'
+NIC statistics:
+     rx_queue_0_packets: 1710000
+     rx_queue_0_drops: 9
+     tx_queue_0_packets: 78000
+M
+  exit 0
+fi
+# mvneta's HW MIB: the two names the driver accumulates ring drops into sit
+# among two dozen others, and the sum of THOSE two is the answer (5 + 2).
+cat <<'M'
+NIC statistics:
+     good_octets_received: 40558104195
+     good_frames_received: 33100000
+     bad_octets_received: 0
+     rx_discard: 5
+     rx_overrun: 2
+     mac_trans_error: 0
+     good_octets_sent: 2765975303
+M

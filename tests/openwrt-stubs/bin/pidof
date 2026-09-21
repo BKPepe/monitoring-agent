@@ -1,0 +1,13 @@
+#!/bin/sh
+# pidof stub for ONE process name. A speed test is running only when the
+# harness says so; the real applet would find nothing in this container, so
+# without this the "a test is running right now" branch could never be taken.
+# Every other question goes to the real applet, because the agent asks it
+# about kresd, openvpn and the service checks as well.
+if [ "$1" = "librespeed-cli" ]; then
+    echo "$*" >> /work/out/pidof_calls.log 2>/dev/null
+    [ "$BK_STUB_TEST_RUNNING" = 1 ] || exit 1
+    echo 4321
+    exit 0
+fi
+exec /bin/busybox pidof "$@"

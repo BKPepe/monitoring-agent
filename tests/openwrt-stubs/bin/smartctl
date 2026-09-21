@@ -1,0 +1,94 @@
+#!/bin/sh
+# smartctl --json=g (the flat "json.a.b = v;" form the agent reads with awk;
+# the harness has no jsonfilter, and neither has a stock router).
+#   /dev/sda     the owner's Kingston SSD (omnia/smartctl_sda.gron), exit 0
+#   /dev/sdb     USB HDD asleep: with `-n standby,3` exit 3 and no data;
+#                WITHOUT the flag it "spins up" and answers in full, so a
+#                dropped flag shows both in the call log and in the state
+#   /dev/sdc     unknown USB bridge, exit 1
+#   /dev/sdd     the same SSD with no drive database: attribute NAMES are
+#                generic guesses there (241 = Total_LBAs_Written, 231 =
+#                Temperature_Celsius) and must not be interpreted; written
+#                bytes can come from the device statistics page only
+#   /dev/nvme0n1 NVMe with critical_warning 4 and 2 media errors, exit 8
+#   /dev/sde     ignores TERM for 30 s: the watchdog has to reach for KILL
+# Without `-q noserial` two decoy identifiers are printed - if either shows
+# up in a payload or a cache, the flag was dropped.
+D=/work/stubs/omnia
+echo "$*" >> /work/out/smartctl_calls.log
+for _dev; do :; done
+case " $* " in *" -q noserial "*) _ids=0 ;; *) _ids=1 ;; esac
+ids() {
+    [ "$_ids" = 1 ] || return 0
+    echo 'json.serial_number = "DECOYSERIAL-0042";'
+    echo 'json.wwn.id = 4276994270;'
+}
+case "$_dev" in
+/dev/sda) cat $D/smartctl_sda.gron; ids; exit 0 ;;
+/dev/sdb)
+    case " $* " in *" -n standby,3 "*)
+        echo 'json.smartctl.messages[0].string = "Device is in STANDBY mode, exit(3)";'
+        echo 'json.smartctl.messages[0].severity = "information";'
+        echo 'json.smartctl.exit_status = 3;'
+        exit 3 ;;
+    esac
+    sed 's/^json\.rotation_rate = 0;/json.rotation_rate = 5400;/' $D/smartctl_sda.gron; ids; exit 0 ;;
+/dev/sdc)
+    echo 'json.smartctl.messages[0].string = "/dev/sdc: Unknown USB bridge [0x1f75:0x0621 (0x100)]";'
+    echo 'json.smartctl.messages[0].severity = "error";'
+    echo 'json.smartctl.messages[1].string = "Please specify device type with the -d option.";'
+    echo 'json.smartctl.exit_status = 1;'
+    exit 1 ;;
+/dev/sdd)
+    sed -e 's/^json\.in_smartctl_database = true;/json.in_smartctl_database = false;/' \
+        -e 's/\.name = "SSD_Life_Left";/.name = "Temperature_Celsius";/' \
+        -e 's/\.name = "Host_Writes_GiB";/.name = "Total_LBAs_Written";/' $D/smartctl_sda.gron
+    cat <<'M'
+json.ata_device_statistics = {};
+json.ata_device_statistics.pages = [];
+json.ata_device_statistics.pages[0] = {};
+json.ata_device_statistics.pages[0].number = 1;
+json.ata_device_statistics.pages[0].name = "General Statistics";
+json.ata_device_statistics.pages[0].table = [];
+json.ata_device_statistics.pages[0].table[0] = {};
+json.ata_device_statistics.pages[0].table[0].name = "Lifetime Power-On Resets";
+json.ata_device_statistics.pages[0].table[0].value = 230;
+json.ata_device_statistics.pages[0].table[1] = {};
+json.ata_device_statistics.pages[0].table[1].name = "Logical Sectors Written";
+json.ata_device_statistics.pages[0].table[1].value = 880803840;
+M
+    ids; exit 0 ;;
+/dev/nvme0n1) cat <<'M'
+json = {};
+json.smartctl = {};
+json.smartctl.exit_status = 8;
+json.device = {};
+json.device.name = "/dev/nvme0n1";
+json.device.type = "nvme";
+json.device.protocol = "NVMe";
+json.model_name = "Generic NVMe 256GB";
+json.smart_support = {};
+json.smart_support.available = true;
+json.smart_status = {};
+json.smart_status.passed = false;
+json.nvme_smart_health_information_log = {};
+json.nvme_smart_health_information_log.critical_warning = 4;
+json.nvme_smart_health_information_log.temperature = 41;
+json.nvme_smart_health_information_log.available_spare = 100;
+json.nvme_smart_health_information_log.percentage_used = 3;
+json.nvme_smart_health_information_log.data_units_written = 1200000;
+json.nvme_smart_health_information_log.power_cycles = 88;
+json.nvme_smart_health_information_log.power_on_hours = 4100;
+json.nvme_smart_health_information_log.unsafe_shutdowns = 12;
+json.nvme_smart_health_information_log.media_errors = 2;
+json.temperature = {};
+json.temperature.current = 41;
+json.power_cycle_count = 88;
+json.power_on_time = {};
+json.power_on_time.hours = 4100;
+M
+    ids; exit 8 ;;
+# exec: the PID the agent watches IS the sleeper, so KILL leaves no orphan behind.
+/dev/sde) trap '' TERM; exec sleep 30 ;;
+*) echo 'json.smartctl.exit_status = 2;'; exit 2 ;;
+esac

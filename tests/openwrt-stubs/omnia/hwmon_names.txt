@@ -1,0 +1,10 @@
+/sys/class/hwmon/hwmon0 f1072004mdiomii01
+/sys/class/hwmon/hwmon1 f10e4078.thermal
+/sys/class/hwmon/hwmon2 mv88e6xxx000
+/sys/class/hwmon/hwmon3 mv88e6xxx001
+/sys/class/hwmon/hwmon4 mv88e6xxx002
+/sys/class/hwmon/hwmon5 mv88e6xxx003
+/sys/class/hwmon/hwmon6 mv88e6xxx004
+/sys/class/hwmon/hwmon7 sfp
+/sys/class/hwmon/hwmon8 mt7915_phy0
+/sys/class/hwmon/hwmon9 i2csfp11

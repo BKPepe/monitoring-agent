@@ -1,0 +1,14 @@
+phy0-ap0  ESSID: "Domov 5 GHz"
+          Access Point: 02:00:00:00:00:10
+          Mode: Master  Channel: 36 (5.180 GHz)  HT Mode: HE80
+          Center Channel 1: 42 2: unknown
+          Tx-Power: 23 dBm  Link Quality: 54/70
+          Signal: -55 dBm  Noise: -92 dBm
+          Bit Rate: 736.8 MBit/s
+          Encryption: mixed WPA2/WPA3 PSK/SAE (CCMP)
+          Type: nl80211  HW Mode(s): 802.11ac/ax/b/g/n
+          Hardware: 14C3:7915 14C3:7915 [MediaTek MT7915E]
+          TX power offset: none
+          Frequency offset: none
+          Supports VAPs: yes  PHY name: phy0
+          MLO Capabilities: 0

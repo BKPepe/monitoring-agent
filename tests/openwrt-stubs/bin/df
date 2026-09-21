@@ -1,0 +1,13 @@
+#!/bin/sh
+# `df -PT` of the Omnia (/ and /srv are the same btrfs on sda1) plus a USB
+# disk whose mount point has a space, a # and quotes in it - a partition is
+# joined to its mount by device, and that name has to survive the trip.
+# Any other call is the container's own df.
+[ "$*" = "-PT" ] || exec /bin/df "$@"
+cat <<'M'
+Filesystem           Type       1024-blocks    Used Available Capacity Mounted on
+/dev/sda1            btrfs        117219800 21099564  95412180  19% /
+tmpfs                tmpfs          1030680    9500   1021180   1% /tmp
+/dev/sda1            btrfs        117219800 21099564  95412180  19% /srv
+/dev/sdb1            ext4         976284628 512000000 464284628  53% /mnt/usb #1 "disk"
+M

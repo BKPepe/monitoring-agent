@@ -1,9 +1,41 @@
 #!/bin/sh
+# uci stub. Every answer is a canned one; an option that is NOT set exits 1
+# with no output, exactly as `uci -q get` does, because the agent has to tell
+# "not configured" from "no uci at all".
+#
+#   BK_STUB_UCI_FLOW=off       firewall.@defaults[0].flow_offloading unset
+#   BK_STUB_UCI_STEERING=0     network.@globals[0].packet_steering='0'
+#                              (unset by default: the label must say "unset")
+#   BK_STUB_LIBRESPEED=off     librespeed.client.data_dir unset -> the agent
+#                              has to fall back to /tmp/librespeed-data
+#   BK_STUB_SPEED_DIR=<dir>    the data_dir uci reports
+#   BK_STUB_SQM=off            the queue on the WAN port is enabled='0' too,
+#                              so every section of the file is disabled
+echo "$*" >> /work/out/uci_calls.log 2>/dev/null
+# `uci -q get x` and `uci get x` are the same question here.
+set -- $(echo "$*" | sed 's/^-q //')
 case "$*" in
-  "get sqm.@queue[0].enabled") echo 1 ;;
-  "get sqm.@queue[0].download") echo 50000 ;;
-  "get sqm.@queue[0].upload") echo 10000 ;;
-  "get sqm.@queue[0].interface") echo eth0 ;;
+  "get firewall.@defaults[0].flow_offloading")
+    [ "$BK_STUB_UCI_FLOW" = off ] && exit 1
+    echo 1 ;;
+  "get firewall.@defaults[0].flow_offloading_hw")
+    [ "$BK_STUB_UCI_FLOW" = off ] && exit 1
+    echo 0 ;;
+  "get network.@globals[0].packet_steering")
+    [ -z "$BK_STUB_UCI_STEERING" ] && exit 1
+    echo "$BK_STUB_UCI_STEERING" ;;
+  "get librespeed.client.data_dir")
+    [ "$BK_STUB_LIBRESPEED" = off ] && exit 1
+    echo "${BK_STUB_SPEED_DIR:-/srv/speed}" ;;
+  "show sqm")
+    # The owner's real file: ONE stale section on the LAN conduit, disabled.
+    printf 'sqm.eth1=queue\nsqm.eth1.enabled=%s\nsqm.eth1.interface=%s\nsqm.eth1.download=%s\nsqm.eth1.upload=%s\n' \
+      "'0'" "'eth1'" "'85000'" "'10000'"
+    # And one queue on the WAN port. Its upload is 0: that direction is not
+    # shaped, which is not "0 kbit/s". With BK_STUB_SQM=off it is switched
+    # off while still naming the port the traffic really takes.
+    printf 'sqm.wan=queue\nsqm.wan.enabled=%s\nsqm.wan.interface=%s\nsqm.wan.download=%s\nsqm.wan.upload=%s\n' \
+      "$([ "$BK_STUB_SQM" = off ] && echo "'0'" || echo "'1'")" "'eth2'" "'50000'" "'0'" ;;
   "show dhcp") printf 'dhcp.@host[0]=host\ndhcp.@host[0].name=a\ndhcp.@host[1]=host\ndhcp.@host[2]=host\n' ;;
   *) exit 1 ;;
 esac
