@@ -414,4 +414,8 @@ sh /work/stubs/runs-g28.sh
 # the calling user, which is why this only ever failed in CI. The modes that
 # the tests actually assert are captured as text next to the artifacts
 # (*_mode.txt, *_dirmode.txt), so relaxing the COPIES proves nothing less.
-chmod -R a+rX "$OUT" 2>/dev/null || true
+#
+# Write, not just read: the harness deletes its temp directory on exit, and
+# removing a file needs write permission on the DIRECTORY holding it. With
+# a+rX the assertions passed and the cleanup then failed the whole job.
+chmod -R a+rwX "$OUT" 2>/dev/null || true
