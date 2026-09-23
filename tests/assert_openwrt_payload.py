@@ -1039,6 +1039,18 @@ checks.update({
     f"budget: the warm runs leave at most {PRIV_MAX_PAGES} tmpfs pages in the private directory (wbud2)":
         len(priv) > 0 and all(s is not None for s, _ in priv) and priv_pages <= PRIV_MAX_PAGES,
 })
+# The one check on the agent's SOURCE, not its output: busybox 1.37 reads a
+# backslash in the replacement text of sub()/gsub() the POSIX way ("\\\\" is
+# one backslash), 1.36 - the image this harness runs - the old way. An escaper
+# built on it passes every payload check here and prints raw quotes on a
+# newer router, whose report the server then refuses whole.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vps-agent", "agent_openwrt.sh"), encoding="utf-8") as _f:
+    agent_src = _f.read()
+awk_subs = re.findall(r'\bg?sub\(\s*/(?:\\.|[^/\\\n])*/\s*,\s*"((?:\\.|[^"\\\n])*)"', agent_src)
+checks.update({
+    "awk: žádné sub()/gsub() s obráceným lomítkem v náhradě - busybox 1.37+ ho čte jinak a uvozovky by šly do JSON syrové":
+        len(awk_subs) >= 50 and [r for r in awk_subs if "\\" in r] == [],
+})
 # Checks written down before the collector that can pass them: the stubs
 # already serve the real router, the Wi-Fi block of the agent is still the
 # 0.1.6 one. A pending check does not fail the run, but one that PASSES does,

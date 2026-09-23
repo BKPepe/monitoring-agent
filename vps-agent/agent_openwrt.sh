@@ -2390,7 +2390,12 @@ function jb(v) { return (v == "1") ? "true" : (v == "0" ? "false" : "null") }
 # A mount point is a path a person chose: it may hold a quote or a backslash,
 # and printed raw it makes the whole report invalid JSON, which the server
 # answers with 400 - the router would stop reporting over a directory name.
-function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/[\001-\037]/, "", s); return s }
+# Character by character, never through gsub(): what a backslash in the
+# replacement text means changed in busybox 1.37 ("\\\\" became ONE
+# backslash, as POSIX says), and the old gsub escaper then printed quotes
+# raw. A string with neither a quote nor a backslash, nearly every one,
+# goes back as it is.
+function esc(s,   o, c, i, n) { gsub(/[\001-\037]/, "", s); if (!index(s, "\\") && !index(s, "\"")) return s; o = ""; n = length(s); for (i = 1; i <= n; i++) { c = substr(s, i, 1); o = o ((c == "\\" || c == "\"") ? "\\" c : c) } return o }
 function hexn(s,   v) { s = tolower(s); sub(/^0x/, "", s); if (s !~ /^[0-9a-f]+$/) return ""; v = 0; while (s != "") { v = v * 16 + index("0123456789abcdef", substr(s, 1, 1)) - 1; s = substr(s, 2) } return v }
 FILENAME != "-" && $0 ~ /^D\|/ { n = split($0, f, "|"); nd++; name[nd] = f[2]; tr[nd] = f[3]; port[nd] = f[4]; size[nd] = f[5]; rot[nd] = f[6]; rem[nd] = f[7]; la[nd] = hexn(f[8]); lb[nd] = hexn(f[9]); eol[nd] = hexn(f[10])
     m = f[11]; for (i = 12; i <= n; i++) m = m "|" f[i]; gsub(/[^A-Za-z0-9 ._()+\/-]/, "", m); gsub(/  +/, " ", m); sub(/^ /, "", m); sub(/ $/, "", m); model[nd] = substr(m, 1, 64); next }
@@ -2491,7 +2496,10 @@ if [ "$io_accounting_json" = "true" ]; then
                 close(cf);
                 if (name != "") print wb "|" pid "|" name;
             }' 2>/dev/null | sort -rn | head -5 | awk -F'|' '
-            { nm = $3; gsub(/\\/, "\\\\", nm); gsub(/"/, "\\\"", nm);
+            # A process names itself, quotes included: escaped as in
+            # BK_STORAGE_AWK, character by character (see there).
+            function esc(s,   o, c, i, n) { gsub(/[\001-\037]/, "", s); if (!index(s, "\\") && !index(s, "\"")) return s; o = ""; n = length(s); for (i = 1; i <= n; i++) { c = substr(s, i, 1); o = o ((c == "\\" || c == "\"") ? "\\" c : c) } return o }
+            { nm = esc($3);
               printf "%s{\"pid\":%s,\"name\":\"%s\",\"write_bytes\":%s}", (n++ ? "," : "["), $2, nm, $1 }
             END { printf "%s", (n ? "]" : "[]") }'
     )
@@ -4112,7 +4120,8 @@ BK_WIFI_AWK='
 function hexval(c) { return index("0123456789abcdef", tolower(c)) - 1 }
 function jn(v) { return (v == "") ? "null" : v }
 function jq(v) { return (v == "") ? "null" : "\"" v "\"" }
-function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/[\001-\037]/, "", s); return s }
+# Escaped as in BK_STORAGE_AWK, character by character (see there).
+function esc(s,   o, c, i, n) { gsub(/[\001-\037]/, "", s); if (!index(s, "\\") && !index(s, "\"")) return s; o = ""; n = length(s); for (i = 1; i <= n; i++) { c = substr(s, i, 1); o = o ((c == "\\" || c == "\"") ? "\\" c : c) } return o }
 function genof(fl) { if (fl ~ /\[EHT\]/) return 7; if (fl ~ /\[HE\]/) return 6; if (fl ~ /\[VHT\]/) return 5; if (fl ~ /\[HT\]/) return 4; return 0 }
 function reset() {
     ssid = ""; ssid_set = 0; mode = ""; freq = ""; chan = ""; htmode = ""; txp = ""; noise = ""; enc = ""; phy = ""

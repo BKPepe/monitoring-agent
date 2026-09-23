@@ -201,6 +201,10 @@ with nobody on it.
   say null too. A change that saves forks lowers the budget in the same
   commit: a budget more than `FORK_SLACK` (9) above the measured run fails
   as well, so room cannot be bought by raising it.
+- **One check reads the agent's source**, not a payload: no awk `sub()` or
+  `gsub()` may carry a backslash in its replacement text. Busybox 1.37 reads
+  it differently from the 1.36 this harness runs, so an escaper built on it
+  passes every payload check here and breaks the JSON on a newer router.
 - **The log runs `wlog1..8` (W1-C3).** The payload runs read the plain
   `logread` stub (two error lines, a fixed date). `BK_STUB_LOG=pii` and
   `BK_STUB_LOG=formats` serve a log written relative to the stub's own clock,

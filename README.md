@@ -476,6 +476,12 @@ reading, so the server's `clock_skew_s` no longer includes the rest of the
 run; and on OpenWrt's integer `sort -n` the `top_*` lists now rank by the
 decimal value (0.1.8 broke ties on the text).
 
+One fix goes with it: busybox 1.37 and later read a backslash in awk's
+`gsub()` replacement text the POSIX way, and the escaper of Wi-Fi SSIDs, mount
+points and process names built on it printed their quotes raw. A quote in any
+of them made the report invalid JSON, which the server refuses whole. 0.1.9
+escapes them character by character, with the same output on busybox 1.36.
+
 ### What 0.1.7 stopped claiming, and what it now measures (OpenWrt)
 
 Five fields of 0.1.6 were defaults dressed up as readings. They are null now,
