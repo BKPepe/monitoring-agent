@@ -26,6 +26,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The tests import the Worker as an ES module from a plain .js file,
+      # which needs Node's module syntax detection (default from 22.7 on).
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # A failing test stops the deploy: the label the Worker posts is shown
+      # unchanged on the public status page.
+      - name: Unit tests
+        run: node --test tests/*.test.mjs
+
       - name: Deploy Worker & sync secrets
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

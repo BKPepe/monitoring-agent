@@ -8,6 +8,7 @@ second, parsers reading the right columns.
 | Script | What runs | Needs |
 | --- | --- | --- |
 | `run_linux_e2e.sh` | `agent.sh` and `agent.py` in Debian (real `/proc`, real `ps`), twice, the second run under load, against a stand-in TeamSpeak ServerQuery on 10011 (`linux/fake_ts3.py`) - and once more with `python3` made unusable, so the bash agent's `nc` transport is exercised too | docker, python3 |
+| `cloudflare-agent.test.mjs` (`node --test tests/*.test.mjs`) | the Worker's cron and `/run` handlers against a stubbed `fetch`: the location it posts takes city and country from the colo, never from the trace's `loc` or the `/run` caller; runs before every Worker deploy | node 22+ |
 | `run_openwrt_e2e.sh` | `agent_openwrt.sh` in busybox (ash, busybox awk/sed) with canned `wg`, `mwan3`, `tc`, `uci`, `logread`, `iwinfo`, `hostapd_cli`, `iw`, `smartctl`, `df`, `nft`, `ubus`, `ping`, `openssl` from `openwrt-stubs/bin` and a fake `/sys` + `/proc` from `openwrt-stubs/mkroot.sh`; six payload runs, then the scenario and hardening runs on canned server answers | docker, python3 |
 
 The stub outputs are what the real tools print (`wg show all dump`,

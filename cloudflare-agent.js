@@ -13,23 +13,39 @@
 const CHECK_TIMEOUT_MS = 8000;
 const SUPPORTED_TYPES = ['web', 'cpanel'];
 
-// IATA data center code → city name mapping (Cloudflare major PoPs)
-const COLO_CITY = {
-  AMS:'Amsterdam',ARN:'Stockholm',ATL:'Atlanta',BCN:'Barcelona',BEG:'Belgrade',
-  BER:'Berlin',BKK:'Bangkok',BOM:'Mumbai',BRU:'Brussels',BUH:'Bucharest',
-  CDG:'Paris',CWB:'Curitiba',DEL:'New Delhi',DFW:'Dallas',DUB:'Dublin',
-  DUS:'Düsseldorf',EWR:'Newark',EZE:'Buenos Aires',FCO:'Rome',FRA:'Frankfurt',
-  GIG:'Rio de Janeiro',GRU:'São Paulo',HAM:'Hamburg',HKG:'Hong Kong',
-  IAD:'Washington DC',IAH:'Houston',ICN:'Seoul',IST:'Istanbul',JNB:'Johannesburg',
-  KHI:'Karachi',KIX:'Osaka',LAX:'Los Angeles',LHR:'London',LIM:'Lima',
-  LIS:'Lisbon',MAA:'Chennai',MAD:'Madrid',MAN:'Manchester',MEL:'Melbourne',
-  MEX:'Mexico City',MIA:'Miami',MNL:'Manila',MRS:'Marseille',MUC:'Munich',
-  NRT:'Tokyo',ORD:'Chicago',OSL:'Oslo',OTP:'Bucharest',PHX:'Phoenix',
-  PNQ:'Pune',PRG:'Prague',QRO:'Queretaro',RUH:'Riyadh',SCL:'Santiago',
-  SEA:'Seattle',SFO:'San Francisco',SIN:'Singapore',SJC:'San Jose',
-  SOF:'Sofia',SYD:'Sydney',TLV:'Tel Aviv',TPE:'Taipei',VIE:'Vienna',
-  WAW:'Warsaw',YUL:'Montreal',YVR:'Vancouver',YYZ:'Toronto',ZRH:'Zürich',
+// IATA data center code → [city, ISO country] (Cloudflare major PoPs).
+// The country comes from here and nowhere else: the colo is the one thing
+// that says where the Worker ran. Codes as Cloudflare's trace prints them
+// (Berlin is TXL there, Bucharest OTP); cross-checked against the PoP list
+// on cloudflarestatus.com.
+const COLO = {
+  AMS:['Amsterdam','NL'],ARN:['Stockholm','SE'],ATL:['Atlanta','US'],
+  BCN:['Barcelona','ES'],BEG:['Belgrade','RS'],BER:['Berlin','DE'],
+  BKK:['Bangkok','TH'],BOM:['Mumbai','IN'],BRU:['Brussels','BE'],
+  BUH:['Bucharest','RO'],CDG:['Paris','FR'],CWB:['Curitiba','BR'],
+  DEL:['New Delhi','IN'],DFW:['Dallas','US'],DUB:['Dublin','IE'],
+  DUS:['Düsseldorf','DE'],EWR:['Newark','US'],EZE:['Buenos Aires','AR'],
+  FCO:['Rome','IT'],FRA:['Frankfurt','DE'],GIG:['Rio de Janeiro','BR'],
+  GRU:['São Paulo','BR'],HAM:['Hamburg','DE'],HKG:['Hong Kong','HK'],
+  IAD:['Washington DC','US'],IAH:['Houston','US'],ICN:['Seoul','KR'],
+  IST:['Istanbul','TR'],JNB:['Johannesburg','ZA'],KHI:['Karachi','PK'],
+  KIX:['Osaka','JP'],LAX:['Los Angeles','US'],LHR:['London','GB'],
+  LIM:['Lima','PE'],LIS:['Lisbon','PT'],MAA:['Chennai','IN'],
+  MAD:['Madrid','ES'],MAN:['Manchester','GB'],MEL:['Melbourne','AU'],
+  MEX:['Mexico City','MX'],MIA:['Miami','US'],MNL:['Manila','PH'],
+  MRS:['Marseille','FR'],MUC:['Munich','DE'],NRT:['Tokyo','JP'],
+  ORD:['Chicago','US'],OSL:['Oslo','NO'],OTP:['Bucharest','RO'],
+  PHX:['Phoenix','US'],PNQ:['Pune','IN'],PRG:['Prague','CZ'],
+  QRO:['Queretaro','MX'],RUH:['Riyadh','SA'],SCL:['Santiago','CL'],
+  SEA:['Seattle','US'],SFO:['San Francisco','US'],SIN:['Singapore','SG'],
+  SJC:['San Jose','US'],SLC:['Salt Lake City','US'],SOF:['Sofia','BG'],
+  SYD:['Sydney','AU'],TLV:['Tel Aviv','IL'],TPE:['Taipei','TW'],
+  TXL:['Berlin','DE'],VIE:['Vienna','AT'],WAW:['Warsaw','PL'],
+  YUL:['Montreal','CA'],YVR:['Vancouver','CA'],YYZ:['Toronto','CA'],
+  ZRH:['Zürich','CH'],
 };
+
+const EDGE_UNKNOWN = '🌐 Cloudflare Edge (AS13335 Cloudflare)';
 
 function countryFlag(code) {
   if (!code || code.length !== 2) return '🌐';
@@ -42,7 +58,10 @@ function countryFlag(code) {
  */
 async function detectLocation() {
   try {
-    // Cloudflare trace gives us the PoP (colo) and country of THIS worker invocation
+    // Only `colo` (the PoP that served THIS worker invocation) is used. The
+    // trace's `loc` is the country of the client IP, and inside a Worker the
+    // client is the Worker's own egress IP, geolocated as US wherever it runs:
+    // it put a US flag on Singapore, Warsaw and every other colo.
     const traceResp = await fetch('https://cloudflare.com/cdn-cgi/trace', {
       signal: AbortSignal.timeout(4000)
     });
@@ -50,29 +69,18 @@ async function detectLocation() {
     const kv = Object.fromEntries(
       traceText.trim().split('\n').map(l => l.split('='))
     );
-    const colo    = kv['colo'] || '';
-    const country = kv['loc']  || '';
-    const city    = COLO_CITY[colo] || colo;
-    const flag    = countryFlag(country);
-
-    const geo = [city, country].filter(Boolean).join(', ');
-    return `${flag} ${geo} (AS13335 Cloudflare)`.trim();
+    const colo = kv['colo'] || '';
+    // No colo (an error page instead of a trace) says nothing about where we
+    // ran, and the label is shown publicly - no empty or made-up place.
+    if (!/^[A-Z]{3}$/.test(colo)) return EDGE_UNKNOWN;
+    // A colo missing from the map keeps its code and gets the neutral flag
+    // rather than a guessed country; add it to COLO when it shows up.
+    const [city, cc] = COLO[colo] ?? [colo, ''];
+    const geo = [city, cc].filter(Boolean).join(', ');
+    return `${countryFlag(cc)} ${geo} (AS13335 Cloudflare)`;
   } catch (e) {
-    return '🌐 Cloudflare Edge (AS13335 Cloudflare)';
+    return EDGE_UNKNOWN;
   }
-}
-
-/**
- * Build location from incoming request's cf object (for /run HTTP handler).
- */
-function locationFromRequest(request) {
-  if (!request?.cf) return null;
-  const { asn, asOrganization, country, city } = request.cf;
-  const flag    = countryFlag(country);
-  const geo     = [city, country].filter(Boolean).join(', ');
-  const orgName = asOrganization ? asOrganization.split(' ').slice(0, 3).join(' ') : '';
-  const asnStr  = asn ? `AS${asn}${orgName ? ' ' + orgName : ''}` : orgName;
-  return `${flag} ${geo}${asnStr ? ' (' + asnStr + ')' : ''}`.trim() || null;
 }
 
 export default {
@@ -80,7 +88,9 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/run') {
-      const location = locationFromRequest(request) || await detectLocation();
+      // Same label as the cron run. request.cf describes whoever called /run
+      // (their city, country and ISP), not where the checks are made from.
+      const location = await detectLocation();
       const result   = await runMonitoring(env, location);
       return new Response(JSON.stringify(result, null, 2), {
         headers: { 'Content-Type': 'application/json' }
