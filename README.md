@@ -344,6 +344,99 @@ option, a `tc` call per queue and an `ubus` dump of every netdev.
   its own rate, because five gigabit ports behind one gigabit conduit share
   1 Gbit between them.
 
+### The LAN switch, port by port (OpenWrt, 0.1.8)
+
+`lan_ports` answers three questions about the wired side: which ports carry a
+link, which are idle, and how many devices sit behind each one. Unlike
+`wan_path` it is read on EVERY run - a cable is pulled and a laptop moves
+between minutes, not between hours - so the one `ubus call network.device
+status` per run serves both, and the hourly block reuses that same walk
+instead of asking again. The whole walk - the 27 kB dump plus the forwarding
+database - measures about 20 ms of shell on x86, so it fits the runtime budget
+several times over on the router's own CPU.
+
+- **Counts only, never identifiers.** A per-port device COUNT is not personal
+  data. MAC addresses, hostnames and IP addresses stay on the router: the
+  MACs are read by an `awk` that prints nothing but `dev count`, and a named
+  device list is a separate, opt-in feature. Nothing here is hashed and sent
+  either - a hashed MAC is still an identifier.
+- **Per port**: `link`, the negotiated `speed_mbit` and `duplex`, `max_mbit`
+  (what the port itself supports, from `link-supported`), `partner_max_mbit`
+  (what the other end advertises) and `clients`. A port with no carrier
+  prints no `speed` at all, so its rate and duplex are null - never 0, which
+  would read as a measurement nobody took. `partner_max_mbit` is what lets the
+  app say that lan1 at 100 Mbit is the other end's limit and not a fault.
+- **`conduits[]`** carries the DSA conduit with its own rate. On this hardware
+  every wired client shares one 1 Gbit link to the CPU, and that, not the
+  port, is the real ceiling.
+- **The counts** come from `bridge fdb show br <bridge>`. Not a client, and
+  dropped: `permanent` rows (the bridge's and the ports' own addresses), the
+  `vlan 4095 ... self` rows DSA keeps for its CPU port, the multicast groups
+  `33:33:*` and `01:00:5e:*` and broadcast. One MAC learnt in several VLANs is
+  one device. Only bridge members with devtype `dsa` are ports: the radios are
+  bridge members too (and their clients are counted per radio elsewhere), and
+  a USB LTE stick is an "ethernet" device that is not in the bridge at all.
+  The number is what the bridge has LEARNT, so the app should word it that way:
+  a port with a link and `clients: 0` holds a device that has not spoken since
+  the bridge last forgot it, not necessarily an empty socket.
+- **Null, never an empty list**, when the router cannot answer: no ubus dump,
+  no LAN bridge, no `bridge` command (`/usr/sbin/bridge` is looked at directly
+  as well, because cron hands a job a PATH without sbin on some builds), or a
+  switch that is not DSA - there the kernel does not say which physical port a
+  frame came in on. An empty list would claim there are no devices anywhere,
+  which is a different statement.
+
+### The error lines behind the log count (OpenWrt, 0.1.8)
+
+`log_errors_24h` counts the error lines among the last 500 lines of the log.
+The name is historic: logd is a ring buffer, and 500 of its lines can be ten
+minutes or three days. From 0.1.8 the report also says what the count covers
+and what it counted:
+
+- **`log_window_secs`**: seconds from the oldest of those lines to now, so the
+  app can say "in the last N hours". Null when no line has a readable time.
+- **`log_errors_recent`**: the newest 5 distinct error lines, newest first, as
+  `{"ts", "prog", "msg", "count"}`. The count's own regex picks them from the
+  same buffer, in ONE `awk` pass that now does the two counts as well (they
+  were two `grep -c` over the same lines). `ts` is epoch seconds: logd and
+  journalctl print local time without a zone, so the router's current offset
+  is applied, while syslog-ng on Turris writes ISO 8601 with its own. `prog`
+  is the program without its pid, null for a line with no date (its layout
+  is unknown), and `count` how often the line repeats in the buffer.
+- **Masked on the router.** A log line is the one thing in the report that can
+  carry what the owner never meant to send, so before it leaves: MAC `<mac>`,
+  IPv6 `<ipv6>`, IPv4 `<ipv4>`, e-mail `<email>`; names under a home domain
+  (`.lan`, `.local`, `.home`, `.internal`, `.localdomain`, `.home.arpa`,
+  `.fritz.box`), names that look like a device (`iphone`, `galaxy`,
+  `desktop-`, ...) and the client name dnsmasq writes after a MAC `<host>`;
+  hex runs of 12 or more (DUIDs, client ids) `<id>`. The mask runs BEFORE the
+  cut to 200 characters, so a cut cannot leave half an address that no mask
+  recognises. Every byte outside printable ASCII becomes `?`: the server
+  refuses invalid UTF-8, and one stray byte must not cost the whole report.
+  Lines are deduplicated on the masked text, so one failure against two
+  addresses is one line with `count: 2`; the kernel's printk stamp
+  (`[ 1234.567890]`) is dropped for the same reason, since `ts` already says
+  when.
+- **Cheap on a router in trouble.** The masks cost per character, and a
+  failing router can fill all 500 lines with errors. So a line is cut to 256
+  characters BEFORE masking - at a space, so no address is split, and marked
+  `...` - the same text is masked once, and a cheap test skips every mask
+  that cannot match. 500 error lines, each with its own address, take about
+  30 ms of busybox `awk` on an arm64 laptop core; a log without errors costs
+  nothing beyond the two counts.
+- **Two switches keep the lines at home; the counts go either way.**
+  `LOG_LINES_ENABLED=0` in `agent_openwrt.cfg` is the owner's, on the router.
+  The monitor's setting is the server's: it answers every report with
+  `"log_lines":true` or `"log_lines":false`, and the agent keeps a `false` as
+  `agent_openwrt.loglines-off` next to the cfg. That is on flash on purpose:
+  in `/var/run` a reboot would forget it and the first report would carry the
+  lines again. A `true` removes the file; an answer without the key (an older
+  server) changes nothing. `log_lines_state` names what applies - `on`,
+  `off_monitor` or `off_router` - so a missing list is never read as "no
+  errors".
+- **Null, never an empty list**, when there is no readable log. `[]` means the
+  log was read and holds no error line.
+
 ### What 0.1.7 stopped claiming, and what it now measures (OpenWrt)
 
 Five fields of 0.1.6 were defaults dressed up as readings. They are null now,

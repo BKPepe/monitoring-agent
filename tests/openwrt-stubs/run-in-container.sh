@@ -20,9 +20,10 @@
 # (one branch of the WAN walk each), wsmart, wlock, wspeed*/wack* (where the
 # speedtest results come from and what a 200 really acknowledges), wpath1..8
 # (the path the packets take), wfw1..3 (what "the firewall is up" is read
-# from), wdns1/wdns3 (the DNS probe's exit status) and wrun1..7 (the run's own
-# clock and the runs that produced no report) - and the hardening runs
-# (runs-g28.sh).
+# from), wdns1/wdns3 (the DNS probe's exit status), wrun1..7 (the run's own
+# clock and the runs that produced no report) and wlog1..9 (the masked error
+# lines behind the log count, and who may switch them off) - and the
+# hardening runs (runs-g28.sh).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -340,6 +341,27 @@ fresh
 BK_STUB_WAN=eth2 BK_STUB_SQM=off sh agent_openwrt.sh --dry-run > $OUT/wpath8.json 2> $OUT/wpath8.err
 fresh
 
+# --- wport1..wport3: the wired switch ports ---------------------------------
+# The payload runs already carry the owner's switch (lan0 3 devices, lan1 1
+# behind a 100 Mbit partner, lan2/lan3 unplugged, lan4 2) and wpath7 carries
+# the same switch with both gigabit cables out. What is left is the two ways
+# the answer is NOT a list of ports:
+#   wport1  a switch with nothing plugged in: every count is a measured 0,
+#           and the noise rows (permanent, vlan 4095, multicast) that are
+#           still there may not turn into devices.
+#   wport2  no `bridge` on the router: the section is null. An empty list
+#           would say "no devices anywhere", which is a different claim.
+#   wport3  ubus answers nothing at all: null again, and lan_port_cap too.
+fresh
+BK_STUB_FDB=empty sh agent_openwrt.sh --dry-run > $OUT/wport1.json 2> $OUT/wport1.err
+fresh
+stub_off bridge
+sh agent_openwrt.sh --dry-run > $OUT/wport2.json 2> $OUT/wport2.err
+stub_on bridge
+fresh
+( export BK_STUB_NO_WAN=1; sh agent_openwrt.sh --dry-run > $OUT/wport3.json 2> $OUT/wport3.err )
+fresh
+
 # --- wfw1..wfw3: what "the firewall is up" is read from (G20) ---------------
 # fw4 loads ONE table, `inet fw4`, and loads it whole. A kernel holding
 # somebody else's table, a kernel holding nothing, and a router without nft
@@ -401,6 +423,63 @@ fresh
 mv /tmp/fakeroot/proc/uptime /tmp/fakeroot/proc/uptime.off
 sh agent_openwrt.sh --dry-run > $OUT/wrun7.json 2> $OUT/wrun7.err
 mv /tmp/fakeroot/proc/uptime.off /tmp/fakeroot/proc/uptime
+fresh
+
+# --- wlog1..wlog9: the error lines behind log_errors_24h (W1-C3) -----------
+# The payload runs carry the plain stub log (two error lines, a fixed date);
+# these runs serve a log written relative to the stub's own clock, so every
+# ts and the window can be checked to the second.
+#   wlog1  the masking fixture (BK_STUB_LOG=pii): addresses, names, a DUID,
+#          an e-mail, bytes that are not ASCII, and a cut through an address
+#   wlog2  every date layout, in CEST: a zone-less time read without the
+#          router's offset would be two hours off
+#   wlog3  LOG_LINES_ENABLED=0 on the router: no lines, the counts still go
+#   wlog4  the server answers "log_lines":false - this report was already
+#          collected and carries the lines, the NEXT one must not
+#   wlog5  ... on a fresh private directory (what a reboot leaves) and an
+#          answer without the key: still off, the switch lives on flash
+#   wlog6  "log_lines": true (with a space): this report is still off, the
+#          switch is gone afterwards
+#   wlog7  and the lines are back
+#   wlog8  no log at all: every log field is null, never 0 and never []
+#   wlog9  the lines that would make masking expensive: cut to 256 before
+#          the masks, at a space; a printk stamp does not split repeats
+BK_LOG_OFF=/root/agent/agent_openwrt.loglines-off
+rm -f "$BK_LOG_OFF" $OUT/logread_now.log
+fresh
+# The stub notes its clock in logread_now.log; each run's note is kept.
+BK_STUB_LOG=pii sh agent_openwrt.sh --dry-run > $OUT/wlog1.json 2> $OUT/wlog1.err
+mv $OUT/logread_now.log $OUT/wlog1_now.txt
+cp "$PRIV/last-payload.json" $OUT/wlog1_last.json 2>/dev/null || true
+fresh
+TZ=CET-1CEST,M3.5.0,M10.5.0/3 BK_STUB_LOG=formats sh agent_openwrt.sh --dry-run > $OUT/wlog2.json 2> $OUT/wlog2.err
+mv $OUT/logread_now.log $OUT/wlog2_now.txt
+fresh
+echo "LOG_LINES_ENABLED=0" > /root/agent/agent_openwrt.cfg
+BK_STUB_LOG=pii sh agent_openwrt.sh --dry-run > $OUT/wlog3.json 2> $OUT/wlog3.err
+rm -f /root/agent/agent_openwrt.cfg
+fresh
+resp 200 '{"status":"ok","log_lines":false}'
+BK_STUB_LOG=pii STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlog4.json 2> $OUT/wlog4.err
+if [ -f "$BK_LOG_OFF" ]; then echo yes; else echo no; fi > $OUT/wlog4_flag.txt
+fresh
+resp 200 '{"status":"ok"}'
+BK_STUB_LOG=pii STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlog5.json 2> $OUT/wlog5.err
+if [ -f "$BK_LOG_OFF" ]; then echo yes; else echo no; fi > $OUT/wlog5_flag.txt
+resp 200 '{"status":"ok", "log_lines": true}'
+BK_STUB_LOG=pii STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlog6.json 2> $OUT/wlog6.err
+if [ -f "$BK_LOG_OFF" ]; then echo yes; else echo no; fi > $OUT/wlog6_flag.txt
+BK_STUB_LOG=pii sh agent_openwrt.sh --dry-run > $OUT/wlog7.json 2> $OUT/wlog7.err
+fresh
+# busybox's own logread applet answers nothing without its syslogd.
+stub_off logread
+sh agent_openwrt.sh --dry-run > $OUT/wlog8.json 2> $OUT/wlog8.err
+stub_on logread
+fresh
+rm -f $OUT/logread_now.log
+BK_STUB_LOG=cut sh agent_openwrt.sh --dry-run > $OUT/wlog9.json 2> $OUT/wlog9.err
+mv $OUT/logread_now.log $OUT/wlog9_now.txt
+rm -f "$BK_LOG_OFF" $OUT/logread_now.log
 fresh
 
 # Agent hardening (identity cache, last payload, remote actions); the version

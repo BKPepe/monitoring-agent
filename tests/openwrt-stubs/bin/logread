@@ -11,6 +11,74 @@ if [ "$BK_STUB_UPTIME_BUMP" = 1 ] && [ -f "$STATUS_TEST_ROOT/proc/uptime" ]; the
     awk -v u="$_u" -v i="$_i" 'BEGIN { printf "%.2f %.2f\n", u + 4.20, i }' \
         > "$STATUS_TEST_ROOT/proc/uptime.new" && mv "$STATUS_TEST_ROOT/proc/uptime.new" "$STATUS_TEST_ROOT/proc/uptime"
 fi
+# BK_STUB_LOG=pii|formats: a log written relative to NOW, so the agent's
+# log_window_secs and every line's ts can be checked to the second; the stub's
+# own clock is appended to /work/out/logread_now.log for the assertions.
+#   pii      the masking fixture. Every address and name below is made up or
+#            from a documentation range (RFC 5737, RFC 3849): nothing here is
+#            the owner's. They are in the lines ON PURPOSE - "masked before it
+#            leaves the router" is only provable when there is something to
+#            leak. Five distinct error lines, one of them twice.
+#   formats  every date layout the agent meets: logd, ISO 8601 with Z and
+#            with +02:00 (syslog-ng on Turris), BSD syslog without a year,
+#            and a line with no date at all; seven distinct error lines, so
+#            the two oldest are not sent.
+#   cut      the lines that would make the masks expensive (see below).
+bk_ld() { date -d "@$1" '+%a %b %e %H:%M:%S %Y'; }
+case "$BK_STUB_LOG" in
+    pii)
+        n=$(date +%s)
+        echo "pii $n" >> /work/out/logread_now.log
+        echo "$(bk_ld $((n - 7200))) daemon.info procd: - init complete -"
+        # The same failure against two addresses: one line, count 2 - and each
+        # address straddles the 200-character cut (it starts at 191), so a cut
+        # made before the mask would send "192.0.2" and "198.51.".
+        _pad=$(printf '%0182d' 0 | tr 0 x)
+        echo "$(bk_ld $((n - 3600))) daemon.err dnsmasq[124]: error: $_pad 192.0.2.44 unreachable"
+        echo "$(bk_ld $((n - 3000))) daemon.err dnsmasq[124]: error: $_pad 198.51.100.23 unreachable"
+        echo "$(bk_ld $((n - 2400))) daemon.err hostapd: wlan0: STA 02:5e:10:aa:bb:01 IEEE 802.1X: authentication failed for identity jana.novakova@example.org"
+        echo "$(bk_ld $((n - 1800))) daemon.err odhcpd[300]: Failed to send reply to fe80::1c2:3ff:fe44:5566%br-lan (DUID 000100012b3c4d5e025e10aabb04, 2001:db8:42::17)"
+        # dnsmasq writes DHCPACK at info; the level is raised here so that the
+        # client name after the MAC reaches the list and its mask is tested.
+        echo "$(date -u -d "@$((n - 1200 + 7200))" '+%Y-%m-%dT%H:%M:%S')+02:00 err dnsmasq-dhcp[124]: DHCPACK(br-lan) 192.0.2.61 02-5e-10-aa-bb-02 novakovi-ntb"
+        # Names, a quote, a backslash, UTF-8 and a lone 0xff byte.
+        printf '%s daemon.err kresd[3765]: error resolving novakovi-nas.lan. asked by Janas-iPhone, DESKTOP-7QK2M9A and Galaxy-S23-Jana: "quote" back\\slash \303\251 \377\n' "$(bk_ld $((n - 600)))"
+        echo "$(bk_ld $((n - 120))) kern.warn kernel: [ 1234.567890] warning: something odd"
+        echo "$(bk_ld $((n - 60))) daemon.info dnsmasq[124]: read /etc/hosts - 4 names"
+        exit 0
+        ;;
+    cut)
+        # What a router in trouble writes: a kernel error repeated with a new
+        # printk stamp each time, a line of 24 addresses (367 characters, cut
+        # to 256 before the masks, at a space, so "198.51.1" of the 17th never
+        # reaches them), and a 300-character word that has no space to cut at.
+        n=$(date +%s)
+        echo "cut $n" >> /work/out/logread_now.log
+        for _s in 1 2 3; do
+            echo "$(bk_ld $((n - 300 + _s))) kern.err kernel: [ 10$_s.00000$_s] mt7915e 0000:01:00.0: error: message timeout"
+        done
+        _ips=""
+        for _i in 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33; do _ips="$_ips 198.51.100.2$_i"; done
+        echo "$(bk_ld $((n - 120))) daemon.err dnsmasq[124]: error:$_ips"
+        echo "$(bk_ld $((n - 60))) daemon.err uhttpd[200]: error: $(printf '%0300d' 0 | tr 0 z)"
+        exit 0
+        ;;
+    formats)
+        n=$(date +%s)
+        echo "formats $n" >> /work/out/logread_now.log
+        echo "$(date -u -d "@$((n - 5400))" '+%Y-%m-%dT%H:%M:%S').123456Z err kresd[3765]: error: [system] bind to 127.0.0.1@53 failed"
+        echo "$(bk_ld $((n - 4800))) daemon.err uhttpd[200]: error: TLS handshake failed"
+        echo "$(bk_ld $((n - 4200))) daemon.err odhcpd[300]: Failed to send RS"
+        echo "$(date -u -d "@$((n - 3000 + 7200))" '+%Y-%m-%dT%H:%M:%S')+02:00 err kernel[]: [ 1234.567890] mv88e6085 f1072004.mdio-mii:10: error: link down"
+        echo "$(bk_ld $((n - 2400))) daemon.err procd: Instance ntpd::instance1 s in a crash loop 6 crashes, 0 seconds since last crash"
+        echo "$(date -d "@$((n - 1800))" '+%b %e %H:%M:%S') turris crond[99]: fatal: cannot open crontab"
+        echo "$(bk_ld $((n - 1200))) daemon.err uhttpd[200]: error: TLS handshake failed"
+        echo "$(bk_ld $((n - 600))) daemon.err uhttpd[200]: error: TLS handshake failed"
+        echo "    error: continuation of a stack trace"
+        echo "$(bk_ld $((n - 60))) daemon.info dnsmasq[124]: read /etc/hosts - 4 names"
+        exit 0
+        ;;
+esac
 cat <<'M'
 Tue Sep  2 09:00:01 2026 daemon.info dnsmasq[123]: started, version 2.90 cachesize 150
 Tue Sep  2 09:00:02 2026 daemon.info uhttpd[200]: starting

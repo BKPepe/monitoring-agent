@@ -54,6 +54,7 @@ if [ -f "$ScriptPath/agent_openwrt.cfg" ]; then
                     ALLOWED_ACTIONS) ALLOWED_ACTIONS="$val" ;;
                     SMART_INTERVAL_MINUTES) SMART_INTERVAL_MINUTES="$val" ;;
                     SMART_TIMEOUT_SEC) SMART_TIMEOUT_SEC="$val" ;;
+                    LOG_LINES_ENABLED) LOG_LINES_ENABLED="$val" ;;
                 esac
                 ;;
         esac
@@ -115,7 +116,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.7"
+AGENT_VERSION="0.1.8"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
 
@@ -138,6 +139,7 @@ for arg in "$@"; do
             echo "Konfigurace:"
             echo "  Cte nastaveni ze souboru agent_openwrt.cfg nebo z promendych prostredi:"
             echo "  STATUS_API_URL, STATUS_AGENT_KEY, STATUS_AUTO_UPDATE, STATUS_HEAVY_OP_INTERVAL_HOURS"
+            echo "  LOG_LINES_ENABLED=0 v agent_openwrt.cfg: radky chyb z logu neopusti router, posila se jen jejich pocet"
             echo ""
             echo "Volitelne balicky (bez nich zustanou jejich hodnoty prazdne, nikdy nulove):"
             echo "  smartmontools, smartmontools-drivedb   zdravi disku (SMART)"
@@ -2275,12 +2277,13 @@ bk_sqm_flush() {
 bk_lan_rec() {
     [ -n "$_lc_dev" ] || return 0
     case "$_lc_dev" in *[!A-Za-z0-9._-]*) return 0 ;; esac
-    _lc_recs="$_lc_recs$_lc_dev|$_lc_type|$_lc_cond|$_lc_speed|$_lc_cap$BK_NL"
+    _lc_recs="$_lc_recs$_lc_dev|$_lc_type|$_lc_cond|$_lc_speed|$_lc_cap|$_lc_car|$_lc_dup|$_lc_pcap$BK_NL"
 }
 
 bk_lan_caps() {
     lan_port_max=""; lan_port_cap=""; lan_conduits=""
     _lc_dev=""; _lc_type=""; _lc_speed=""; _lc_cond=""; _lc_cap=""
+    _lc_car=""; _lc_dup=""; _lc_pcap=""
     _lc_members=""; _lc_recs=""; _lc_arr=""; _lc_conds=""; _lc_any=0
     while IFS= read -r _lc_ln; do
         # A device opens at ONE tab; every key inside it is deeper, so the
@@ -2291,6 +2294,7 @@ bk_lan_caps() {
                 _lc_dev=${_lc_ln#*\"}
                 _lc_dev=${_lc_dev%%\"*}
                 _lc_type=""; _lc_speed=""; _lc_cond=""; _lc_cap=""; _lc_arr=""
+                _lc_car=""; _lc_dup=""; _lc_pcap=""
                 _lc_any=1
                 continue
                 ;;
@@ -2306,10 +2310,18 @@ bk_lan_caps() {
                 _lc_cond=${_lc_cond%%\"*}
                 case "$_lc_cond" in *[!A-Za-z0-9._-]*) _lc_cond="" ;; esac
                 ;;
+            "$_lc_t2"'"carrier": '*)
+                _lc_v=${_lc_ln#*: }
+                _lc_car=${_lc_v%,}
+                ;;
             "$_lc_t2"'"speed": "'*)
                 # "1000F" / "150H": F and H are the duplex, the digits the rate.
                 _lc_v=${_lc_ln#*: \"}
                 _lc_v=${_lc_v%%\"*}
+                case "$_lc_v" in
+                    *F) _lc_dup="full" ;;
+                    *H) _lc_dup="half" ;;
+                esac
                 _lc_v=${_lc_v%[FH]}
                 case "$_lc_v" in
                     ''|*[!0-9]*) ;;
@@ -2317,6 +2329,7 @@ bk_lan_caps() {
                 esac
                 ;;
             "$_lc_t2"'"link-supported": ['*) _lc_arr="ls" ;;
+            "$_lc_t2"'"link-partner-advertising": ['*) _lc_arr="lp" ;;
             "$_lc_t2"'"bridge-members": ['*) _lc_arr="bm" ;;
             "$_lc_t2"']'*) _lc_arr="" ;;
             "$_lc_t3"'"'*)
@@ -2336,6 +2349,23 @@ bk_lan_caps() {
                                 ;;
                         esac
                         ;;
+                    lp)
+                        # What the OTHER end offers. A port that supports
+                        # 1000 and links at 100 is not a fault when the
+                        # partner never advertised more - lan1 on the real
+                        # capture. An empty array leaves it null.
+                        _lc_v=${_lc_ln#*\"}
+                        _lc_v=${_lc_v%%\"*}
+                        _lc_v=${_lc_v%%base*}
+                        case "$_lc_v" in
+                            ''|*[!0-9]*) ;;
+                            *)
+                                if [ -z "$_lc_pcap" ] || [ "$_lc_v" -gt "$_lc_pcap" ]; then
+                                    _lc_pcap="$_lc_v"
+                                fi
+                                ;;
+                        esac
+                        ;;
                     bm)
                         if [ "$_lc_dev" = "$BK_LAN_BRIDGE" ]; then
                             _lc_v=${_lc_ln#*\"}
@@ -2350,7 +2380,7 @@ bk_lan_caps() {
     bk_lan_rec
     [ "$_lc_any" = 1 ] || return 0
 
-    while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp; do
+    while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp _lc_ca _lc_du _lc_pc; do
         [ -n "$_lc_d" ] || continue
         case " $_lc_members " in *" $_lc_d "*) ;; *) continue ;; esac
         case "$_lc_ty" in dsa|ethernet) ;; *) continue ;; esac
@@ -2377,7 +2407,7 @@ EOF_LAN
     lan_conduits="[]"
     for _lc_c in $_lc_conds; do
         _lc_cs=""
-        while IFS='|' read -r _lc_d _lc_ty _lc_c2 _lc_s _lc_cp; do
+        while IFS='|' read -r _lc_d _lc_ty _lc_c2 _lc_s _lc_cp _lc_ca _lc_du _lc_pc; do
             [ "$_lc_d" = "$_lc_c" ] && _lc_cs="$_lc_s"
         done <<EOF_CON
 $_lc_recs
@@ -2393,9 +2423,150 @@ EOF_CON
     esac
 }
 
+# How many DEVICES sit behind each wired port, from the bridge's forwarding
+# database. COUNTS ONLY: a MAC address is personal data and none ever leaves
+# this function - awk sees them, the payload gets a number. The named device
+# list is a separate, opt-in feature and is not built here.
+#
+# What is not a learnt client, from the owner's own `bridge fdb show`:
+#   permanent        the bridge's and the ports' own addresses
+#   vlan 4095 ... self  the rows DSA keeps for its CPU port
+#   33:33:* 01:00:5e:*  IPv6 and IPv4 multicast groups, ff:ff... broadcast
+# One MAC learnt in several VLANs is one device, so the pair mac+dev counts
+# once.
+bk_fdb_counts() {
+    "$1" fdb show br "$2" 2>/dev/null | awk '
+        {
+            mac = tolower($1); dev = ""; skip = 0
+            for (i = 2; i <= NF; i++) {
+                if ($i == "dev") dev = $(i + 1)
+                else if ($i == "permanent") skip = 1
+                else if ($i == "vlan" && $(i + 1) == "4095") skip = 1
+            }
+            if (skip || dev == "") next
+            if (mac ~ /^33:33:/ || mac ~ /^01:00:5e:/) next
+            if (mac == "ff:ff:ff:ff:ff:ff") next
+            if ((mac " " dev) in seen) next
+            seen[mac " " dev] = 1
+            n[dev]++
+        }
+        END { for (d in n) print d " " n[d] }
+    '
+}
+
+# The wired switch ports, built from the dump bk_lan_caps has just walked
+# (its records and the bridge member list are still in the globals) plus the
+# forwarding database. Per port: does it carry a link, at what rate and
+# duplex, what the port itself supports, what the OTHER end advertises - so
+# a 100 Mbit link can be named as the partner's limit instead of a fault -
+# and how many devices are behind it. The conduit is carried too: on DSA
+# every wired client shares that one link to the CPU, and it is the real
+# ceiling.
+#
+# Null, never an empty list, when the router cannot answer: no dump, no LAN
+# bridge, no `bridge` command, or a switch that is not DSA - there the kernel
+# does not tell which physical port a client came in on.
+bk_lan_ports() {
+    lan_ports_json="null"
+    [ "$_lc_any" = 1 ] || return 0
+    [ -n "$_lc_members" ] || return 0
+    _lp_bin=""
+    if command -v bridge >/dev/null 2>&1; then
+        _lp_bin=bridge
+    elif [ -x /usr/sbin/bridge ]; then
+        # cron hands a job a PATH without sbin on some builds; the tool is
+        # there, so look where OpenWrt puts it before giving up.
+        _lp_bin=/usr/sbin/bridge
+    else
+        return 0
+    fi
+    _lp_dsa=0
+    while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp _lc_ca _lc_du _lc_pc; do
+        [ -n "$_lc_d" ] || continue
+        case " $_lc_members " in *" $_lc_d "*) ;; *) continue ;; esac
+        [ "$_lc_ty" = dsa ] && _lp_dsa=1
+    done <<EOF_DSA
+$_lc_recs
+EOF_DSA
+    [ "$_lp_dsa" = 1 ] || return 0
+
+    _lp_counts=$(bk_fdb_counts "$_lp_bin" "$BK_LAN_BRIDGE")
+    _lp_ports=""; _lp_total=0; _lp_sep=""
+    while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp _lc_ca _lc_du _lc_pc; do
+        [ -n "$_lc_d" ] || continue
+        case " $_lc_members " in *" $_lc_d "*) ;; *) continue ;; esac
+        # Only the switch's own ports. A radio and a USB LTE modem are
+        # bridge members too and are not wired ports.
+        [ "$_lc_ty" = dsa ] || continue
+        _lp_n=0
+        while read -r _lp_k _lp_v; do
+            [ "$_lp_k" = "$_lc_d" ] || continue
+            # The count is fed into arithmetic below; anything that is not a
+            # number would end the run, and a number is all awk can print.
+            case "$_lp_v" in ''|*[!0-9]*) ;; *) _lp_n="$_lp_v" ;; esac
+        done <<EOF_CNT
+$_lp_counts
+EOF_CNT
+        _lp_total=$((_lp_total + _lp_n))
+        _lp_link=false
+        [ "$_lc_ca" = true ] && _lp_link=true
+        _lp_dq=null
+        [ -n "$_lc_du" ] && _lp_dq="\"$_lc_du\""
+        _lp_ports="$_lp_ports$_lp_sep{\"name\":\"$_lc_d\",\"link\":$_lp_link,\"speed_mbit\":${_lc_s:-null},\"duplex\":$_lp_dq,\"max_mbit\":${_lc_cp:-null},\"partner_max_mbit\":${_lc_pc:-null},\"clients\":$_lp_n}"
+        _lp_sep=","
+    done <<EOF_PORT
+$_lc_recs
+EOF_PORT
+    [ -n "$_lp_ports" ] || return 0
+
+    # The conduit's own record, looked up by the name the ports gave.
+    _lp_cond=""; _lp_sep=""
+    for _lp_c in $_lc_conds; do
+        _lp_cs=""; _lp_cd=""; _lp_cl=false
+        while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp _lc_ca _lc_du _lc_pc; do
+            if [ "$_lc_d" = "$_lp_c" ]; then
+                _lp_cs="$_lc_s"; _lp_cd="$_lc_du"
+                [ "$_lc_ca" = true ] && _lp_cl=true
+            fi
+        done <<EOF_CD
+$_lc_recs
+EOF_CD
+        _lp_dq=null
+        [ -n "$_lp_cd" ] && _lp_dq="\"$_lp_cd\""
+        _lp_cond="$_lp_cond$_lp_sep{\"dev\":\"$_lp_c\",\"link\":$_lp_cl,\"speed_mbit\":${_lp_cs:-null},\"duplex\":$_lp_dq}"
+        _lp_sep=","
+    done
+    lan_ports_json="{\"bridge\":\"$BK_LAN_BRIDGE\",\"ports\":[$_lp_ports],\"conduits\":[$_lp_cond],\"clients_total\":$_lp_total}"
+}
+
 _lc_t1='	'
 _lc_t2='		'
 _lc_t3='			'
+
+# The LAN switch, every run. The rest of the WAN path is configuration and is
+# read once an hour, but which cable is plugged in and how many devices are
+# behind it changes by the minute, so this one dump is taken each time - and
+# taken ONCE: the hourly block below reads the same records instead of asking
+# ubus a second time.
+lan_ports_json="null"
+lan_port_max=""; lan_port_cap=""; lan_conduits=""
+BK_LAN_BRIDGE="br-lan"
+if command -v ubus >/dev/null 2>&1; then
+    if bk_iface_load lan; then
+        _wp_lan=""
+        json_get_var _wp_lan l3_device
+        [ -z "$_wp_lan" ] && json_get_var _wp_lan device
+        # The name is passed to `bridge` and put in the payload, so it is held
+        # to what a netdev name may be - the same guard the port names get.
+        case "$_wp_lan" in *[!A-Za-z0-9._-]*) _wp_lan="" ;; esac
+        [ -n "$_wp_lan" ] && BK_LAN_BRIDGE="$_wp_lan"
+    fi
+    bk_lan_caps <<EOF_UBUS_DEV
+$(ubus call network.device status 2>/dev/null)
+EOF_UBUS_DEV
+    bk_lan_ports
+fi
+log_debug "LAN porty: most=${lan_port_max:-null} strop=${lan_port_cap:-null} bridge=$BK_LAN_BRIDGE"
 
 wp_ts=""; wp_body=""; wp_sq_en=""; wp_sq_dl=""; wp_sq_ul=""; wp_sq_dr=""; wp_end=""
 if [ -f "$BK_WAN_PATH_CACHE" ]; then
@@ -2543,20 +2714,9 @@ EOF_SQM
         wp_sqm="[$wp_sqm]"
     fi
 
-    # The LAN side. One ubus dump an hour, parsed with `read`.
-    lan_port_max=""; lan_port_cap=""; lan_conduits=""
-    if command -v ubus >/dev/null 2>&1; then
-        BK_LAN_BRIDGE="br-lan"
-        if bk_iface_load lan; then
-            _wp_lan=""
-            json_get_var _wp_lan l3_device
-            [ -z "$_wp_lan" ] && json_get_var _wp_lan device
-            [ -n "$_wp_lan" ] && BK_LAN_BRIDGE="$_wp_lan"
-        fi
-        bk_lan_caps <<EOF_UBUS
-$(ubus call network.device status 2>/dev/null)
-EOF_UBUS
-    fi
+    # The LAN side comes from the per-run walk above: the dump was already
+    # taken this run, and asking ubus for the same 27 kB twice a minute buys
+    # nothing.
 
     wan_path_json="{\"checked_at\":$now_ts,\"flow_offloading\":$wp_flow,\"flow_offloading_hw\":$wp_flow_hw,\"flowtable_active\":$wp_flowtable,\"packet_steering\":$wp_steering,\"packet_steering_active\":$wp_steer_active,\"wan_rps_mask\":$wp_rps_mask,\"wan_threaded_napi\":$wp_threaded,\"wan_rx_ring_drops\":$wp_ring,\"sqm\":$wp_sqm,\"lan_port_max_mbit\":${lan_port_max:-null},\"lan_port_cap_mbit\":${lan_port_cap:-null},\"lan_conduits\":${lan_conduits:-null}}"
 
@@ -2970,8 +3130,43 @@ fi
 # Log: busybox logread pouziva "<err>"/"<warn>", syslog-ng (Turris) pise
 # uroven slovem ("err:", "error", "warning"). Drivejsi grep na "<err>"
 # proto na Turrisu hlasil vzdycky nulu. Bez citelneho logu zustava null.
+#
+# W1-C3 (0.1.8): next to the two counts the report carries the error lines
+# behind log_errors_24h - the newest 5 distinct ones, each with its repeat
+# count - and log_window_secs, how far back the read buffer reaches. The
+# "24h" in the key is historic: logread is a ring buffer, and 500 of its
+# lines can be ten minutes or three days, so the app needs the real span to
+# say what the count covers.
+#
+# A log line is the one thing in this report that can carry what the owner
+# never meant to send - a phone's name in a DHCP line, an address in a failed
+# connection - so every line is masked HERE, before it can leave the router:
+# MAC, IPv6, IPv4, e-mail, names under the home domains (.lan, .local, ...),
+# names that look like a device (iphone, galaxy, desktop-, ...), the client
+# name dnsmasq writes after a MAC, and hex runs of 12+ (DUIDs, client ids).
+# Masking comes BEFORE the 200-character cut, so a cut can never leave half
+# an address that no mask recognises any more. Every byte outside printable
+# ASCII becomes "?": the server's JSON decoder refuses invalid UTF-8, and one
+# stray byte in a log line must not cost the whole report.
+#
+# Two switches keep the lines on the router; the counts are sent either way.
+# LOG_LINES_ENABLED=0 in agent_openwrt.cfg is the owner's, on the router. The
+# monitor's own setting is the server's: it names it in every answer, and the
+# answer is remembered in BK_LOG_LINES_OFF (see the answer handling below).
+# log_lines_state says which of them is in force, so an empty list is never
+# mistaken for "no errors".
 log_errors_24h="null"
 log_warnings_24h="null"
+log_window_secs="null"
+log_errors_recent="null"
+BK_LOG_LINES_OFF="$ScriptPath/agent_openwrt.loglines-off"
+case "$LOG_LINES_ENABLED" in
+    0|no|false|off) log_lines_state="off_router" ;;
+    *)
+        log_lines_state="on"
+        [ -f "$BK_LOG_LINES_OFF" ] && log_lines_state="off_monitor"
+        ;;
+esac
 log_buf=""
 if [ -n "$bk_log_full" ]; then
     log_buf=$(printf '%s\n' "$bk_log_full" | tail -n 500)
@@ -2983,10 +3178,177 @@ if [ -z "$log_buf" ] && [ -r /var/log/messages ]; then
     log_buf=$(tail -n 500 /var/log/messages 2>/dev/null)
 fi
 if [ -n "$log_buf" ]; then
-    log_errors_24h=$(echo "$log_buf" | grep -c -i -E '<err>|(^| )err(or)?[: ]|daemon\.err|kern\.err|critical|fatal|panic')
-    log_warnings_24h=$(echo "$log_buf" | grep -c -i -E '<warn>|(^| )warn(ing)?[: ]|daemon\.warn|kern\.warn')
-    [ -z "$log_errors_24h" ] && log_errors_24h=0
-    [ -z "$log_warnings_24h" ] && log_warnings_24h=0
+    _lg_lines=0
+    [ "$log_lines_state" = on ] && _lg_lines=1
+    # ONE awk over the buffer does all of it, the two counts included (they
+    # were two greps over the same lines; the regexes are unchanged). Line 1
+    # of its answer is "errors warnings window", line 2 the JSON list.
+    #
+    # Times become epoch seconds. logd and journalctl print local time with
+    # no zone, so the router's CURRENT offset is applied (a line from before
+    # a DST switch is then an hour off; the window labels a count, it is not
+    # a stopwatch) and without a readable offset those times stay null.
+    # syslog-ng on Turris writes ISO 8601 with its own offset, used as it is.
+    # The BSD form has no year: this year, or the last one when this year
+    # would put the line in the future.
+    #
+    # Deduplicated on program + MASKED text, so the same failure against two
+    # addresses is one line with count 2. The apostrophe of "Pepe's-iPhone"
+    # comes in through -v q: this program is single-quoted.
+    _lg_out=$(printf '%s\n' "$log_buf" | awk -v now="$now_ts" -v tz="$(date +%z 2>/dev/null)" -v lines="$_lg_lines" -v q="'" '
+        function days(y, m, d,    era, yoe, doy, doe) {
+            y -= (m <= 2)
+            era = int((y >= 0 ? y : y - 399) / 400)
+            yoe = y - era * 400
+            doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+            doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+            return era * 146097 + doe - 719468
+        }
+        function year_of(t,    z, era, doe, yoe, doy, mp) {
+            z = int(t / 86400) + 719468
+            era = int(z / 146097)
+            doe = z - era * 146097
+            yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365)
+            doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100))
+            mp = int((5 * doy + 2) / 153)
+            return yoe + era * 400 + (mp >= 10)
+        }
+        function hms(t,    h) { split(t, h, ":"); return h[1] * 3600 + h[2] * 60 + int(h[3]) }
+        # Matching runs on a lowercased copy, the text is cut from the original.
+        function repl(s, re, tag,    out) {
+            out = ""
+            while (match(tolower(s), re)) { out = out substr(s, 1, RSTART - 1) tag; s = substr(s, RSTART + RLENGTH) }
+            return out s
+        }
+        # A run of hex, dots and colons is IPv6 when it has "::" or 5+ colons
+        # and stands on its own; a clock (09:05:02) has neither, and the
+        # "d::" in the "ntpd::instance1" of procd is glued to a word.
+        function v6(s,    out, tok, n, pre, post) {
+            out = ""
+            while (match(tolower(s), /[0-9a-f.]*:[0-9a-f.:]*:[0-9a-f.:]*/)) {
+                tok = substr(s, RSTART, RLENGTH); n = gsub(/:/, ":", tok)
+                pre = RSTART > 1 ? substr(s, RSTART - 1, 1) : ""
+                post = substr(s, RSTART + RLENGTH, 1)
+                if ((index(tok, "::") || n >= 5) && pre !~ /[A-Za-z0-9_]/ && post !~ /[A-Za-z0-9_]/) tok = "<ipv6>"
+                out = out substr(s, 1, RSTART - 1) tok
+                s = substr(s, RSTART + RLENGTH)
+            }
+            return out s
+        }
+        # A home-domain name, also before a full stop - but not network.lan.proto.
+        function lanhost(s,    out, m) {
+            out = ""
+            while (match(tolower(s), LANRE "[.]?([^a-z0-9._-]|$)")) {
+                m = substr(s, RSTART, RLENGTH)
+                out = out substr(s, 1, RSTART - 1) "<host>"
+                s = substr(s, RSTART + RLENGTH)
+                match(tolower(m), "^" LANRE); out = out substr(m, RLENGTH + 1)
+            }
+            return out s
+        }
+        # Each mask is a scan of the line, so a cheap test skips the ones that
+        # cannot match (no "::" and under 5 colons: no IPv6). The name masks
+        # open with a character class that a scan retries at every position,
+        # which is why their bare word lists are asked first.
+        function mask(s,    c) {
+            s = repl(s, "[0-9a-f][0-9a-f]([:-][0-9a-f][0-9a-f])([:-][0-9a-f][0-9a-f])([:-][0-9a-f][0-9a-f])([:-][0-9a-f][0-9a-f])([:-][0-9a-f][0-9a-f])", "<mac>")
+            c = s
+            if (index(s, "::") || gsub(/:/, "", c) >= 5) s = v6(s)
+            if (index(s, ".")) s = repl(s, "[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+", "<ipv4>")
+            if (index(s, "@")) s = repl(s, "[a-z0-9._%+-]+@[a-z0-9._-]+", "<email>")
+            if (tolower(s) ~ LANTLD) s = lanhost(s)
+            if (tolower(s) ~ DEVW) s = repl(s, DEVRE, "<host>")
+            if (tolower(s) ~ /dhcp/) sub(/<mac> [^ ]+$/, "<mac> <host>", s)
+            return repl(s, "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]+", "<id>")
+        }
+        function jstr(s,    out, i, c) {
+            out = ""
+            for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); if (c == "\\" || c == "\"") out = out "\\"; out = out c }
+            return "\"" out "\""
+        }
+        BEGIN {
+            split("jan feb mar apr may jun jul aug sep oct nov dec", mn, " ")
+            for (i = 1; i <= 12; i++) mon[mn[i]] = i
+            LANTLD = "[.](lan|local|home|internal|localdomain|home[.]arpa|fritz[.]box)"
+            LANRE = "[a-z0-9_-]+([.][a-z0-9_-]+)*" LANTLD
+            DEVW = "(phone|ipad|ipod|macbook|imac|airpods|android|galaxy|pixel|oneplus|xiaomi|redmi|huawei|samsung|desktop-|laptop|thinkpad|playstation|xbox|chromecast|kindle|tablet)"
+            DEVRE = "[a-z0-9._" q "-]*" DEVW "[a-z0-9._" q "-]*"
+            tzok = (tz ~ /^[+-][0-9][0-9][0-9][0-9]$/); off = 0
+            if (tzok) { off = substr(tz, 2, 2) * 3600 + substr(tz, 4, 2) * 60; if (substr(tz, 1, 1) == "-") off = -off }
+            now += 0; ny = year_of(now + off)
+            first = -1; ne = 0; nw = 0; nm = 0
+        }
+        {
+            lt = -1; k = 1
+            if ($1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) {
+                lt = days(substr($1, 1, 4) + 0, substr($1, 6, 2) + 0, substr($1, 9, 2) + 0) * 86400 + hms(substr($1, 12, 8))
+                z = substr($1, 20); sub(/^[.][0-9]+/, "", z); gsub(/:/, "", z)
+                if (z ~ /^[+-][0-9][0-9][0-9][0-9]$/) { o = substr(z, 2, 2) * 3600 + substr(z, 4, 2) * 60; lt -= (substr(z, 1, 1) == "-") ? -o : o }
+                else if (z != "Z") lt = tzok ? lt - off : -1
+                k = 2
+            } else if ((tolower($2) in mon) && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ && $5 ~ /^[0-9][0-9][0-9][0-9]$/) {
+                lt = tzok ? days($5 + 0, mon[tolower($2)], $3 + 0) * 86400 + hms($4) - off : -1
+                k = 6
+            } else if ((tolower($1) in mon) && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) {
+                lt = days(ny, mon[tolower($1)], $2 + 0) * 86400 + hms($3) - off
+                if (lt > now + 86400) lt = days(ny - 1, mon[tolower($1)], $2 + 0) * 86400 + hms($3) - off
+                # The year comes from the clock: without one the date is unknown.
+                if (!tzok || now <= 0) lt = -1
+                k = 4
+            }
+            if (lt >= 0 && first < 0) first = lt
+            low = tolower($0)
+            if (low ~ /<warn>|(^| )warn(ing)?[: ]|daemon\.warn|kern\.warn/) nw++
+            if (low !~ /<err>|(^| )err(or)?[: ]|daemon\.err|kern\.err|critical|fatal|panic/) next
+            ne++
+            if (!lines) next
+            # The program is the first "name[pid]:" within three fields of the
+            # date: past the facility.level of logd, the level word of Turris
+            # and the host name of BSD syslog, which is never sent - not even
+            # when no program follows it. A line without a date has no known
+            # layout, and its "error:" is not a program: it goes whole, with a
+            # null program.
+            p = 0
+            if (k > 1) for (i = k; i <= NF && i < k + 3; i++) if ($i ~ /^[A-Za-z0-9_.-]+(\[[0-9]*\])?:$/) { p = i; break }
+            prog = ""; start = (k == 4) ? 5 : k
+            if (p) { prog = $p; sub(/(\[[0-9]*\])?:$/, "", prog); if (length(prog) > 64) prog = ""; start = p + 1 }
+            msg = ""
+            for (i = start; i <= NF; i++) msg = msg (i > start ? " " : "") $i
+            # The printk stamp is seconds since boot, which ts says better; left
+            # in, every repeat of a kernel error would be a line of its own.
+            sub(/^\[ *[0-9]+\.[0-9]+\] */, "", msg)
+            gsub(/[^ -~]/, "?", msg)
+            # The masks cost per character and a router in trouble can fill all
+            # 500 lines with errors, so a line is cut to 256 BEFORE masking - at
+            # a space, so no address is split, and marked "...". A repeat of the
+            # same text is masked once.
+            if (length(msg) > 256) { msg = substr(msg, 1, 256); if (!sub(/ [^ ]*$/, " ...", msg)) msg = "..." }
+            if (!(msg in memo)) memo[msg] = mask(msg)
+            msg = memo[msg]
+            key = prog "|" msg
+            at[++nm] = key; cnt[key]++; last[key] = nm; lts[key] = lt; lprog[key] = prog; lmsg[key] = msg
+        }
+        END {
+            printf "%d %d %s\n", ne, nw, (first >= 0 && now >= first) ? sprintf("%.0f", now - first) : "null"
+            if (!lines) { print "null"; exit }
+            out = ""; n = 0
+            for (i = nm; i >= 1 && n < 5; i--) {
+                key = at[i]
+                if (last[key] != i) continue
+                n++; m = lmsg[key]
+                if (length(m) > 200) m = substr(m, 1, 197) "..."
+                out = out (n > 1 ? "," : "") "{\"ts\":" (lts[key] >= 0 ? sprintf("%.0f", lts[key]) : "null") ",\"prog\":" (lprog[key] != "" ? jstr(lprog[key]) : "null") ",\"msg\":" jstr(m) ",\"count\":" cnt[key] "}"
+            }
+            print "[" out "]"
+        }')
+    _lg_head=${_lg_out%%"$BK_NL"*}
+    read -r log_errors_24h log_warnings_24h log_window_secs <<EOF_LOGSTAT
+$_lg_head
+EOF_LOGSTAT
+    log_errors_recent=${_lg_out#*"$BK_NL"}
+    # Only a JSON list reaches the payload. A failed awk leaves every value
+    # empty, and the number check below turns those into null, never 0.
+    case "$log_errors_recent" in '['*']') ;; *) log_errors_recent="null" ;; esac
 fi
 
 # --- Tailscale / ZeroTier / UPS (NUT) - vse null-safe, bez nastroje se neposila nic ---
@@ -3706,7 +4068,7 @@ fi
 [ -z "$mwan3_active_gw" ] && mwan3_active_gw="null"
 
 # Sanitace všech numerických proměnných
-for var in cpu ram ram_total_mb ram_used_mb ram_available_mb ram_free_mb swap_pct entropy conntrack_pct upgradable_packages wifi_clients_count dhcp_leases_count dhcp_reservations_count dns_queries dns_cache_hits dns_cache_misses fw_accepted fw_dropped fw_rejected net net_ipv4_kbps net_ipv6_kbps hdd disk_io_write btrfs_errors load1 load5 load15 uptime_sec temperature wan_uptime sqm_download_kbps sqm_upload_kbps sqm_dropped sqm_ecn lte_rsrp lte_rsrq lte_sinr wan_reconnect_count wan_last_reconnect installed_packages log_errors_24h log_warnings_24h; do
+for var in cpu ram ram_total_mb ram_used_mb ram_available_mb ram_free_mb swap_pct entropy conntrack_pct upgradable_packages wifi_clients_count dhcp_leases_count dhcp_reservations_count dns_queries dns_cache_hits dns_cache_misses fw_accepted fw_dropped fw_rejected net net_ipv4_kbps net_ipv6_kbps hdd disk_io_write btrfs_errors load1 load5 load15 uptime_sec temperature wan_uptime sqm_download_kbps sqm_upload_kbps sqm_dropped sqm_ecn lte_rsrp lte_rsrq lte_sinr wan_reconnect_count wan_last_reconnect installed_packages log_errors_24h log_warnings_24h log_window_secs; do
     eval "val=\$$var"
     # A case pattern instead of `echo | grep` - that was ~45 pipelines a run.
     _num="${val#-}"
@@ -3890,6 +4252,9 @@ payload=$(cat <<EOF
   "wan_last_reconnect": $wan_last_reconnect,
   "installed_packages": $installed_packages,
   "log_errors_24h": $log_errors_24h,
+  "log_window_secs": $log_window_secs,
+  "log_errors_recent": $log_errors_recent,
+  "log_lines_state": "$log_lines_state",
   "tailscale_up": $tailscale_up_json,
   "tailscale_peers": $tailscale_peers_json,
   "zerotier_networks": $zerotier_networks_json,
@@ -3917,6 +4282,7 @@ payload=$(cat <<EOF
   "wan_rx_dropped": $wan_rx_dropped,
   "wan_tx_dropped": $wan_tx_dropped,
   "wan_path": $wan_path_json,
+  "lan_ports": $lan_ports_json,
   "speedtest_active": $speedtest_active,
   "openvpn_tunnels": $openvpn_tunnels,
   "usb_devices": $usb_devices,
@@ -4080,6 +4446,30 @@ if [ "$http_code" = "200" ]; then
             log_message "VAROVANI: Server prijal hlaseni, ale nepotvrdil vysledky mereni rychlosti - posilaji se znovu."
         fi
     fi
+
+    # The monitor's switch for the log lines (W1-C3). The server names it in
+    # every answer; an answer without it (an older server) changes nothing.
+    # "false" is looked for first, so an answer carrying both keeps the lines
+    # at home. Kept on flash next to the cfg, not in /var/run: an opt-out has
+    # to survive a reboot, or the first report of every boot would carry the
+    # lines again. Written only when the answer differs from what is kept.
+    case "$body" in
+        *'"log_lines":false'*|*'"log_lines": false'*)
+            if [ ! -f "$BK_LOG_LINES_OFF" ]; then
+                if : > "$BK_LOG_LINES_OFF" 2>/dev/null; then
+                    log_message "Server vypnul odesilani radku z logu pro tento monitor."
+                else
+                    log_message "VAROVANI: Server vypnul odesilani radku z logu, ale $BK_LOG_LINES_OFF nejde zapsat - radky se poslou znovu."
+                fi
+            fi
+            ;;
+        *'"log_lines":true'*|*'"log_lines": true'*)
+            if [ -f "$BK_LOG_LINES_OFF" ]; then
+                rm -f "$BK_LOG_LINES_OFF" 2>/dev/null
+                log_message "Server znovu zapnul odesilani radku z logu."
+            fi
+            ;;
+    esac
 
     # Potvrzeni provedeni akce zpet na server - bez tohohle by agent_actions.status
     # zustal navzdy na 'sent' ("odeslano, ceka na potvrzeni") v administraci, i kdyz

@@ -158,6 +158,23 @@ with nobody on it.
   reads - moves the fake router's uptime 4.20 s forward, so `agent_run_ms` is
   exactly 4200; `wrun6` reads that same number back as `agent_prev_total_ms`
   from the EXIT trap, and `wrun7` runs with no `proc/uptime` at all.
+- **The log runs `wlog1..8` (W1-C3).** The payload runs read the plain
+  `logread` stub (two error lines, a fixed date). `BK_STUB_LOG=pii` and
+  `BK_STUB_LOG=formats` serve a log written relative to the stub's own clock,
+  which it notes in `logread_now.log`, so every `ts` and the window are
+  checked to the second. `pii` plants every identifier the masks exist for -
+  made-up MACs and names, addresses from the documentation ranges, a DUID, an
+  e-mail, a UTF-8 letter and a lone 0xff byte, and a pair of lines whose
+  address sits across the 200-character cut - and the checks require that
+  none of them is in ANY report or in the kept last payload, while the lines
+  arrive with their tags. The selftest pins that the fixture really serves
+  them raw. `formats` has every date layout (logd, ISO 8601 with `Z` and
+  with `+02:00`, BSD without a year, a line with no date) and runs in CEST,
+  so a zone-less time read without the router's offset would be two hours
+  off. `wlog3` sets `LOG_LINES_ENABLED=0`; `wlog4..7` walk the server's
+  switch through the response seam (`false`, a fresh private directory and
+  an answer without the key, `"log_lines": true`, back on); `wlog8` has no
+  log at all.
 - **Pending checks.** `assert_openwrt_payload.py` may list checks in `PENDING`
   while the collector that satisfies them is not merged yet. A pending check
   that passes fails the run, and `BK_E2E_STRICT=1` fails every pending check;

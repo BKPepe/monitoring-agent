@@ -121,6 +121,17 @@ wdns1, wdns3 = payload("wdns1"), payload("wdns3")
 wrun2, wrun3, wrun4 = (payload(f"wrun{n}") for n in (2, 3, 4))
 wrun5, wrun6, wrun7 = (payload(f"wrun{n}") for n in (5, 6, 7))
 
+wport1, wport2, wport3 = (payload(f"wport{n}") for n in (1, 2, 3))
+
+def lan_ports(p):
+    """A run's wired switch ports, in the order the switch printed them. A run
+    that reports no port section at all answers with an empty list here, which
+    is why every check below also names what it expects of the section."""
+    return ((p.get("lan_ports") or {}).get("ports")) or []
+
+def lan_port(p, name):
+    return next((q for q in lan_ports(p) if q.get("name") == name), {})
+
 def stamps(p):
     """The timestamps a payload offers, in the order it offers them."""
     return [i["timestamp"] for i in (p.get("speedtests") or [])]
@@ -135,6 +146,14 @@ payload_text = "".join(
     open(f, errors="replace").read()
     for f in sorted(glob.glob(f"{out}/*.json")) if os.path.isfile(f))
 uci_asked = collections.Counter(log_lines("uci_calls.log", core_only=True))
+# The switch is read on EVERY run, so the six payload runs (r1, r2, r2b, r3,
+# r4, r5) must show six dumps - one each. Two a run would be the hourly
+# WAN-path block asking ubus for the same 27 kB again. Only five fdb reads:
+# r3 is the access point whose ubus has no netifd at all, and a run that
+# never saw a switch has no bridge to ask about either.
+dev_dumps = sum(1 for c in log_lines("ubus_calls.log", core_only=True)
+                if c == "call network.device status")
+fdb_reads = len(log_lines("bridge_calls.log", core_only=True))
 
 # No address that belongs to somebody may live in this suite: neither in a
 # fixture nor in a payload the fixtures produce. Allowed are the documentation
@@ -306,7 +325,7 @@ checks = {
     "link roles: the WAN device is reported, the LTE rate is measured on the second run": d["wan_l3_device"] == "eth0" and d1["net_lte"] is None and isinstance(d["net_lte"], (int, float)),
     "no interfaces at all: no WAN device, no LTE rate": d3["wan_l3_device"] is None and d3["net_lte"] is None,
     "the log is trimmed on a router that has no stat applet": 0 < log_size <= 40000,
-    "version reported": d.get("version") == "0.1.7",
+    "version reported": d.get("version") == "0.1.8",
     # --- storage and SMART (CORE 2.3, 2.7; CORE e2e #22-#39, #44, #45) ---
     # CORE e2e #22
     "omnia: storage_disks has sda and no loop*, mtdblock*, zram* - and no mmcblk0; emmc is null":
@@ -438,7 +457,7 @@ checks = {
         '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_ROOT" ] && BK_ROOT="$STATUS_TEST_ROOT"'],
     "wifi: every iwinfo call carries exactly one command": len(iwinfo_calls) > 0 and all(len(c.split()) <= 2 for c in iwinfo_calls),
     "wifi: iwinfo was never asked to scan": log_lines("iwinfo_scan.log") == [],
-    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 62 checks)": len(selftest) == 62 and all(l.startswith("ok ") for l in selftest),
+    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 74 checks)": len(selftest) == 74 and all(l.startswith("ok ") for l in selftest),
     "harness: all six payload runs produced a payload of this version": all(x.get("version") == d["version"] for x in (d1, d2b, d3, d4, d5)),
     "wan: PPPoE over a VLAN (the owner's line) - the l3 device is the ppp netdev": (wpppoe["wan_proto"], wpppoe["wan_l3_device"], wpppoe["wan_up"]) == ("pppoe", "pppoe-wan", True),
     # --- W-A2 the WAN device walk (WAN 3.1.1; WAN e2e #5) ---
@@ -527,11 +546,12 @@ checks = {
     "speed: one result stays under 400 B on the wire":
         max(len(json.dumps(i, separators=(",", ":"))) for i in d1["speedtests"]) <= 400,
     # --- W-A4 the path the packets take (WAN 3.1.5 with X5; WAN e2e #9, #21) ---
-    "wan: the path state is read once an hour - six payload runs, one read of each uci option and one ubus device dump":
+    # The ubus device dump is no longer part of this: the switch is read every
+    # run (see the "lan:" checks), and the hourly block reuses that one walk.
+    "wan: the path state is read once an hour - six payload runs, one read of each uci option":
         [uci_asked[k] for k in ("-q get firewall.@defaults[0].flow_offloading",
                                 "-q get network.@globals[0].packet_steering",
                                 "-q show sqm")] == [1, 1, 1]
-        and sum(1 for c in log_lines("ubus_calls.log", core_only=True) if "network.device status" in c) == 1
         and path_of(d1, "checked_at") == path_of(d5, "checked_at"),
     "wan: packet steering is the runtime mask of every RX queue, never the uci label - rx-0 = 2 with two empty queues is on":
         (path_of(wpath[0], "packet_steering"), path_of(wpath[0], "packet_steering_active"), path_of(wpath[0], "wan_rps_mask"))
@@ -593,6 +613,57 @@ checks = {
         and "150" not in json.dumps(path_of(d1, "lan_conduits")),
     "wan: without ubus the LAN side is unknown, not empty":
         [path_of(wpath[5], k) for k in ("lan_port_max_mbit", "lan_port_cap_mbit", "lan_conduits")] == [None] * 3,
+    # --- the wired switch ports (lan_ports) ---
+    "lan: the owner's switch, port by port - link, rate, duplex and what each port supports":
+        [(q.get("name"), q.get("link"), q.get("speed_mbit"), q.get("duplex"), q.get("max_mbit")) for q in lan_ports(d1)] == [
+            ("lan0", True, 1000, "full", 1000), ("lan1", True, 100, "full", 1000),
+            ("lan2", False, None, None, 1000), ("lan3", False, None, None, 1000),
+            ("lan4", True, 1000, "full", 1000)],
+    "lan: a port without carrier prints no speed, so the rate and the duplex are null - never 0":
+        [(q.get("speed_mbit"), q.get("duplex")) for q in lan_ports(d1) if not q.get("link")] == [(None, None)] * 2,
+    "lan: lan1 at 100 is the partner's limit, not a fault - the port supports 1000 and the other end advertises 100":
+        lan_port(d1, "lan1").get("partner_max_mbit") == 100
+        and lan_port(d1, "lan1").get("max_mbit") == 1000
+        and lan_port(d1, "lan0").get("partner_max_mbit") == 1000,
+    "lan: an unplugged port has no link partner to advertise anything":
+        [q.get("partner_max_mbit") for q in lan_ports(d1) if not q.get("link")] == [None, None],
+    "lan: devices are counted per port, and one MAC learnt in two VLANs is one device":
+        [(q.get("name"), q.get("clients")) for q in lan_ports(d1)] == [
+            ("lan0", 3), ("lan1", 1), ("lan2", 0), ("lan3", 0), ("lan4", 2)]
+        and (d1.get("lan_ports") or {}).get("clients_total") == 6,
+    "lan: the rows that are not a client are dropped - permanent, vlan 4095 and the router's own addresses":
+        lan_port(d1, "lan2").get("clients") == 0 and lan_port(d1, "lan3").get("clients") == 0,
+    # The stub carries three of these WITHOUT `permanent` (lan0 a solicited-node
+    # group, lan4 SSDP, lan3 broadcast), so the permanent rule cannot cover for
+    # this one: lan0 stays 3, lan4 stays 2 and lan3 stays 0.
+    "lan: a multicast or broadcast group is not a device, even when the row is not `permanent`":
+        (lan_port(d1, "lan0").get("clients"), lan_port(d1, "lan4").get("clients"),
+         lan_port(d1, "lan3").get("clients")) == (3, 2, 0),
+    "lan: only the switch's own ports are ports - the radios and the conduit are bridge members, not lan ports":
+        [q.get("name") for q in lan_ports(d1)] == ["lan0", "lan1", "lan2", "lan3", "lan4"]
+        and (d1.get("lan_ports") or {}).get("clients_total") == 6,
+    "lan: the conduit every wired client shares is carried with its own rate":
+        (d1.get("lan_ports") or {}).get("conduits") == [{"dev": "eth1", "link": True, "speed_mbit": 1000, "duplex": "full"}]
+        and (d1.get("lan_ports") or {}).get("bridge") == "br-lan",
+    "lan: both gigabit cables out - two ports lose the link and their rate, the third still links at 100":
+        [(q.get("name"), q.get("link"), q.get("speed_mbit")) for q in lan_ports(wpath[6]) if q.get("name") in ("lan0", "lan1", "lan4")]
+        == [("lan0", False, None), ("lan1", True, 100), ("lan4", False, None)],
+    "lan: a switch with nothing plugged in reads a measured 0 on every port, not null":
+        [q.get("clients") for q in lan_ports(wport1)] == [0] * 5
+        and (wport1.get("lan_ports") or {}).get("clients_total") == 0
+        and [q.get("name") for q in lan_ports(wport1)] == ["lan0", "lan1", "lan2", "lan3", "lan4"],
+    "lan: without `bridge` the router cannot say which port a device is on - the section is null, not an empty list":
+        wport2.get("lan_ports") is None and wport2["version"] == d1["version"],
+    "lan: without ubus there are no ports to report either":
+        wport3.get("lan_ports") is None,
+    "lan: not one MAC address leaves the router - the counts are built and thrown away inside awk":
+        not re.search(r'"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}"', json.dumps([p.get("lan_ports") for p in (d1, d, wpath[6], wport1)])),
+    "lan: the whole port section stays under 800 B on the wire":
+        len(json.dumps(d1.get("lan_ports"), separators=(",", ":"))) <= 800,
+    "lan: the switch is read every run, not once an hour - r2b reports it although the WAN path came from the cache":
+        d2b.get("lan_ports") == d1.get("lan_ports") and d2b["wan_path"] == d1["wan_path"],
+    "lan: one ubus device dump per payload run and never two, and no fdb read at all when there is no dump":
+        (dev_dumps, fdb_reads) == (6, 5),
     "wan: the whole path object stays under 600 B on the wire":
         len(json.dumps(d1["wan_path"], separators=(",", ":"))) <= 600,
     # WAN e2e #14, the minute half (a probe item is wave 2). Measured on the
@@ -668,6 +739,94 @@ checks = {
     "gap: the response seam is read on one line, and that line asks for --dry-run": (text("seam_guard.txt") or "").splitlines() == ['[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_RESPONSE" ] && BK_TEST_RESPONSE="$STATUS_TEST_RESPONSE"'],
     "gap: a run on a canned answer still prints the whole payload": all(load(f"w19_{i}.json").get("version") == d["version"] for i in range(1, 12)),
 }
+
+# --- W1-C3: the error lines behind log_errors_24h (wlog1..wlog8) ---
+# bin/logread writes the pii and formats logs relative to its own clock and
+# notes that clock; every ts below is exact to the second.
+def stub_now(name):
+    """The clock of the ONE logread call noted in NAME; more than one call
+    means the run is not the one the expectations were written for."""
+    rows = (text(name) or "").splitlines()
+    try:
+        return int(rows[0].split()[1]) if len(rows) == 1 else None
+    except (IndexError, ValueError):
+        return None
+wl = {i: payload(f"wlog{i}") for i in range(1, 10)}
+n1, n2 = stub_now("wlog1_now.txt"), stub_now("wlog2_now.txt")
+LOG_KEYS = ("log_errors_24h", "log_warnings_24h", "log_window_secs", "log_errors_recent", "log_lines_state")
+exp_pii = None if n1 is None else [
+    {"ts": n1 - 600, "prog": "kresd", "msg": 'error resolving <host>. asked by <host>, <host> and <host>: "quote" back\\slash ?? ?', "count": 1},
+    {"ts": n1 - 1200, "prog": "dnsmasq-dhcp", "msg": "DHCPACK(br-lan) <ipv4> <mac> <host>", "count": 1},
+    {"ts": n1 - 1800, "prog": "odhcpd", "msg": "Failed to send reply to <ipv6>%br-lan (DUID <id>, <ipv6>)", "count": 1},
+    {"ts": n1 - 2400, "prog": "hostapd", "msg": "wlan0: STA <mac> IEEE 802.1X: authentication failed for identity <email>", "count": 1},
+    # Cut at 197 + "...": the address sat across the cut and is a whole tag.
+    {"ts": n1 - 3000, "prog": "dnsmasq", "msg": "error: " + "x" * 182 + " <ipv4> ...", "count": 2},
+]
+exp_fmt = None if n2 is None else [
+    {"ts": None, "prog": None, "msg": "error: continuation of a stack trace", "count": 1},
+    {"ts": n2 - 600, "prog": "uhttpd", "msg": "error: TLS handshake failed", "count": 3},
+    {"ts": n2 - 1800, "prog": "crond", "msg": "fatal: cannot open crontab", "count": 1},
+    {"ts": n2 - 2400, "prog": "procd", "msg": "Instance ntpd::instance1 s in a crash loop 6 crashes, 0 seconds since last crash", "count": 1},
+    # The printk stamp is dropped: ts is the time, and a stamp would split repeats.
+    {"ts": n2 - 3000, "prog": "kernel", "msg": "mv88e6085 f1072004.mdio-mii:10: error: link down", "count": 1},
+]
+n9 = stub_now("wlog9_now.txt")
+exp_cut = None if n9 is None else [
+    {"ts": n9 - 60, "prog": "uhttpd", "msg": "error: ...", "count": 1},
+    {"ts": n9 - 120, "prog": "dnsmasq", "msg": "error: " + " ".join(["<ipv4>"] * 16) + " ...", "count": 1},
+    {"ts": n9 - 297, "prog": "kernel", "msg": "mt7915e 0000:01:00.0: error: message timeout", "count": 3},
+]
+# The plain stub log: fixed dates, read in the container's UTC.
+exp_r2 = [
+    {"ts": 1788339902, "prog": "dnsmasq", "msg": "failed to create listening socket", "count": 1},  # 2026-09-02 09:05:02Z
+    {"ts": 1788339603, "prog": "odhcpd", "msg": "Failed to send RS", "count": 1},  # 09:00:03Z
+]
+# Every identifier the pii log plants. None may be anywhere in a report, and
+# no piece of a cut address may be in the lines.
+PLANTED = ("192.0.2.44", "198.51.100.23", "192.0.2.61", "02:5e:10", "02-5e-10", "025e10", "fe80::1c2",
+           "2001:db8:42", "000100012b3c4d5e", "jana", "novakova", "example.org", "novakovi", "iphone",
+           "desktop-7qk2m9a", "galaxy")
+leaked_log = sorted(
+    f"{f}: {s}" for f in [f"wlog{i}.json" for i in range(1, 10)] + ["wlog1_last.json"]
+    for s in PLANTED if s in (text(f) or "").lower())
+all_lines = [x for p in (d, wl[1], wl[2], wl[4], wl[7], wl[9]) for x in (p.get("log_errors_recent") or [])]
+checks.update({
+    "log: výchozí log routeru - obě chybové řádky s časem, programem a zprávou, okno od prvního řádku (r2)":
+        d["log_errors_recent"] == exp_r2 and d["log_lines_state"] == "on"
+        and isinstance(d["log_window_secs"], int) and 0 <= d["agent_time"] - d["log_window_secs"] - 1788339601 <= 60,
+    "log: maskované řádky - MAC, IPv6, IPv4, e-mail, DUID, domácí doména, jména zařízení i klient DHCP; nejnovější první, stejná chyba jednou s počtem 2 (wlog1)":
+        exp_pii is not None and wl[1]["log_errors_recent"] == exp_pii,
+    "log: počty a okno z téhož průchodu - 6 chyb, 1 varování, okno 2 h k nejstaršímu řádku (wlog1)":
+        (wl[1]["log_errors_24h"], wl[1]["log_warnings_24h"]) == (6, 1)
+        and n1 is not None and isinstance(wl[1]["log_window_secs"], int) and 7200 - 60 <= wl[1]["log_window_secs"] <= 7200,
+    "log: žádná zasazená adresa, MAC, e-mail ani jméno není v žádném hlášení ani v uložené kopii":
+        leaked_log == [] and text("wlog1_last.json") is not None,
+    "log: řez na 200 znaků jde až po maskování - v řádcích není ani kus adresy":
+        not re.search(r"192\.0|198\.51|\d+\.\d+\.\d+\.\d+", json.dumps([x["msg"] for x in all_lines])) and len(all_lines) == 25,
+    "log: každý řádek je tisknutelné ASCII o nejvýš 200 znacích":
+        all(len(x["msg"]) <= 200 and all(32 <= ord(c) < 127 for c in x["msg"]) for x in all_lines),
+    "log: každý formát data dá správný čas i v CEST - logd, ISO 8601 se Z i s +02:00, BSD bez roku; řádek bez data má ts i program null; 'ntpd::' není IPv6 (wlog2)":
+        exp_fmt is not None and wl[2]["log_errors_recent"] == exp_fmt,
+    "log: jen 5 nejnovějších různých řádků, dva starší zůstanou doma; okno sahá k nejstaršímu (ISO se Z) a počítá všech 9 (wlog2)":
+        wl[2]["log_errors_24h"] == 9 and isinstance(wl[2]["log_window_secs"], int) and 5400 - 60 <= wl[2]["log_window_secs"] <= 5400
+        and not any("Failed to send RS" in x["msg"] or "bind to" in x["msg"] for x in wl[2]["log_errors_recent"] or []),
+    "log: LOG_LINES_ENABLED=0 na routeru - žádné řádky, počty a okno jdou dál (wlog3)":
+        wl[3]["log_errors_recent"] is None and wl[3]["log_lines_state"] == "off_router"
+        and (wl[3]["log_errors_24h"], wl[3]["log_warnings_24h"]) == (6, 1) and isinstance(wl[3]["log_window_secs"], int),
+    "log: odpověď \"log_lines\":false - toto hlášení řádky už neslo, vypínač se uloží na flash (wlog4)":
+        wl[4]["log_lines_state"] == "on" and len(wl[4]["log_errors_recent"] or []) == 5 and text("wlog4_flag.txt") == "yes",
+    "log: vypnuto u monitoru - další hlášení bez řádků i po čistém privátním adresáři, odpověď bez klíče nic nemění (wlog5)":
+        wl[5]["log_errors_recent"] is None and wl[5]["log_lines_state"] == "off_monitor"
+        and (wl[5]["log_errors_24h"], wl[5]["log_warnings_24h"]) == (6, 1) and text("wlog5_flag.txt") == "yes",
+    "log: \"log_lines\": true (s mezerou) - toto hlášení ještě bez řádků, vypínač pak zmizí (wlog6)":
+        wl[6]["log_errors_recent"] is None and wl[6]["log_lines_state"] == "off_monitor" and text("wlog6_flag.txt") == "no",
+    "log: po zapnutí se řádky vrátí (wlog7)":
+        wl[7]["log_lines_state"] == "on" and len(wl[7]["log_errors_recent"] or []) == 5,
+    "log: dlouhé řádky se před maskami zkrátí na 256 znaků u mezery (z 17. adresy nezbude kus), slovo bez mezery zmizí celé, opakovaná chyba jádra s jiným razítkem printk je jeden řádek s počtem 3 (wlog9)":
+        exp_cut is not None and wl[9]["log_errors_recent"] == exp_cut and "198.51" not in json.dumps(wl[9]["log_errors_recent"]),
+    "log: bez logu jsou všechna pole null - ne 0 a ne [] (wlog8)":
+        [wl[8][k] for k in LOG_KEYS] == [None, None, None, None, "on"],
+})
 # Checks written down before the collector that can pass them: the stubs
 # already serve the real router, the Wi-Fi block of the agent is still the
 # 0.1.6 one. A pending check does not fail the run, but one that PASSES does,

@@ -133,6 +133,17 @@ t "nft: the default ruleset holds the fw4 table" eq "$(nft list ruleset | grep -
 t "nft: the foreign ruleset holds mwan3 and no fw4 at all" eq "$(BK_STUB_NFT=foreign nft list ruleset | grep -c 'inet fw4')" 0
 BK_STUB_NFT=empty nft list ruleset > $T/o 2>&1; _rc=$?
 t "nft: an empty kernel answers 0 and prints nothing" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9)" "0,0"
+# bridge: the forwarding database. Every kind of row the owner's router
+# prints is in the default answer, and only the learnt ones may be counted.
+t "bridge: an unknown bridge is refused, not answered empty" sh -c '! bridge fdb show br br-nope 2>/dev/null'
+t "bridge: the default answer holds 14 learnt rows, 7 of them on wired ports" eq "$(bridge fdb show br br-lan | grep -c 'master br-lan$'),$(bridge fdb show br br-lan | grep 'master br-lan$' | grep -c ' dev lan')" "14,7"
+t "bridge: lan0 carries the same MAC in two VLANs" eq "$(bridge fdb show br br-lan | grep -c '^02:00:00:00:0a:01 ')" 2
+t "bridge: one vlan 4095 row is NOT permanent, so its own rule has to drop it" eq "$(bridge fdb show br br-lan | grep -c 'vlan 4095 self$')" 1
+t "bridge: BK_STUB_FDB=empty keeps the noise and drops every learnt row" eq "$(BK_STUB_FDB=empty bridge fdb show br br-lan | grep -c 'master br-lan$')" 0
+t "bridge: BK_STUB_FDB=empty still prints the permanent and multicast rows" eq "$(BK_STUB_FDB=empty bridge fdb show br br-lan | wc -l | tr -cd 0-9)" 17
+t "bridge: three multicast/broadcast rows carry no 'permanent', so only their own rule can drop them" eq "$(bridge fdb show br br-lan | grep -Ec '^(33:33|01:00:5e|ff:ff:ff:ff:ff:ff).* self$')" 3
+t "bridge: every call is logged" grep -qx "fdb show br br-lan" $OUT/bridge_calls.log
+
 # nslookup: the two answers G41 needs, and the refusal really is instant.
 nslookup example.com 127.0.0.1 > $T/o 2> $T/e; _rc=$?
 t "nslookup: the resolver answers - exit 0" eq "$_rc" 0
@@ -146,6 +157,15 @@ t "logread: without the variable the uptime stays where it was" eq "$(cat $F/pro
 BK_STUB_UPTIME_BUMP=1 logread > /dev/null 2>&1
 t "logread: with BK_STUB_UPTIME_BUMP=1 the uptime moves 4.20 s forward" eq "$(awk -v a="$(awk '{print $1}' $T/uptime.keep)" -v b="$(awk '{print $1}' $F/proc/uptime)" 'BEGIN { printf "%.2f", b - a }')" "4.20"
 cp $T/uptime.keep $F/proc/uptime
+# W1-C3: a mask can only be proven on a log that HAS something to leak. The
+# pii fixture must serve every identifier raw, the long pair must put its
+# address across the 200-character cut, and the non-ASCII bytes must be there.
+BK_STUB_LOG=pii logread > $T/pii 2>/dev/null
+t "logread pii: every planted identifier is served raw" sh -c "for s in 192.0.2.44 198.51.100.23 192.0.2.61 02:5e:10:aa:bb:01 02-5e-10-aa-bb-02 fe80::1c2:3ff:fe44:5566 2001:db8:42::17 000100012b3c4d5e025e10aabb04 jana.novakova@example.org novakovi-ntb novakovi-nas.lan Janas-iPhone DESKTOP-7QK2M9A Galaxy-S23-Jana; do grep -qF \"\$s\" $T/pii || exit 1; done"
+t "logread pii: the address of the long pair starts at character 191 of the message" eq "$(grep -F 192.0.2.44 $T/pii | sed 's/.*dnsmasq\[124\]: //' | awk '{ print index($0, "192.0.2.44") }')" 191
+t "logread pii: a UTF-8 letter and a lone 0xff byte are in the kresd line" eq "$(grep -F kresd $T/pii | od -An -tx1 | tr -s ' \n' '  ' | grep -c 'c3 a9 20 ff')" 1
+t "logread formats: ten lines, one of them without a date" eq "$(BK_STUB_LOG=formats logread | wc -l | tr -cd 0-9),$(BK_STUB_LOG=formats logread | grep -c '^    error:')" "10,1"
+rm -f $OUT/logread_now.log
 
 rm -rf $T
 rm -f $OUT/*_calls.log $OUT/iwinfo_scan.log /tmp/bk-stub-iw.*.count
