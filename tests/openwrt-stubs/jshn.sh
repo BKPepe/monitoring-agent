@@ -22,9 +22,17 @@ case "$BK_STUB_WAN" in
     *)      BK_STUB_PROTO=dhcp; BK_STUB_DEV=eth0; BK_STUB_L3=eth0 ;;
 esac
 json_init() { BK_SEL=""; }
-json_load() { BK_SEL=""; }
+# Each load of the interface dump is logged with the agent's PID: a run loads
+# it once and reads everything from that one tree (a real jshn load replays
+# the whole dump through eval). echo is a builtin, so this adds no fork.
+json_load() {
+    BK_SEL=""
+    case "$1" in *'"interface"'*) echo "$$" >> /work/out/jshn_calls.log ;; esac
+}
 json_cleanup() { BK_SEL=""; }
-json_select() { case "$1" in ..) BK_SEL="${BK_SEL%/*}" ;; *) BK_SEL="$BK_SEL/$1" ;; esac; }
+# An empty name goes back to the root, as in the real jshn.sh: the agent loads
+# the interface dump once and returns to its root with `json_select ""`.
+json_select() { case "$1" in "") BK_SEL="" ;; ..) BK_SEL="${BK_SEL%/*}" ;; *) BK_SEL="$BK_SEL/$1" ;; esac; }
 json_is_a() { return 1; }
 json_get_type() { eval "$1=''"; }
 json_add_string() { :; }; json_add_int() { :; }; json_add_boolean() { :; }

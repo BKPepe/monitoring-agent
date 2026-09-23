@@ -383,7 +383,9 @@ fresh
 # The answering case is every payload run: the stub resolves. Here the
 # resolver refuses - instantly, which is the point: three milliseconds are not
 # a latency - and then there is no resolver client at all.
-BK_STUB_DNS=fail sh agent_openwrt.sh --dry-run > $OUT/wdns1.json 2> $OUT/wdns1.err
+# wdns1 also has an nft too old for -t: the agent lists the ruleset again
+# without it, and the firewall answers must be the payload runs' answers.
+BK_STUB_DNS=fail BK_STUB_NFT_NOTERSE=1 sh agent_openwrt.sh --dry-run > $OUT/wdns1.json 2> $OUT/wdns1.err
 fresh
 stub_off nslookup
 mv /bin/nslookup /bin/nslookup.off
@@ -423,6 +425,338 @@ fresh
 mv /tmp/fakeroot/proc/uptime /tmp/fakeroot/proc/uptime.off
 sh agent_openwrt.sh --dry-run > $OUT/wrun7.json 2> $OUT/wrun7.err
 mv /tmp/fakeroot/proc/uptime.off /tmp/fakeroot/proc/uptime
+fresh
+
+# --- wtake1..wtake5: the run lock has a maximum age (WW-07) -----------------
+# `pid` is what it always was (an older agent reads it with $(cat) and a digit
+# check); `info` = "<uptime cs when the lock was taken> <the holder's start
+# time>" (field 22 of /proc/PID/stat). The age runs on the fake router's clock
+# (the uptime of agent_run_ms), the identity on the container's real /proc,
+# and every holder below is a real process:
+#   wtake1  400 s old, a shell with a child: both are killed, the run goes on
+#           and says so (runs_skipped_killed 1); wtake1b delivers that fact
+#           with an accepted report, wtake1c is back to a measured 0
+#   wtake2  30 s old: an ordinary busy minute - no report, the holder lives,
+#           and wtake2b counts the skip
+#   wtake3  400 s old, but the start time is not the holder's: the PID now
+#           belongs to another process; nothing is killed, the lock is taken
+#   wtake4  400 s old and a zombie (busybox crond reaps its children every
+#           10 s, so a holder that just died is usually one): taken over
+#   wtake5  400 s old and it survives SIGKILL. PID 1 of the container stands
+#           in for a holder stuck in the kernel (D state), which no container
+#           can make; it is also the run's ancestor, and an ancestor is never
+#           signalled. The lock stays, no report.
+pstat() { # PID -> "STATE START", or "gone"
+    if read -r _ps < "/proc/$1/stat" 2>/dev/null; then
+        _ps=${_ps##*") "}; set -- $_ps; echo "$1 ${20}"
+    else
+        echo gone
+    fi
+}
+upcs() { read -r _u _ < /tmp/fakeroot/proc/uptime; echo "${_u%.*}${_u#*.}"; }
+plant() { # PID START AGE_S
+    mkdir -p "$PRIV/run.lock"; echo "$1" > "$PRIV/run.lock/pid"
+    echo "$(( $(upcs) - $3 * 100 )) $2" > "$PRIV/run.lock/info"
+}
+child_of() { # PPID [STATE] -> the first child (in that state)
+    for _d in /proc/[0-9]*; do
+        read -r _s < "$_d/stat" 2>/dev/null || continue
+        _s=${_s##*") "}; set -- $_s
+        [ "$2" = "$_cp" ] && { [ -z "$_cst" ] || [ "$1" = "$_cst" ]; } && { echo "${_d#/proc/}"; return 0; }
+    done
+    return 0
+}
+mkholder() { # -> H (a shell that execs sleep) and C, its child
+    sh -c 'sleep 1000 & exec sleep 1001' &
+    H=$!; C=""; _n=0; _cp=$H; _cst=""
+    while [ -z "$C" ] && [ $_n -lt 50 ]; do C=$(child_of); [ -z "$C" ] && sleep 0.1; _n=$((_n + 1)); done
+}
+fresh
+mkholder
+set -- $(pstat "$H"); plant "$H" "$2" 400
+sh agent_openwrt.sh --dry-run > $OUT/wtake1.json 2> $OUT/wtake1.err
+echo "holder=$(pstat "$H") child=$(pstat "$C")" > $OUT/wtake1_procs.txt
+if [ -d "$PRIV/run.lock" ]; then echo yes; else echo no; fi > $OUT/wtake1_lock.txt
+kill -9 "$H" "$C" 2>/dev/null || true
+resp 200 '{"status":"ok"}'
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wtake1b.json 2> $OUT/wtake1b.err
+sh agent_openwrt.sh --dry-run > $OUT/wtake1c.json 2> $OUT/wtake1c.err
+fresh
+mkholder
+set -- $(pstat "$H"); plant "$H" "$2" 30
+sh agent_openwrt.sh --dry-run > $OUT/wtake2.json 2> $OUT/wtake2.err
+echo "holder=$(pstat "$H" | cut -c1) child=$(pstat "$C" | cut -c1)" > $OUT/wtake2_procs.txt
+kill -9 "$H" "$C" 2>/dev/null || true
+rm -rf "$PRIV/run.lock"
+sh agent_openwrt.sh --dry-run > $OUT/wtake2b.json 2> $OUT/wtake2b.err
+fresh
+mkholder
+set -- $(pstat "$H"); plant "$H" "$(( $2 + 7 ))" 400
+sh agent_openwrt.sh --dry-run > $OUT/wtake3.json 2> $OUT/wtake3.err
+echo "holder=$(pstat "$H" | cut -c1) child=$(pstat "$C" | cut -c1)" > $OUT/wtake3_procs.txt
+kill -9 "$H" "$C" 2>/dev/null || true
+fresh
+# A zombie: `sleep 0.1` ends, and its parent (exec'd into sleep 1002) never
+# reaps it.
+sh -c 'sleep 0.1 & exec sleep 1002' &
+ZP=$!; Z=""; _n=0; _cp=$ZP; _cst=Z
+while [ -z "$Z" ] && [ $_n -lt 50 ]; do sleep 0.1; Z=$(child_of); _n=$((_n + 1)); done
+set -- $(pstat "$Z"); plant "$Z" "$2" 400
+sh agent_openwrt.sh --dry-run > $OUT/wtake4.json 2> $OUT/wtake4.err
+echo "zombie=$(pstat "$Z" | cut -c1)" > $OUT/wtake4_procs.txt
+kill -9 "$ZP" 2>/dev/null || true
+fresh
+set -- $(pstat 1); plant 1 "$2" 400
+sh agent_openwrt.sh --dry-run > $OUT/wtake5.json 2> $OUT/wtake5.err
+{ cat "$PRIV/run.lock/pid"; cat "$PRIV/skipped"; } > $OUT/wtake5_lock.txt 2>/dev/null || true
+if [ -e "$PRIV/run.lock/killed" ]; then echo yes; else echo no; fi > $OUT/wtake5_killed.txt
+rm -rf "$PRIV/run.lock"
+fresh
+
+# --- wtake6..wtake8: what a takeover leaves behind ----------------------------
+#   wtake6  a REAL run hangs in its first df (BK_STUB_DF_HOLD) after it has
+#           read run.total and run.cpu of the run before it (wtake6a), and is
+#           taken over 400 s later: the report says null for both, not the
+#           numbers of wtake6a - a killed run runs no EXIT trap
+#   wtake7  a run whose lock another run holds by the time it ends (a
+#           stand-in PID goes into run.lock/pid while it waits 5 s in df):
+#           its EXIT trap leaves that lock, and run.total, alone
+#   wtake8  a lock marked `killed` whose PID is gone: a takeover signalled a
+#           run the kernel still held (the lock was kept for it), and it has
+#           died since - the run that reclaims the lock counts it. wtake5's
+#           holder is an ancestor, never signalled, so it gets no mark.
+# Not covered here: a process that no signal ends (D state). The takeover's
+# other half - the holder dies, its child stays in D and keeps the lock -
+# needs a frozen filesystem (fsfreeze), which only a privileged container has.
+held() { # until the held run has reached its df
+    _n=0; while [ -f /tmp/df.hold ] && [ $_n -lt 600 ]; do sleep 0.1; _n=$((_n + 1)); done
+}
+fresh
+sh agent_openwrt.sh --dry-run > $OUT/wtake6a.json 2> $OUT/wtake6a.err
+{ cat "$PRIV/run.total"; cat "$PRIV/run.cpu"; } > $OUT/wtake6a_files.txt 2>/dev/null || true
+touch /tmp/df.hold
+BK_STUB_DF_HOLD=/tmp/df.hold sh agent_openwrt.sh --dry-run > /dev/null 2> $OUT/wtake6h.err &
+W=$!
+held
+read -r _ws _wst < "$PRIV/run.lock/info" || true
+echo "$(( $(upcs) - 40000 )) $_wst" > "$PRIV/run.lock/info"
+sh agent_openwrt.sh --dry-run > $OUT/wtake6.json 2> $OUT/wtake6.err
+wait "$W" 2>/dev/null || true
+echo "wedged=$(pstat "$W")" > $OUT/wtake6_procs.txt
+fresh
+touch /tmp/df.hold
+BK_STUB_DF_HOLD=/tmp/df.hold BK_STUB_DF_HOLD_S=5 sh agent_openwrt.sh --dry-run > $OUT/wtake7.json 2> $OUT/wtake7.err &
+W=$!
+held
+sleep 1000 &
+S7=$!
+echo "$S7" > "$PRIV/run.lock/pid"
+wait "$W" || true
+{ echo "$S7"; cat "$PRIV/run.lock/pid" 2>/dev/null || echo none; if [ -e "$PRIV/run.total" ]; then echo total; else echo no-total; fi; } > $OUT/wtake7_lock.txt
+kill -9 "$S7" 2>/dev/null || true
+wait "$S7" 2>/dev/null || true
+fresh
+sh -c 'exit 0' &
+D8=$!
+wait "$D8" || true
+plant "$D8" 1 400
+: > "$PRIV/run.lock/killed"
+sh agent_openwrt.sh --dry-run > $OUT/wtake8.json 2> $OUT/wtake8.err
+if [ -d "$PRIV/run.lock" ]; then echo yes; else echo no; fi > $OUT/wtake8_lock.txt
+fresh
+
+# --- wskip1..wskip2c: the skip counters are folded (IO-03) -------------------
+#   wskip1  25,000 lines from a month the server was out of reach, 200 more
+#           appended WHILE the run folds them, and a POST that fails: every
+#           line is counted exactly once - by this run or left for the next
+#   wskip2  a total already near the server's range check, lines of an older
+#           agent on top (with a "p"): each counter stops at 100,000;
+#           wskip2b is accepted and clears it, wskip2c measures 0 again
+fresh
+awk 'BEGIN { for (i = 0; i < 25000; i++) print "l" }' > "$PRIV/skipped"
+( _i=0; while [ $_i -lt 200 ]; do printf 'l\n' >> "$PRIV/skipped"; _i=$((_i + 1)); done ) &
+_app=$!
+resp 000 ''
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wskip1.json 2> $OUT/wskip1.err || true
+wait "$_app" || true
+cat "$PRIV/skipped.total" > $OUT/wskip1_total.txt 2>/dev/null || true
+if [ -f "$PRIV/skipped" ]; then wc -l < "$PRIV/skipped" | tr -cd '0-9'; else echo 0; fi > $OUT/wskip1_left.txt
+if [ -s "$PRIV/skipped.fold" ]; then echo yes; else echo no; fi > $OUT/wskip1_fold.txt
+fresh
+printf '99999 100000 7\n' > "$PRIV/skipped.total"
+printf 'l\nl\nl\np\n' > "$PRIV/skipped"
+sh agent_openwrt.sh --dry-run > $OUT/wskip2.json 2> $OUT/wskip2.err
+resp 200 '{"status":"ok"}'
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wskip2b.json 2> $OUT/wskip2b.err
+sh agent_openwrt.sh --dry-run > $OUT/wskip2c.json 2> $OUT/wskip2c.err
+fresh
+
+# --- wlp1..wlp3: the debug copy of the payload only when it helps (IO-11) ----
+# A plain --dry-run keeps writing it (wlog1, w18 and wpriv read it). Through
+# the response seam the run is a cron run: a failed POST keeps the copy
+# (wlp1), an accepted one removes it (wlp2), and the owner's flag file keeps
+# it on every run (wlp3).
+resp 000 ''
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlp1.json 2> $OUT/wlp1.err || true
+ls -l "$PRIV/last-payload.json" 2>/dev/null | cut -c1-10 > $OUT/wlp1_mode.txt
+cp "$PRIV/last-payload.json" $OUT/wlp1_last.json 2>/dev/null || true
+resp 200 '{"status":"ok"}'
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlp2.json 2> $OUT/wlp2.err
+if [ -e "$PRIV/last-payload.json" ]; then echo yes; else echo no; fi > $OUT/wlp2_file.txt
+touch "$PRIV/last-payload.on"
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlp3.json 2> $OUT/wlp3.err
+cp "$PRIV/last-payload.json" $OUT/wlp3_last.json 2>/dev/null || true
+fresh
+
+# --- wdl0..wdl2: the run's deadline (WW-04) -----------------------------------
+# The POST's limit is what is left of 58 s after the start, minus 5 s for the
+# name lookup, between 5 and 20 s; the service checks wait for the next minute
+# below 12 s. logread moves the fake uptime (BK_STUB_UPTIME_ADD), so the run
+# reaches its POST 0, 40 and 50 s late. The seam stands in for the POST, and
+# the answer asks for one service check.
+resp 200 '{"status":"ok","service_checks":[{"monitor_id":7,"process":"dnsmasq","port":53}]}'
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl0.json 2> $OUT/wdl0.err
+BK_STUB_UPTIME_ADD=40 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl1.json 2> $OUT/wdl1.err
+BK_STUB_UPTIME_ADD=50 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl2.json 2> $OUT/wdl2.err
+fresh
+
+# --- wupd1, wupd2: the self-update swap (IO-07) ------------------------------
+# The update itself runs only after a real 200 and never under the response
+# seam, so the swap is one function, taken out of the agent by name and run
+# here (inside an `if`, because of `set -e`). The target lives in the
+# container's overlay root and the download in /dev/shm (tmpfs): two
+# filesystems, like /usr/bin (overlay) and /tmp (tmpfs) on a router - the case
+# that turned 0.1.8's `mv` into unlink + copy. Not on /work: Docker Desktop's
+# bind mount itself fails an open now and then while a rename runs (5 of 101
+# samples, measured), which no router filesystem does.
+#   wupd1  a poller reads the target's size the whole time: it may only ever
+#          see the old or the new size, never a missing or a short file;
+#          afterwards the target is the new file, executable, with no .bak
+#          and no .new next to it
+#   wupd2  the flash has 100 kB left (the df stub): nothing is written, the
+#          target is untouched and the reason is "space" - and the .new an
+#          interrupted swap left behind is gone, or it would hold that room
+#          for good
+sed -n -e '/^bk_dirname() {/,/^}/p' -e '/^bk_self_replace() {/,/^}/p' agent_openwrt.sh > /tmp/sr.sh
+UPD=/root/upd; NEWF=/dev/shm/upd-new.sh
+rm -rf "$UPD"; mkdir -p "$UPD"
+cp agent_openwrt.sh "$UPD/agent_openwrt.sh"
+{ sed 's/^AGENT_VERSION=.*/AGENT_VERSION="9.9.9"/' agent_openwrt.sh; echo "# the update of wupd1"; } > "$NEWF"
+{ wc -c < "$UPD/agent_openwrt.sh" | tr -cd '0-9'; echo; wc -c < "$NEWF" | tr -cd '0-9'; echo; } > $OUT/wupd1_sizes.txt
+rm -f /tmp/upd.done /tmp/upd-seen.txt
+# Every sample is a size, or "missing" when the target could not be opened.
+( while [ ! -f /tmp/upd.done ]; do
+      _sz=$(wc -c < "$UPD/agent_openwrt.sh" 2>/dev/null) || _sz=missing
+      echo "${_sz:-missing}" | tr -d ' '
+  done >> /tmp/upd-seen.txt ) &
+_poll=$!
+sleep 0.3
+( BK_NL='
+'; . /tmp/sr.sh; if bk_self_replace "$NEWF" "$UPD/agent_openwrt.sh"; then echo "rc=0 err=$_sr_err"; else echo "rc=1 err=$_sr_err"; fi ) > $OUT/wupd1_rc.txt
+sleep 0.3
+touch /tmp/upd.done
+wait "$_poll" || true
+sort -u /tmp/upd-seen.txt > $OUT/wupd1_seen.txt
+if cmp -s "$NEWF" "$UPD/agent_openwrt.sh"; then echo same; else echo differ; fi > $OUT/wupd1_cmp.txt
+ls -A "$UPD" > $OUT/wupd1_dir.txt
+ls -l "$UPD/agent_openwrt.sh" | cut -c1-10 > $OUT/wupd1_mode.txt
+cp agent_openwrt.sh "$UPD/agent_openwrt.sh"
+printf 'half of an agent\n' > "$UPD/agent_openwrt.sh.new"
+( export BK_STUB_DF_AVAIL=100; BK_NL='
+'; . /tmp/sr.sh; if bk_self_replace "$NEWF" "$UPD/agent_openwrt.sh"; then echo "rc=0 err=$_sr_err need=$_sr_need"; else echo "rc=1 err=$_sr_err need=$_sr_need"; fi ) > $OUT/wupd2_rc.txt
+if cmp -s agent_openwrt.sh "$UPD/agent_openwrt.sh"; then echo same; else echo differ; fi > $OUT/wupd2_cmp.txt
+ls -A "$UPD" > $OUT/wupd2_dir.txt
+wc -l < /tmp/upd-seen.txt | tr -cd '0-9' > $OUT/wupd1_samples.txt
+rm -rf "$UPD" "$NEWF" /tmp/upd-seen.txt /tmp/upd.done /tmp/sr.sh
+
+# --- wbud0..wbud6: what a run costs, and the budget it must stay in (W1-7) ---
+# The agent reports the CPU of its previous run (agent_prev_cpu_ms, taken by
+# its EXIT trap from /proc/$$/stat), and a warm run of this harness is held to
+# a fork budget, memory ceilings and a tmpfs budget - the numbers and why they are what they
+# are sit next to the checks in assert_openwrt_payload.py.
+#   wbud0  cold, on a clean private directory: there is no previous run - null
+#   wbud1  warm, under busybox `time`: its forks from the PID namespace's
+#          last-PID counter, its CPU and its largest process from wait4()
+#   wbud2  warm again: reports wbud1's CPU, which must match what `time` saw;
+#          its own forks and memory are held to the budget too; then the
+#          private directory it leaves is listed (the tmpfs budget)
+#   wbud6  warm, the shell's heap and stack sampled while it runs
+#   wbud3  killed by SIGKILL while it waits on `wg`, long after it took the
+#          lock: it has emptied run.cpu and never writes it back
+#   wbud4  so it reports null, not wbud6's CPU (the dead holder's lock is
+#          simply reclaimed: its PID is gone)
+#   wbud5  run.cpu is there, but the version stamp is another version's
+#          (a self-update just happened): null, not the old version's cost
+# The detached SMART reader of a cold run forks on its own, into the same PID
+# counter: the warm runs wait until it is gone.
+fresh
+resp 200 '{"status":"ok"}'
+settle() {
+    _st=0
+    while ps | grep -q '[-]-smart-refresh' && [ "$_st" -lt 60 ]; do sleep 1; _st=$((_st + 1)); done
+}
+# PID delta minus 2: the fork of `time` itself and the one of the agent's sh
+# (env execs it, no fork). A delta that went down wrapped at pid_max: "wrap",
+# and the check reads the other warm run.
+bud() {
+    read -r _x _x _x _x _bp0 < /proc/loadavg
+    time -f '%U %S %M' -o $OUT/$1_time.txt env STATUS_TEST_RESPONSE=/tmp/wack-resp.json \
+        sh agent_openwrt.sh --dry-run > $OUT/$1.json 2> $OUT/$1.err
+    read -r _x _x _x _x _bp1 < /proc/loadavg
+    if [ "$_bp1" -ge "$_bp0" ]; then echo $((_bp1 - _bp0 - 2)); else echo wrap; fi > $OUT/$1_forks.txt
+}
+# busybox `time` prints %M as ru_maxrss * page size / 1024, and ru_maxrss is
+# in kB already: the checks divide by the page size in kB, read here.
+awk '/^KernelPageSize:/ { print $2; exit }' /proc/self/smaps > $OUT/wbud_pagekb.txt
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud0.json 2> $OUT/wbud0.err
+settle
+bud wbud1
+bud wbud2
+# What the warm runs leave in the private directory: on a router that is
+# tmpfs, i.e. RAM, one page per file at least. "BYTES PATH" per regular file.
+find "$PRIV" -type f | while read -r _f; do
+    printf '%s %s\n' "$(wc -c < "$_f" | tr -cd '0-9')" "${_f#"$PRIV"/}"
+done > $OUT/wbud_priv.txt
+# wbud6: warm, its shell's memory sampled every 20 ms from /proc/PID/status
+# (the sleeps fork, so this is not a fork-counted run). RssAnon is the heap
+# and stack - what a variable holding a big output grows - and unlike VmHWM
+# it does not carry the busybox text, whose size depends on the CPU the image
+# was built for. A sample misses a peak shorter than 20 ms, so this is a
+# floor of the real peak: it can let a spike through, never fail a good run.
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud6.json 2> $OUT/wbud6.err &
+_bud=$!
+_ban=0; _bhwm=""; _bn=0
+while [ -d "/proc/$_bud" ]; do
+    while read -r _k _v _x; do
+        case "$_k" in
+            RssAnon:) [ "$_v" -gt "$_ban" ] && _ban=$_v ;;
+            VmHWM:) _bhwm=$_v ;;
+        esac
+    done < "/proc/$_bud/status" 2>/dev/null || true
+    _bn=$((_bn + 1))
+    sleep 0.02
+done
+wait "$_bud" 2>/dev/null || true
+echo "$_ban $_bhwm $_bn" > $OUT/wbud6_mem.txt
+mkdir -p /tmp/hangbin
+printf '#!/bin/sh\necho $$ > /tmp/hang.pid\nexec sleep 60\n' > /tmp/hangbin/wg
+chmod +x /tmp/hangbin/wg
+rm -f /tmp/hang.pid
+PATH="/tmp/hangbin:$PATH" STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud3.json 2> $OUT/wbud3.err &
+_bud=$!
+_st=0
+while [ ! -s /tmp/hang.pid ] && [ "$_st" -lt 300 ]; do sleep 0.1; _st=$((_st + 1)); done
+# The size of run.cpu while wbud3 hangs: 0 = read and emptied.
+wc -c < "$PRIV/run.cpu" 2>/dev/null | tr -cd '0-9' > $OUT/wbud3_runcpu.txt || true
+kill -9 "$_bud" 2>/dev/null || true
+kill "$(cat /tmp/hang.pid 2>/dev/null)" 2>/dev/null || true
+wait "$_bud" 2>/dev/null || true
+rm -rf /tmp/hangbin /tmp/hang.pid
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud4.json 2> $OUT/wbud4.err
+# wbud4 left its CPU in run.cpu; an older version is what the stamp says now.
+cp "$PRIV/run.cpu" $OUT/wbud4_runcpu.txt 2>/dev/null || true
+echo "0.0.0-old" > /tmp/status-agent-openwrt-version.stamp
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud5.json 2> $OUT/wbud5.err
 fresh
 
 # --- wlog1..wlog9: the error lines behind log_errors_24h (W1-C3) -----------

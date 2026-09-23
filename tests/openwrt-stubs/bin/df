@@ -2,7 +2,22 @@
 # `df -PT` of the Omnia (/ and /srv are the same btrfs on sda1) plus a USB
 # disk whose mount point has a space, a # and quotes in it - a partition is
 # joined to its mount by device, and that name has to survive the trip.
-# Any other call is the container's own df.
+# Any other call is the container's own df, except the self-update's free
+# space check (`df -Pk DIR`) when BK_STUB_DF_AVAIL=<kB> says how full the
+# flash is: no container can be given a full overlay to write into.
+# BK_STUB_DF_HOLD=<file>: while that file exists, the first df of the run
+# removes it (the harness's sign that the run got this far) and then sleeps
+# BK_STUB_DF_HOLD_S seconds (default 1000) before it answers - a run that
+# hangs in a tool, as on a dead disk, but one a signal still ends.
+if [ -n "$BK_STUB_DF_HOLD" ] && [ -f "$BK_STUB_DF_HOLD" ]; then
+    rm -f "$BK_STUB_DF_HOLD"
+    sleep "${BK_STUB_DF_HOLD_S:-1000}"
+fi
+if [ -n "$BK_STUB_DF_AVAIL" ] && [ "$1" = "-Pk" ]; then
+    printf 'Filesystem           1024-blocks    Used Available Capacity Mounted on\n'
+    printf 'overlayfs:/overlay          7000    6900 %9s  99%% /\n' "$BK_STUB_DF_AVAIL"
+    exit 0
+fi
 [ "$*" = "-PT" ] || exec /bin/df "$@"
 cat <<'M'
 Filesystem           Type       1024-blocks    Used Available Capacity Mounted on

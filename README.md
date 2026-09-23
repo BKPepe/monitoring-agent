@@ -437,6 +437,45 @@ and what it counted:
 - **Null, never an empty list**, when there is no readable log. `[]` means the
   log was read and holds no error line.
 
+### What 0.1.9 made lighter (OpenWrt)
+
+0.1.9 sends what 0.1.8 sent plus two keys about the agent itself; the rest of
+the change is what a run costs the router. Measured in the e2e harness
+(busybox in an arm64 container, the installer's cfg):
+
+- **Forks: 502 → 182 per warm run** (hourly 546 → 226, daily 627 → 309, cold
+  after a boot 663 → 366; an OpenWrt rootfs with the real jshn 411 → 177).
+  Config and state files are read with shell builtins, the JSON and HiLink
+  XML escaping no longer starts a program per value, and the interface dump,
+  `nft`, `top`, the DNS chain and mwan3 are each parsed once. `tests/` holds a
+  warm run to a fork budget of 200 and fails when the budget is more than 9
+  above the run, so a saving stays saved.
+- **A wedged run can be taken over**: after 300 s with the run lock it is
+  killed with its children, and the next run goes on. That needs a next run
+  to meet the lock: cronie (Turris OS) starts one every minute, and so does a
+  run started by hand. Stock OpenWrt's busybox crond never starts a line
+  again while its previous job still runs, so there a wedged run still holds
+  the router until it ends or the router reboots, as in 0.1.8.
+- **Less written**: `last-payload.json` (16.9 kB) is no longer written by
+  every run, and a self-update writes the script once, by a rename, with no
+  `.bak`.
+- **Two new keys**: `agent_prev_cpu_ms`, the CPU the previous run used, and
+  `runs_skipped_killed`, the runs the lock takeover stopped since the last
+  accepted report. The self-report paragraph of the next section has their
+  null rules and the waits in detail.
+- **CPU on a real router is not measured yet.** In a shared host's OpenWrt
+  rootfs container a warm run used 0.37-0.55x of 0.1.8's CPU, but that is not
+  a router. `agent_prev_cpu_ms` from the routers is the number to read after
+  the rollout.
+
+Three readings can move a little: timestamps that read the clock a second
+time mid-run now use the run's own clock (`wan_last_reconnect` can sit up to
+one run length earlier); `agent_time` is that clock moved on by the uptime to
+the moment the payload is built, a few seconds later than 0.1.8's mid-run
+reading, so the server's `clock_skew_s` no longer includes the rest of the
+run; and on OpenWrt's integer `sort -n` the `top_*` lists now rank by the
+decimal value (0.1.8 broke ties on the text).
+
 ### What 0.1.7 stopped claiming, and what it now measures (OpenWrt)
 
 Five fields of 0.1.6 were defaults dressed up as readings. They are null now,
@@ -483,17 +522,64 @@ Three signals were replaced or added:
   being refused.
 
 Finally, the agent reports on itself (`agent_run_ms`, `agent_prev_total_ms`,
-`runs_skipped_lock`, `runs_skipped_post`). The run length is measured from the
-KERNEL uptime at both ends, never from the clock: ntpd steps the clock minutes
-after boot on a router without an RTC, and a run would come out negative or
-hours long. The payload is built before the POST, so a run cannot report its
-own total - the EXIT trap writes it to `run.total` and the NEXT report carries
+`agent_prev_cpu_ms`, `runs_skipped_lock`, `runs_skipped_post`,
+`runs_skipped_killed`). The run length is measured from the KERNEL uptime at
+both ends, never from the clock: ntpd steps the clock minutes after boot on a
+router without an RTC, and a run would come out negative or hours long. The
+payload is built before the POST, so a run cannot report its own total - the
+EXIT trap writes it to `run.total` and the NEXT report carries
 it as `agent_prev_total_ms`; the POST is usually what pushes a minute run past
-its minute. A minute that produced no report cannot report itself either, so
-each one appends a line to `skipped` (`l` = the previous run still held the
-lock, `p` = the POST failed) and the next accepted report carries the counts
-and drops exactly the lines it counted. That is how the server tells a router
-that was switched off from an agent that cannot keep up.
+its minute. The same trap writes the run's CPU to `run.cpu` - user + system
+of the agent shell and every child it waited for, from `/proc/$$/stat`, in
+10 ms ticks - and the next report carries it as `agent_prev_cpu_ms`, so every
+router measures what the agent costs it, the slow ones included. The file is
+emptied as it is read and wiped on a version change: after a run that was
+killed before its trap, and on the first report of a new version, the value
+is null, never an older run's. The detached SMART reader is not in it. A
+minute that produced no report cannot report itself either, so
+a run that meets the lock appends a line to `skipped`, and the next run that
+holds the lock folds those lines (taken by a rename, so a line appended
+meanwhile waits for the run after) into one `skipped.total` line of three
+counters: `l` = the previous run still held the lock, `p` = the POST failed,
+`k` = a run wedged for 5 minutes was killed. An accepted report clears the
+total. Each counter stops at 100,000, the server's range. That is how the
+server tells a router that was switched off from an agent that cannot keep
+up. (Until 0.1.8 every skip stayed a line and every run re-read up to 20,000
+of them.)
+
+The waits are bounded, so one bad minute does not become the next one's:
+
+- **The run lock has a maximum age.** A run holding it for 300 s is taken
+  over: it and every process below it get TERM, then KILL, and the run goes
+  on and reports `runs_skipped_killed`. The lock's `pid` file is what it
+  always was (older agents read it); `info` next to it holds the uptime when
+  the lock was taken and the holder's start time from `/proc/PID/stat`, so a
+  PID that belongs to another process by now is never killed. A process of
+  the tree that survives KILL (stuck in the kernel: usually not the holder
+  but the tool it waits for, `df` on a dead disk) keeps the lock - its PID
+  and start time go into the lock with a fresh age, the lock is marked
+  `killed`, and the run that reclaims it once the process is gone counts the
+  killed run. A second run beside it would only get stuck as well. The run's
+  own ancestors are never signalled. A lock is claimed by renaming it away,
+  so of two runs that judged the same lock only one gets it, and a run
+  removes the lock at its end only while it still names that run.
+  This needs a next run to meet the lock, which busybox crond never starts
+  (see the 0.1.9 notes above): the takeover works under cronie (Turris OS)
+  and for a run started by hand.
+- **The DNS probe** keeps busybox's own 5 s. A resolver that answers in 2-5 s
+  is slow, not dead; a shorter bound would report it as not answering.
+- **The POST has a deadline**: what is left of 58 s after the start, minus
+  5 s for the name lookup that `-T` does not bound, between 5 and 20 s. The
+  service checks and the self-update wait for the next minute when fewer than
+  12 s are left; action results only get shorter limits.
+- **The self-update** downloads to one fixed name in the private directory,
+  copies the verified file next to the script (`dd conv=fsync`, which flushes
+  that file only, never a global `sync` that a hung disk could hold) and
+  renames it over the script, after checking the flash has room for it; a
+  `.new` left by an interrupted swap is removed first. No `.bak` copy
+  (nothing read it), one flash write of the script instead of two, and no
+  moment when cron finds the agent missing or half written, which the old
+  `mv` from `/tmp` (another filesystem, so a copy) allowed.
 
 ### What the OpenWrt agent keeps on the router, and remote actions
 
@@ -508,8 +594,12 @@ can be written by another local user:
   `read`, 24 h). Before 0.1.7 it was a file in `/tmp` that the agent `eval`'d.
 - The last payload, for "what did the router send?", is
   `last-payload.json` in the same directory, mode 0600, with `agent_key`
-  blanked. The old `/tmp/status-agent-openwrt-last-payload.json` is removed
-  by the first run of the new version.
+  blanked. It is written by a plain `--dry-run`, after a POST that failed,
+  and on every run while `last-payload.on` exists in that directory; an
+  accepted report removes it. (Until 0.1.8 every run wrote it: 97 % of the
+  agent's tmpfs writes, about 20 MB a day, for a copy nobody read.) The old
+  `/tmp/status-agent-openwrt-last-payload.json` is removed by the first run
+  of the new version.
 - The first run of a new agent version drops every cache an older version
   wrote (identity, package and service lists, HiLink, and from 0.1.7 the
   Wi-Fi, disk, SMART and WAN path caches), so a parser fix shows at the update

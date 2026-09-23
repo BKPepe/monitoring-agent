@@ -33,18 +33,56 @@ if [ -n "$STATUS_HEAVY_OP_INTERVAL_HOURS" ]; then
     HEAVY_OP_INTERVAL_HOURS="$STATUS_HEAVY_OP_INTERVAL_HOURS"
 fi
 
-ScriptPath=$(dirname "$0")
+# The control characters the builtin parsers below compare against, from ONE
+# fork: POSIX sh cannot spell a CR or a tab any other way. BK_WSX is what
+# busybox awk's default field split treats as blank but `read` does not
+# (CR, VT, FF); a fast path meets it and hands the input to the old tool.
+_bk_ctl=$(printf '\r\t\013\014')
+BK_CR=${_bk_ctl%???}
+BK_TAB=${_bk_ctl#?}; BK_TAB=${BK_TAB%??}
+BK_WSX="$BK_CR${_bk_ctl#??}"
+BK_NL='
+'
+
+# dirname without the fork, the same answers musl's dirname() gives (it is
+# what the busybox applet prints): "." without a slash, "/" for the root.
+bk_dirname() {
+    _dn=$1
+    [ -z "$_dn" ] && { _dn=.; return 0; }
+    while :; do case "$_dn" in */) _dn=${_dn%/} ;; *) break ;; esac; done
+    case "$_dn" in '') _dn=/; return 0 ;; */*) ;; *) _dn=.; return 0 ;; esac
+    _dn=${_dn%/*}
+    while :; do case "$_dn" in */) _dn=${_dn%/} ;; *) break ;; esac; done
+    [ -z "$_dn" ] && _dn=/
+    return 0
+}
+bk_dirname "$0"; ScriptPath=$_dn
+
+# One cfg field as the old `$(echo "$x" | sed 's/^[[:space:]]*//;...')` gave
+# it, in $_t, without its three forks per field. busybox echo took a field
+# that is nothing but echo options (-n, -e, -E, -nE ...) as options and
+# printed nothing, so such a field still reads as empty.
+bk_cfg_field() {
+    _t=$1
+    case "$_t" in -?*) case "${_t#-}" in *[!neE]*) ;; *) _t="" ;; esac ;; esac
+    while :; do case "$_t" in [[:space:]]*) _t=${_t#?} ;; *) break ;; esac; done
+    while :; do case "$_t" in *[[:space:]]) _t=${_t%?} ;; *) break ;; esac; done
+}
 
 if [ -f "$ScriptPath/agent_openwrt.cfg" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
-        line=$(echo "$line" | tr -d '\r')
+        # Every CR goes, not only the last one: `tr -d '\r'` did the same.
+        while :; do case "$line" in *"$BK_CR"*) line=${line%%"$BK_CR"*}${line#*"$BK_CR"} ;; *) break ;; esac; done
         case "$line" in
             \#*|"") continue ;;
         esac
         case "$line" in
             *=*)
-                key=$(echo "${line%%=*}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                val=$(echo "${line#*=}" | sed "s/^[[:space:]]*//;s/[[:space:]]*\$//;s/^[\"']//;s/[\"']\$//")
+                bk_cfg_field "${line%%=*}"; key=$_t
+                bk_cfg_field "${line#*=}"; val=$_t
+                # One quote off each end, either kind, as the old sed did.
+                case "$val" in [\"\']*) val=${val#?} ;; esac
+                case "$val" in *[\"\']) val=${val%?} ;; esac
                 case "$key" in
                     API_URL) API_URL="$val" ;;
                     AGENT_KEY) AGENT_KEY="$val" ;;
@@ -116,7 +154,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.8"
+AGENT_VERSION="0.1.9"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
 
@@ -224,8 +262,22 @@ done
 # Presne to se stalo pri opravce Wi-Fi detekce: router hlasil "Hostapd Wi-Fi
 # AP" i po aktualizaci, protoze seznam sluzeb cetl z cache, kterou zapsala
 # stara verze. Hodinu jsme hledali chybu v kodu, ktery uz byl spravne.
+# The whole of FILE in $_sl, exactly what `$(cat FILE 2>/dev/null)` gave
+# (trailing newlines dropped, a missing file empty), from a builtin read loop
+# instead of a fork. Meant for the small files read back every minute.
+# Never for /proc/sys: a sysctl file answers only the first read(2), and
+# `read` takes one byte per call.
+bk_slurp() {
+    _sl=""; _sll=""
+    { while IFS= read -r _sll; do _sl="$_sl$_sll$BK_NL"; _sll=""; done; } 2>/dev/null < "$1"
+    _sl="$_sl$_sll"
+    while :; do case "$_sl" in *"$BK_NL") _sl=${_sl%"$BK_NL"} ;; *) break ;; esac; done
+    return 0
+}
+
 BK_VERSION_STAMP="/tmp/status-agent-openwrt-version.stamp"
-if [ "$(cat "$BK_VERSION_STAMP" 2>/dev/null)" != "$AGENT_VERSION" ]; then
+bk_slurp "$BK_VERSION_STAMP"
+if [ "$_sl" != "$AGENT_VERSION" ]; then
     # The identity cache moved into the private directory (both of its
     # possible places are named, the directory is chosen further down). The
     # old last-payload file goes as well: 0.1.6 wrote it world-readable with
@@ -250,13 +302,17 @@ if [ "$(cat "$BK_VERSION_STAMP" 2>/dev/null)" != "$AGENT_VERSION" ]; then
     # readings, the WAN path and the rate states. NOT on the list, on purpose:
     # probe.count, probe.attempts, pending.state, probe-out/ and skipped -
     # spend the owner consented to and results not sent yet are no cache.
+    # run.cpu goes too: the last run of the old version (the one that just
+    # downloaded this file) is not what this version costs, and the first
+    # report of a new version is exactly the one a canary is judged by.
     for _bk_pd in /var/run/status-agent-openwrt /tmp/status-agent-openwrt-private; do
         # A planted symlink is never used as the private directory (see
         # bk_private_dir_ok), so nothing behind it is ours to delete.
         [ -L "$_bk_pd" ] && continue
         rm -f "$_bk_pd/wifi-survey.state" "$_bk_pd"/wifi-caps.* \
               "$_bk_pd/disks.static" "$_bk_pd/smart.cache" "$_bk_pd/smart.spawn" \
-              "$_bk_pd/wan-path.cache" "$_bk_pd"/cores.* "$_bk_pd/wan-rate.state" 2>/dev/null || true
+              "$_bk_pd/wan-path.cache" "$_bk_pd"/cores.* "$_bk_pd/wan-rate.state" \
+              "$_bk_pd/run.cpu" 2>/dev/null || true
     done
     # 0.1.6 remembered only the newest speedtest file here and so never sent
     # the older ones; without the file the first run offers them all again.
@@ -264,8 +320,92 @@ if [ "$(cat "$BK_VERSION_STAMP" 2>/dev/null)" != "$AGENT_VERSION" ]; then
     echo "$AGENT_VERSION" > "$BK_VERSION_STAMP" 2>/dev/null || true
 fi
 
+# JSON string escaping without a fork, into $_jr: a backslash and a quote
+# are escaped, a CR is dropped and a newline becomes a space - byte for
+# byte what `printf | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g' | tr '\n' ' '`
+# produced, at four forks a call and 17 calls a report. Other control
+# characters pass through untouched, as they did.
+bk_js() {
+    _js=$1
+    case "$_js" in *[\\\"$BK_CR$BK_NL]*) ;; *) _jr=$_js; return 0 ;; esac
+    _jr=""
+    while :; do
+        case "$_js" in
+            *[\\\"$BK_CR$BK_NL]*) ;;
+            *) _jr=$_jr$_js; return 0 ;;
+        esac
+        _jh=${_js%%[\\\"$BK_CR$BK_NL]*}; _js=${_js#"$_jh"}
+        _jc=${_js%"${_js#?}"}; _js=${_js#?}
+        case "$_jc" in
+            \\) _jr="$_jr$_jh\\\\" ;;
+            \") _jr="$_jr$_jh\\\"" ;;
+            "$BK_CR") _jr="$_jr$_jh" ;;
+            *) _jr="$_jr$_jh " ;;
+        esac
+    done
+}
+# json_val's answer in $_jr: null for an empty value or the string "null",
+# else the escaped value in quotes.
+bk_jv() {
+    if [ -z "$1" ] || [ "$1" = "null" ]; then _jr=null; else bk_js "$1"; _jr="\"$_jr\""; fi
+}
+
 json_str() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g' | tr '\n' ' '
+    bk_js "$1"; printf '%s' "$_jr"
+}
+
+# NUM / DEN to DIGITS (1 or 2) decimals in $_fd, the same text as awk's
+# printf "%.<DIGITS>f", NUM / DEN, without the awk. Shell integers do it
+# exactly for plain non-negative numbers below 10^12, where a double cannot
+# land on the other side of a rounding boundary. An exact tie is decided by
+# which way the double of the quotient happened to round, so a tie - like
+# every input outside that range - still goes to awk.
+bk_fdiv_awk() {
+    _fd=$(awk -v n="$1" -v d="$2" "BEGIN { printf \"%.$3f\", n / d }")
+}
+bk_fdiv() {
+    case "$1" in 0|[1-9]|[1-9]*[0-9]) ;; *) bk_fdiv_awk "$@"; return 0 ;; esac
+    case "$2" in [1-9]|[1-9]*[0-9]) ;; *) bk_fdiv_awk "$@"; return 0 ;; esac
+    case "$1$2" in *[!0-9]*) bk_fdiv_awk "$@"; return 0 ;; esac
+    case "$1" in ?????????????*) bk_fdiv_awk "$@"; return 0 ;; esac
+    case "$2" in ?????????????*) bk_fdiv_awk "$@"; return 0 ;; esac
+    case "$3" in 1) _fm=10 ;; 2) _fm=100 ;; *) bk_fdiv_awk "$@"; return 0 ;; esac
+    _fq=$(( $1 * _fm / $2 )); _fr=$(( $1 * _fm % $2 * 2 ))
+    [ "$_fr" -eq "$2" ] && { bk_fdiv_awk "$@"; return 0; }
+    [ "$_fr" -gt "$2" ] && _fq=$((_fq + 1))
+    _ff=$((_fq % _fm))
+    [ "$_fm" = 100 ] && [ "$_ff" -lt 10 ] && _ff="0$_ff"
+    _fd="$((_fq / _fm)).$_ff"
+}
+
+# The single line of one of the agent's own state files in $_sl, read
+# without a fork. Status 0 when the file holds at most one line and no CR,
+# VT or FF (which awk would split on and `read` would not); a missing or
+# empty file is status 0 and empty, as the old tools read it. Anything else
+# is status 1 and the caller asks the old tool, so a damaged file still
+# reads exactly as it did.
+bk_line1() {
+    _sl=""; _sl2=""; _slm=""
+    { IFS= read -r _sl; IFS= read -r _sl2 && _slm=1; } 2>/dev/null < "$1"
+    [ -z "$_slm" ] && [ -z "$_sl2" ] || return 1
+    case "$_sl" in *["$BK_WSX"]*) return 1 ;; esac
+    return 0
+}
+# awk's $1 and $2 of a line (fields split on spaces and tabs) in $_b1 $_b2.
+bk_blank2() {
+    _b=$1
+    _b=${_b#"${_b%%[! $BK_TAB]*}"}; _b1=${_b%%[ $BK_TAB]*}; _b=${_b#"$_b1"}
+    _b=${_b#"${_b%%[! $BK_TAB]*}"}; _b2=${_b%%[ $BK_TAB]*}
+}
+# `cut -d, -f1..3` of a line in $_c1 $_c2 $_c3, including cut's rule that a
+# line without the delimiter is printed whole for every field.
+bk_cut3() {
+    case "$1" in
+        *"$2"*)
+            _c1=${1%%"$2"*}; _cr3=${1#*"$2"}; _c2=${_cr3%%"$2"*}; _c3=""
+            case "$_cr3" in *"$2"*) _cr3=${_cr3#*"$2"}; _c3=${_cr3%%"$2"*} ;; esac ;;
+        *) _c1=$1; _c2=$1; _c3=$1 ;;
+    esac
 }
 
 # Vypise JSON hodnotu: bud null (bez uvozovek), nebo uvozovkovany retezec.
@@ -274,11 +414,7 @@ json_str() {
 # "null" a `"$(json_str "$v")"` z ni udelal RETEZEC "null", takze UI
 # poctive vypsalo `null · "null"` misto pomlcky.
 json_val() {
-    if [ -z "$1" ] || [ "$1" = "null" ]; then
-        printf 'null'
-    else
-        printf '"%s"' "$(json_str "$1")"
-    fi
+    bk_jv "$1"; printf '%s' "$_jr"
 }
 
 log_message() {
@@ -295,12 +431,18 @@ log_message() {
     # (CONFIG_STAT is not set), so the size came back empty, the guard below
     # rewrote it to 0 and the trim never ran on a single router - while the
     # test image, a busybox defconfig build, does ship stat and looked fine.
+    # Once per run, after the run's first line: the check costs three forks
+    # and a run adds a few hundred bytes, so checking every line (a verbose
+    # --dry-run writes eight) bought nothing but forks.
+    [ -n "$_bk_log_checked" ] && return 0
+    _bk_log_checked=1
     _log_size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -cd '0-9')
     case "$_log_size" in ''|*[!0-9]*) _log_size=0 ;; esac
     if [ "$_log_size" -gt 65536 ]; then
         tail -c 32768 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null
     fi
 }
+_bk_log_checked=""
 
 # Progress chatter reaches the file only with --verbose; errors and actions always.
 log_debug() {
@@ -533,41 +675,261 @@ if [ "$1" = "--smart-refresh" ]; then
     exit 0
 fi
 
+# The run lock has a maximum age (WW-07). Before, one run wedged for good (a
+# driver call that never returns, a POST into a black hole) made every later
+# run exit at the lock until the next reboot: the router went silent with no
+# stated cause. A holder older than 300 s is taken over now - it and every
+# process below it are killed - and the next report says so.
+#
+# The lock keeps `pid` exactly as before (the PID alone), because an OLDER
+# agent reads it with $(cat) and a digit check: any other content would look
+# like garbage to it and it would take a live lock away. The age and the
+# holder's identity go into a second file, `info`: the uptime (centiseconds)
+# when the lock was taken, and the holder's start time from /proc/PID/stat.
+# The start time is what stops a takeover from killing a stranger: a holder
+# that died by SIGKILL (the OOM killer) leaves its lock behind, and the PID
+# can belong to some other process by now - same PID, different start time.
 BK_LOCK_DIR="$BK_PRIVATE_DIR/run.lock"
+BK_LOCK_MAX_CS=30000
+
+# From /proc/PID/stat: the state (field 3) into _ps_state, the parent
+# (field 4) into _ps_ppid and the start time in clock ticks since boot (field
+# 22) into _ps_start - all empty when the process is gone. The command name
+# in field 2 may hold spaces and brackets, so everything up to its LAST ") "
+# is dropped first. A function, so `set --` leaves the script's arguments.
+bk_proc_start() {
+    _ps_start=""; _ps_state=""; _ps_ppid=""
+    # 2>/dev/null BEFORE the `<`: redirections apply left to right, and a
+    # process that is gone would otherwise print "can't open" on stderr.
+    read -r _ps_l 2>/dev/null < "/proc/$1/stat" || return 0
+    _ps_l=${_ps_l##*") "}
+    # shellcheck disable=SC2086
+    set -- $_ps_l
+    [ $# -ge 20 ] || return 0
+    _ps_state=$1; _ps_ppid=$2; _ps_start=${20}
+    case "$_ps_start" in *[!0-9]*) _ps_start="" ;; esac
+}
+# The holder and every process below it, as " pid pid ... " in _kt_list, from
+# the ppid field of /proc/*/stat with builtins. Taken once, BEFORE any signal:
+# a killed parent hands its children to init, and they would drop out.
+bk_lock_tree() {
+    _kt_list=" $1 "; _kt_more=1
+    while [ "$_kt_more" = 1 ]; do
+        _kt_more=0
+        for _kt_d in /proc/[0-9]*; do
+            _kt_p=${_kt_d#/proc/}
+            case "$_kt_list" in *" $_kt_p "*) continue ;; esac
+            read -r _kt_s 2>/dev/null < "$_kt_d/stat" || continue
+            _kt_s=${_kt_s##*") "}
+            # shellcheck disable=SC2086
+            set -- $_kt_s
+            case "$_kt_list" in *" $2 "*) _kt_list="$_kt_list$_kt_p "; _kt_more=1 ;; esac
+        done
+    done
+}
+bk_lock_killed=0
 if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
-    _lock_pid=$(cat "$BK_LOCK_DIR/pid" 2>/dev/null)
+    # `read`, not $(cat): one fork less on every run that meets a lock.
+    _lock_pid=""
+    read -r _lock_pid 2>/dev/null < "$BK_LOCK_DIR/pid"
     # Digits only: /tmp is world-writable and "../.." in here would make the
     # -d test true forever.
     case "$_lock_pid" in ''|*[!0-9]*) _lock_pid="" ;; esac
+    # The PID this run judges; the claim below takes only a lock that still
+    # names it.
+    _lock_seen=$_lock_pid
+    if [ -n "$_lock_pid" ] && [ -d "/proc/$_lock_pid" ]; then
+        _lock_since=""; _lock_start=""
+        read -r _lock_since _lock_start 2>/dev/null < "$BK_LOCK_DIR/info"
+        case "$_lock_since" in ''|*[!0-9]*) _lock_since="" ;; esac
+        case "$_lock_start" in ''|*[!0-9]*) _lock_start="" ;; esac
+        bk_proc_start "$_lock_pid"
+        if [ -n "$_lock_start" ] && [ -n "$_ps_start" ] && [ "$_ps_start" != "$_lock_start" ]; then
+            # Same PID, another process: the holder is long gone.
+            log_message "Zamek drzi PID $_lock_pid, ktery uz patri jinemu procesu - zamek je opusteny."
+            _lock_pid=""
+        elif [ -n "$_lock_since" ] && [ -n "$_lock_start" ] && [ -n "$_ps_start" ] && [ -n "$BK_RUN_START_CS" ] \
+            && [ $((BK_RUN_START_CS - _lock_since)) -ge "$BK_LOCK_MAX_CS" ]; then
+            # The start times are equal here (the branch above took every
+            # mismatch). A lock without a full `info` (taken by an older
+            # agent, or being taken right now) is never old: without a start
+            # time the holder cannot be told from a stranger.
+            bk_lock_tree "$_lock_pid"
+            # This run and its ancestors (cron, procd) are never signalled,
+            # whatever a lock file says.
+            _kt_anc=" $$ "; _kt_a=$$
+            while [ "$_kt_a" -gt 1 ] 2>/dev/null; do
+                bk_proc_start "$_kt_a"; _kt_a=$_ps_ppid
+                case "$_kt_a" in ''|*[!0-9]*) break ;; esac
+                _kt_anc="$_kt_anc$_kt_a "
+            done
+            log_message "Predchozi beh (PID $_lock_pid) drzi zamek $(( (BK_RUN_START_CS - _lock_since) / 100 )) s, ukoncuji ho."
+            for _kt_p in $_kt_list; do
+                case "$_kt_anc" in *" $_kt_p "*) continue ;; esac
+                kill -TERM "$_kt_p" 2>/dev/null
+            done
+            sleep 1
+            _kt_left=""
+            for _kt_p in $_kt_list; do
+                case "$_kt_anc" in *" $_kt_p "*) continue ;; esac
+                bk_proc_start "$_kt_p"
+                # A zombie is dead already; only its parent can remove it.
+                [ -n "$_ps_state" ] && [ "$_ps_state" != Z ] && kill -KILL "$_kt_p" 2>/dev/null && _kt_left=1
+            done
+            [ -n "$_kt_left" ] && sleep 1
+            # Gone, or a zombie: busybox crond reaps its children only every
+            # 10 s, so a holder killed a moment ago is usually still listed -
+            # and a zombie holds nothing any more. Anything else survived
+            # SIGKILL: stuck in the kernel (D state). That is usually not the
+            # holder shell but the tool it waits for - `df` on a dead disk,
+            # `iw` waiting on rtnl - so the holder dies, its child is handed
+            # to init, and a run started beside it walks into the same hang:
+            # one more unkillable process every 5 minutes. So every process
+            # of the tree is checked, the holder first; this run's ancestors
+            # were never signalled and are left out (the holder itself always
+            # counts).
+            _kt_keep=""
+            bk_proc_start "$_lock_pid"
+            if [ -n "$_ps_state" ] && [ "$_ps_state" != Z ]; then
+                _kt_keep=$_lock_pid
+            else
+                for _kt_p in $_kt_list; do
+                    case "$_kt_anc" in *" $_kt_p "*) continue ;; esac
+                    bk_proc_start "$_kt_p"
+                    if [ -n "$_ps_state" ] && [ "$_ps_state" != Z ]; then _kt_keep=$_kt_p; break; fi
+                done
+            fi
+            if [ -n "$_kt_keep" ]; then
+                # The lock STAYS, handed to the survivor the way bk_smart_refresh
+                # hands smart.lock to a hung smartctl: its PID, its start time
+                # and a fresh age. Every run skips at the lock meanwhile, the
+                # next takeover is tried 300 s later, and the lock frees itself
+                # when the kernel lets the process go. `killed` records that
+                # this run was ended by the takeover (an ancestor never is):
+                # the run that later reclaims the lock counts it.
+                case "$_kt_anc" in *" $_lock_pid "*) ;; *) : > "$BK_LOCK_DIR/killed" 2>/dev/null ;; esac
+                [ "$_kt_keep" = "$_lock_pid" ] || echo "$_kt_keep" > "$BK_LOCK_DIR/pid" 2>/dev/null
+                [ -n "$_ps_start" ] && printf '%s %s\n' "$BK_RUN_START_CS" "$_ps_start" > "$BK_LOCK_DIR/info" 2>/dev/null
+                log_message "Predchozi beh (PID $_lock_pid) nejde ukoncit ani SIGKILL (zustava PID $_kt_keep), tento koncim."
+                _lock_pid=$_kt_keep
+            else
+                bk_lock_killed=1
+                _lock_pid=""
+            fi
+        fi
+    fi
     if [ -n "$_lock_pid" ] && [ -d "/proc/$_lock_pid" ]; then
         log_message "Predchozi beh (PID $_lock_pid) jeste bezi, tento koncim."
         # G42: the minute that produced no report is remembered here, because
         # the report that WOULD have said so is exactly the one not sent. One
-        # line per skip; the next accepted report carries the count and drops
-        # the lines it counted. Without it the server cannot tell a router
-        # that was switched off from an agent that cannot keep up.
+        # line per skip, appended without the lock; the next run that holds
+        # the lock folds the lines into its counters (see "skipped" below).
+        # Without it the server cannot tell a router that was switched off
+        # from an agent that cannot keep up.
         printf 'l\n' >> "$BK_PRIVATE_DIR/skipped" 2>/dev/null || true
         exit 0
     fi
-    rm -rf "$BK_LOCK_DIR" 2>/dev/null
+    # Claimed by a RENAME, never `rm -rf` + `mkdir`: of two runs that judged
+    # the same lock (a manual run next to cron, both inside the takeover's two
+    # seconds of sleep), only one can move it away. With rm the later one
+    # deleted the lock the earlier one had just taken, both ran, and the first
+    # to finish removed the other's lock. What was moved away must still name
+    # the PID judged above; a lock another run took meanwhile goes back.
+    [ -e "$BK_LOCK_DIR.$$" ] && rm -rf "$BK_LOCK_DIR.$$" 2>/dev/null
+    if mv "$BK_LOCK_DIR" "$BK_LOCK_DIR.$$" 2>/dev/null; then
+        _lock_now=""
+        read -r _lock_now 2>/dev/null < "$BK_LOCK_DIR.$$/pid"
+        case "$_lock_now" in ''|*[!0-9]*) _lock_now="" ;; esac
+        if [ "$_lock_now" != "$_lock_seen" ]; then
+            [ -e "$BK_LOCK_DIR" ] || mv "$BK_LOCK_DIR.$$" "$BK_LOCK_DIR" 2>/dev/null
+            [ -e "$BK_LOCK_DIR.$$" ] && rm -rf "$BK_LOCK_DIR.$$" 2>/dev/null
+            log_message "Zamek mezitim prevzal jiny beh (PID $_lock_now), tento koncim."
+            printf 'l\n' >> "$BK_PRIVATE_DIR/skipped" 2>/dev/null || true
+            exit 0
+        fi
+        # A run the takeover signalled while the kernel still held it (the
+        # lock was kept for it, see `killed` above) is gone now: it counts.
+        [ -e "$BK_LOCK_DIR.$$/killed" ] && bk_lock_killed=1
+        rm -rf "$BK_LOCK_DIR.$$" 2>/dev/null
+    fi
     mkdir "$BK_LOCK_DIR" 2>/dev/null || exit 0
 fi
 echo "$$" > "$BK_LOCK_DIR/pid" 2>/dev/null
+# `pid` first, `info` second: a run that looks in between sees no age and
+# waits, it never takes over a lock that is being taken. No uptime or no
+# start time: no `info`, and such a lock is simply never taken over.
+bk_proc_start "$$"
+[ -n "$BK_RUN_START_CS" ] && [ -n "$_ps_start" ] && printf '%s %s\n' "$BK_RUN_START_CS" "$_ps_start" > "$BK_LOCK_DIR/info" 2>/dev/null
 
 # G42: the WHOLE previous run, its POST included. The payload is assembled
 # before the POST, so a run can never report its own total - and the POST is
 # what usually pushes a minute run past its minute, which is the thing worth
 # reporting. It is written by the EXIT trap below and read here.
+# CONSUMED like run.cpu below, and for the same reason: a run killed by a
+# takeover runs no trap, and the report after a 300 s wedge would otherwise
+# name the run BEFORE it as "the previous run", a few seconds long.
 BK_RUN_TOTAL_FILE="$BK_PRIVATE_DIR/run.total"
 agent_prev_total_ms="null"
-if read -r _prev_total < "$BK_RUN_TOTAL_FILE" 2>/dev/null; then
+if read -r _prev_total 2>/dev/null < "$BK_RUN_TOTAL_FILE"; then
     case "$_prev_total" in ''|*[!0-9]*) ;; *) agent_prev_total_ms="$_prev_total" ;; esac
+    : > "$BK_RUN_TOTAL_FILE" 2>/dev/null
 fi
 
+# W1-7 (ARCH-05): what the previous run cost in CPU - user + system time of
+# the agent shell AND of every child it waited for (each tool, each awk, the
+# POST with its TLS), the number `time agent_openwrt.sh` prints. A harness
+# measures the agent on one machine; this is every router measuring itself,
+# the slow MIPS ones included, so each later change is judged by the fleet
+# and not by an estimate. Taken by the EXIT trap below, for the same reason
+# as the total above: the POST comes after the payload.
+# The file is CONSUMED: emptied as soon as it has been read, under the lock.
+# A run that dies before its trap (killed by a takeover, the OOM killer, a
+# power cut) then leaves nothing behind, and the next report says null
+# instead of passing off the cost of an older run as the last one.
+BK_RUN_CPU_FILE="$BK_PRIVATE_DIR/run.cpu"
+agent_prev_cpu_ms="null"
+if read -r _prev_cpu 2>/dev/null < "$BK_RUN_CPU_FILE"; then
+    case "$_prev_cpu" in ''|*[!0-9]*) ;; *) agent_prev_cpu_ms="$_prev_cpu" ;; esac
+    : > "$BK_RUN_CPU_FILE" 2>/dev/null
+fi
+
+# This shell's CPU so far plus that of its waited-for children, in ms, into
+# _sc_ms; empty when /proc/$$/stat cannot be read or parsed. Fields 14-17 of
+# the stat line are utime, stime, cutime and cstime in USER_HZ ticks, which
+# the kernel exports at 100 per second on every architecture OpenWrt builds
+# (CONFIG_HZ does not change them, and a router has no getconf to ask): a
+# tick is 10 ms. The REAL /proc, never the test root: this is the agent's
+# own process. The name in field 2 may hold spaces, so everything up to its
+# last ") " goes first, as in bk_proc_start. No fork: the trap runs on every
+# exit, and a fork here would be counted in the very number it produces.
+bk_self_cpu_ms() {
+    _sc_ms=""
+    read -r _sc_l < "/proc/$$/stat" 2>/dev/null || return 0
+    _sc_l=${_sc_l##*") "}
+    # shellcheck disable=SC2086
+    set -- $_sc_l
+    [ $# -ge 15 ] || return 0
+    case "${12}${13}${14}${15}" in *[!0-9]*) return 0 ;; esac
+    _sc_ms=$(( (${12} + ${13} + ${14} + ${15}) * 10 ))
+}
+
 bk_run_end() {
+    # Only while this run still holds its lock. A run whose lock another run
+    # has taken since (a takeover judged it wedged, or it lost the claim)
+    # would write over files that run has already read, and delete its lock.
+    _re_pid=""
+    read -r _re_pid 2>/dev/null < "$BK_LOCK_DIR/pid"
+    [ "$_re_pid" = "$$" ] || return 0
     bk_uptime_cs
     if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
         printf '%s\n' "$(( (_up_cs - BK_RUN_START_CS) * 10 ))" > "$BK_RUN_TOTAL_FILE" 2>/dev/null || true
+    fi
+    # Last, but while the lock is still held: written after the `rm` below, it
+    # could land after the next run had already read (and emptied) the file,
+    # and would be reported one run late. So only that `rm` is not in it.
+    bk_self_cpu_ms
+    if [ -n "$_sc_ms" ]; then
+        printf '%s\n' "$_sc_ms" > "$BK_RUN_CPU_FILE" 2>/dev/null || true
     fi
     rm -rf "$BK_LOCK_DIR"
 }
@@ -608,6 +970,9 @@ log_debug "Ziskavam statistiky routeru (OpenWrt agent v$AGENT_VERSION)..."
 cpu="null"
 cpu_cores="null"; cpu_core_max_pct="null"; cpu_core_max_index="null"; cpu_core_max_softirq_pct="null"
 now_ts=$(date +%s)
+# The uptime at the same moment: agent_time is moved on from here to the
+# payload without a second `date` (see agent_run_ms).
+bk_uptime_cs; BK_NOW_TS_CS=$_up_cs
 BK_CORES_NOW="$BK_PRIVATE_DIR/cores.now"
 BK_CORES_PREV="$BK_PRIVATE_DIR/cores.prev"
 # One builtin loop instead of the `grep '^cpu '` fork: the aggregate line and
@@ -656,22 +1021,60 @@ END {
 # vraci stejna cisla, jen skalovana x65536 - zbytecna komplikace navic).
 load1="null"; load5="null"; load15="null"
 if [ -f /proc/loadavg ]; then
-    load1=$(awk '{print $1}' /proc/loadavg)
-    load5=$(awk '{print $2}' /proc/loadavg)
-    load15=$(awk '{print $3}' /proc/loadavg)
+    # One `read` instead of three awk: the kernel writes a single line of
+    # blank-separated fields, which is what both split on.
+    load1=""; load5=""; load15=""
+    read -r load1 load5 load15 _ < /proc/loadavg 2>/dev/null
+    # A CR, VT or FF would split differently in awk: then awk decides.
+    case "$load1$load5$load15" in *["$BK_WSX"]*)
+        load1=$(awk '{print $1}' /proc/loadavg)
+        load5=$(awk '{print $2}' /proc/loadavg)
+        load15=$(awk '{print $3}' /proc/loadavg) ;;
+    esac
 fi
 
 # Uptime (sekundy)
 uptime_sec="null"
-[ -f /proc/uptime ] && uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime)
+if [ -f /proc/uptime ]; then
+    # awk's printf "%d" cut the fraction off; so does the expansion. Only a
+    # plain "123.45" takes the fast path, anything else still goes to awk.
+    _ut=""; read -r _ut _ < /proc/uptime 2>/dev/null
+    _uw=${_ut%.*}; _uf=${_ut#*.}
+    case "$_ut" in *.*) ;; *) _uw=x ;; esac
+    case "$_uw" in 0|[1-9]*) ;; *) _uw=x ;; esac
+    case "$_uw$_uf" in
+        *[!0-9]*) uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime) ;;
+        *) uptime_sec=$_uw ;;
+    esac
+fi
 
 # Teplota (nejvyssi dostupna thermal zona) - volitelne, hodne routeru senzor nema.
 temperature="null"
 if [ -d /sys/class/thermal ]; then
-    max_temp=$(for z in /sys/class/thermal/thermal_zone*/temp; do
-        [ -r "$z" ] && cat "$z" 2>/dev/null
-    done | awk '$1 > 0 && $1 < 150000 { if ($1 > max) max = $1 } END { if (max) print max }')
-    [ -n "$max_temp" ] && temperature=$(awk -v m="$max_temp" 'BEGIN { printf "%.1f", m / 1000 }')
+    # Builtin: the old $(for ... cat | awk) cost a fork per zone plus two. A
+    # zone that does not hold a plain integer in millidegrees (it never
+    # should) sends the whole reading back to the old pipeline, so the
+    # answer cannot drift from what it was.
+    max_temp=""; _tz_odd=""
+    for z in /sys/class/thermal/thermal_zone*/temp; do
+        [ -r "$z" ] || continue
+        # One line with its newline, as sysfs writes it. A second line or a
+        # missing newline (cat glued it to the next zone's value) is odd.
+        _tz=""; _tz2=""; _tzr=0
+        { IFS= read -r _tz || _tzr=1; IFS= read -r _tz2 && _tz_odd=1; } < "$z" 2>/dev/null
+        [ -n "$_tz2" ] && _tz_odd=1
+        [ "$_tzr" = 1 ] && [ -n "$_tz" ] && _tz_odd=1
+        case "$_tz" in ''|0) continue ;; -[1-9]*) _tz_c=${_tz#-} ;; [1-9]*) _tz_c=$_tz ;; *) _tz_odd=1 ;; esac
+        [ -n "$_tz_odd" ] && break
+        case "$_tz_c" in *[!0-9]*|??????????*) _tz_odd=1; break ;; esac
+        [ "$_tz" -gt 0 ] && [ "$_tz" -lt 150000 ] && { [ -z "$max_temp" ] || [ "$_tz" -gt "$max_temp" ]; } && max_temp=$_tz
+    done
+    if [ -n "$_tz_odd" ]; then
+        max_temp=$(for z in /sys/class/thermal/thermal_zone*/temp; do
+            [ -r "$z" ] && cat "$z" 2>/dev/null
+        done | awk '$1 > 0 && $1 < 150000 { if ($1 > max) max = $1 } END { if (max) print max }')
+    fi
+    [ -n "$max_temp" ] && { bk_fdiv "$max_temp" 1000 1; temperature=$_fd; }
 fi
 
 # --- 2. Flash/Overlay - realny df, ne ubus "system info" root/tmp stanza.
@@ -701,7 +1104,8 @@ fi
 DISK_STATE_FILE="/tmp/status-agent-openwrt-disk.state"
 disk_io_write="null"
 if [ -f /proc/diskstats ]; then
-    now_ts=$(date +%s)
+    # now_ts is the run's clock from section 1: a second $(date) here was one
+    # more fork for the same second.
     # Bez shodneho disku se nevypisuje nic (drive nula, kterou pak stejne
     # odfiltroval test -gt 0 nize - ale vzor svadel k opakovani jinde).
     # Jen cela zarizeni, ne jejich oddily.
@@ -717,14 +1121,18 @@ if [ -f /proc/diskstats ]; then
     total_written_sectors=$(awk '$3 ~ /^(mtdblock[0-9]+|mmcblk[0-9]+|sd[a-z]|ubiblock[0-9_]+|nvme[0-9]+n[0-9]+|hd[a-z])$/ {sum += $10; n++} END {if (n>0) print sum}' /proc/diskstats 2>/dev/null)
     if [ -n "$total_written_sectors" ] && [ "$total_written_sectors" -gt 0 ]; then
         if [ -f "$DISK_STATE_FILE" ]; then
-            prev_ts=$(awk '{print $1}' "$DISK_STATE_FILE" 2>/dev/null)
-            prev_sec=$(awk '{print $2}' "$DISK_STATE_FILE" 2>/dev/null)
+            if bk_line1 "$DISK_STATE_FILE"; then
+                bk_blank2 "$_sl"; prev_ts=$_b1; prev_sec=$_b2
+            else
+                prev_ts=$(awk '{print $1}' "$DISK_STATE_FILE" 2>/dev/null)
+                prev_sec=$(awk '{print $2}' "$DISK_STATE_FILE" 2>/dev/null)
+            fi
             if [ -n "$prev_ts" ] && [ -n "$prev_sec" ] && [ "$now_ts" -gt "$prev_ts" ]; then
                 time_delta=$((now_ts - prev_ts))
                 sec_delta=$((total_written_sectors - prev_sec))
                 if [ "$sec_delta" -ge 0 ] && [ "$time_delta" -gt 0 ]; then
                     write_kb=$((sec_delta / 2))
-                    disk_io_write=$(awk -v k="$write_kb" -v t="$time_delta" 'BEGIN {printf "%.2f", k / t}')
+                    bk_fdiv "$write_kb" "$time_delta" 2; disk_io_write=$_fd
                 fi
             fi
         fi
@@ -810,11 +1218,22 @@ wan_up=""; wan_proto=""; wan_uptime="null"; wan_ipv4=""; wan_gateway=""; wan_dns
 dump_json=""
 command -v ubus >/dev/null 2>&1 && dump_json=$(ubus call network.interface dump 2>/dev/null)
 _bi_list=""
-# Scans the dump once into "key|name|proto" lines.
+_bi_loaded=0
+# Scans the dump once into "key|name|proto" lines. This is also the ONLY
+# json_load of the dump in a run: every reader below goes back to the root of
+# the tree already in the shell with `json_select ""` (what real jshn.sh does
+# for an empty name). Each json_load replays the whole dump as json_add_*
+# calls through eval; on an 8-interface router the real jshn spent about a
+# third of the run's CPU loading the same document five or six times.
+# Nothing between here and the last reader loads another document into jshn
+# (the board identity is read before this point), so the tree stays valid.
 bk_iface_scan() {
     [ -n "$_bi_list" ] && return 0
+    # Loaded, but no interface in it: loading it again would not add one.
+    [ "$_bi_loaded" = 1 ] && return 1
     [ -n "$dump_json" ] || return 1
     json_load "$dump_json"
+    _bi_loaded=1
     json_select interface
     _bi_keys=""
     json_get_keys _bi_keys
@@ -862,7 +1281,8 @@ EOF
         done
     fi
     [ -n "$_bi_hit" ] || return 1
-    json_load "$dump_json"
+    # Back to the root of the one loaded tree (see bk_iface_scan), not a reload.
+    json_select ""
     json_select interface
     json_select "$_bi_hit"
     return 0
@@ -940,14 +1360,19 @@ if [ -n "$wan_l3_device" ] && [ -f /proc/net/dev ]; then
             # The device is part of the state: after a failover the WAN device
             # changes (pppoe-wan -> wwan0) and a delta between two different
             # counters charged the whole new session to one interval.
-            prev_ts=$(cut -d',' -f1 "$NET_STATE_FILE" 2>/dev/null)
-            prev_dev=$(cut -d',' -f2 "$NET_STATE_FILE" 2>/dev/null)
-            prev_bytes=$(cut -d',' -f3 "$NET_STATE_FILE" 2>/dev/null)
+            # Builtin read of the one line this block wrote (3 cut forks before).
+            if bk_line1 "$NET_STATE_FILE"; then
+                bk_cut3 "$_sl" ,; prev_ts=$_c1; prev_dev=$_c2; prev_bytes=$_c3
+            else
+                prev_ts=$(cut -d',' -f1 "$NET_STATE_FILE" 2>/dev/null)
+                prev_dev=$(cut -d',' -f2 "$NET_STATE_FILE" 2>/dev/null)
+                prev_bytes=$(cut -d',' -f3 "$NET_STATE_FILE" 2>/dev/null)
+            fi
             if [ "$prev_dev" = "$wan_l3_device" ] && [ -n "$prev_ts" ] && [ -n "$prev_bytes" ]; then
                 elapsed=$((now_ts - prev_ts))
                 delta=$((net_bytes - prev_bytes))
                 if [ "$elapsed" -gt 0 ] && [ "$delta" -ge 0 ]; then
-                    net=$(awk -v d="$delta" -v e="$elapsed" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
+                    bk_fdiv "$delta" "$((elapsed * 1024))" 1; net=$_fd
                 fi
             fi
         fi
@@ -965,9 +1390,13 @@ v6_bytes=$(awk '/^Ip6(In|Out)Octets/ { sum += $2 } END { print sum + 0 }' /proc/
 
 if [ -n "$v4_bytes" ] && [ "$v4_bytes" -gt 0 ]; then
     if [ -f "$NET_IP_STATE_FILE" ]; then
-        prev_ts=$(cut -d',' -f1 "$NET_IP_STATE_FILE" 2>/dev/null)
-        prev_v4=$(cut -d',' -f2 "$NET_IP_STATE_FILE" 2>/dev/null)
-        prev_v6=$(cut -d',' -f3 "$NET_IP_STATE_FILE" 2>/dev/null)
+        if bk_line1 "$NET_IP_STATE_FILE"; then
+            bk_cut3 "$_sl" ,; prev_ts=$_c1; prev_v4=$_c2; prev_v6=$_c3
+        else
+            prev_ts=$(cut -d',' -f1 "$NET_IP_STATE_FILE" 2>/dev/null)
+            prev_v4=$(cut -d',' -f2 "$NET_IP_STATE_FILE" 2>/dev/null)
+            prev_v6=$(cut -d',' -f3 "$NET_IP_STATE_FILE" 2>/dev/null)
+        fi
         if [ -n "$prev_ts" ] && [ -n "$prev_v4" ] && [ "$now_ts" -gt "$prev_ts" ]; then
             elapsed=$((now_ts - prev_ts))
             d_v4=$((v4_bytes - prev_v4))
@@ -976,10 +1405,10 @@ if [ -n "$v4_bytes" ] && [ "$v4_bytes" -gt 0 ]; then
             d_v6=""
             [ -n "$v6_bytes" ] && [ -n "$prev_v6" ] && d_v6=$((v6_bytes - prev_v6))
             if [ "$elapsed" -gt 0 ] && [ "$d_v4" -ge 0 ]; then
-                net_ipv4_kbps=$(awk -v d="$d_v4" -v e="$elapsed" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
+                bk_fdiv "$d_v4" "$((elapsed * 1024))" 1; net_ipv4_kbps=$_fd
             fi
             if [ -n "$d_v6" ] && [ "$elapsed" -gt 0 ] && [ "$d_v6" -ge 0 ]; then
-                net_ipv6_kbps=$(awk -v d="$d_v6" -v e="$elapsed" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
+                bk_fdiv "$d_v6" "$((elapsed * 1024))" 1; net_ipv6_kbps=$_fd
             fi
         fi
     fi
@@ -990,32 +1419,32 @@ fi
 # "wan6" (typicke pro PPPoE + DHCPv6-PD), protoze "wan" samo casto ma jen
 # link-local fe80:: adresu, ktera pro verejne zobrazeni nema smysl. ---
 wan_ipv6=""
-if [ -n "$dump_json" ]; then
-    json_load "$dump_json"
+# The interfaces called wan6, in dump order, from the names bk_iface_scan
+# already read: no reload of the dump and no json_select into each of the
+# other interfaces just to learn its name.
+if [ -n "$dump_json" ] && bk_iface_scan; then
+    json_select ""
     json_select interface
-    json_get_keys iface_keys
-    for k in $iface_keys; do
-        json_select "$k"
-        iface_name=""
-        json_get_var iface_name interface
-        if [ "$iface_name" = "wan6" ]; then
-            json_get_keys v6_keys "ipv6-address"
-            for vk in $v6_keys; do
-                json_select "ipv6-address"
-                json_select "$vk"
-                candidate=""
-                json_get_var candidate address
-                json_select ..
-                json_select ..
-                case "$candidate" in
-                    fe80:*) ;;
-                    *) [ -z "$wan_ipv6" ] && wan_ipv6="$candidate" ;;
-                esac
-            done
-        fi
+    while IFS='|' read -r _bi_k _bi_n _bi_p; do
+        [ "$_bi_n" = "wan6" ] || continue
+        json_select "$_bi_k"
+        json_get_keys v6_keys "ipv6-address"
+        for vk in $v6_keys; do
+            json_select "ipv6-address"
+            json_select "$vk"
+            candidate=""
+            json_get_var candidate address
+            json_select ..
+            json_select ..
+            case "$candidate" in
+                fe80:*) ;;
+                *) [ -z "$wan_ipv6" ] && wan_ipv6="$candidate" ;;
+            esac
+        done
         json_select ..
-    done
-    json_select ..
+    done <<EOF
+$_bi_list
+EOF
 fi
 # --- 4c. WAN port walk (WAN 3.1.1) - link rate and physical port, 0 forks ---
 # Two questions, one walk. A VLAN, bridge or macvlan netdev answers `speed` by
@@ -1274,6 +1703,8 @@ swap_pct=$(awk '/^SwapTotal:/ {total=$2} /^SwapFree:/ {free=$2} END { if (total 
 [ -z "$swap_pct" ] && swap_pct="null"
 
 entropy="null"
+# Stays a cat, like the conntrack count below: a /proc/sys file answers only
+# the first read(2), and `read` takes one byte per call - it saw "2" of 256.
 [ -f /proc/sys/kernel/random/entropy_avail ] && entropy=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null)
 
 # Pocet spojeni ma dve cesty a novejsi jadra znaji jen tu druhou.
@@ -1301,7 +1732,8 @@ fi
 upgradable_packages="null"
 installed_packages="null"
 OPKG_CACHE_FILE="/tmp/status-agent-openwrt-opkg.cache"
-now_sec=$(date +%s)
+# The run's clock (section 1), not a second `date` fork.
+now_sec=$now_ts
 opkg_cache_age=999999
 if [ -f "$OPKG_CACHE_FILE" ]; then
     opkg_mtime=$(date -r "$OPKG_CACHE_FILE" +%s 2>/dev/null || echo 0)
@@ -1309,8 +1741,12 @@ if [ -f "$OPKG_CACHE_FILE" ]; then
 fi
 
 if [ $opkg_cache_age -lt $HEAVY_OP_INTERVAL_SEC ] && [ -f "$OPKG_CACHE_FILE" ]; then
-    upgradable_packages=$(cut -d'|' -f1 "$OPKG_CACHE_FILE" 2>/dev/null)
-    installed_packages=$(cut -d'|' -f2 "$OPKG_CACHE_FILE" 2>/dev/null)
+    if bk_line1 "$OPKG_CACHE_FILE"; then
+        bk_cut3 "$_sl" '|'; upgradable_packages=$_c1; installed_packages=$_c2
+    else
+        upgradable_packages=$(cut -d'|' -f1 "$OPKG_CACHE_FILE" 2>/dev/null)
+        installed_packages=$(cut -d'|' -f2 "$OPKG_CACHE_FILE" 2>/dev/null)
+    fi
 else
     # OpenWrt 24.10 vymenilo opkg za apk (apk-tools 3).
     #
@@ -1423,19 +1859,44 @@ fw_rejected="null"
 # rozborem: fw4 pise veci jako comment "!fw4: Drop excess packets", takze slovo
 # "packets" v textu by jinak pricetlo, co za nim nahodou stoji.
 # Pocita se jen "counter packets N" - pravidlo bez pocitadla zadne cislo nema.
-_nft_verdict_packets() {
-    printf '%s\n' "$bk_nft_rules" | awk -v want="$1" '
-        {
-            line = $0
-            sub(/comment ".*/, "", line)
-            nf = split(line, f, /[ \t]+/)
-            hit = 0
-            for (i = 1; i <= nf; i++) if (f[i] == want || f[i] == (want ";")) hit = 1
-            if (!hit) next
-            for (i = 2; i <= nf; i++) if (f[i] == "packets" && f[i-1] == "counter") { sum += f[i+1]; n++ }
+#
+# ONE awk reads the ruleset as it streams out of nft and answers everything
+# this run asks of it: the three verdict sums (each its own sum over the same
+# lines, exactly as three separate passes summed them), whether a line holds
+# "table inet fw4" (firewall_enabled) and whether one holds "flowtable " (the
+# WAN path). Before, the whole ruleset was held in the shell and piped into
+# three more awks; with a banIP or adblock set of 10k elements that was the
+# set four times over. `nft -t` leaves the elements of NAMED sets and maps
+# out; rules, with their inline anonymous sets and vmaps, print in full. An
+# element line only ever counted when it held a verdict AND per-element
+# counters, i.e. a named verdict map with counters. fw4 creates none, and a
+# plain set of addresses (banIP, adblock) holds no verdict, so its elements
+# never counted and leaving them out changes no sum.
+# Output: "FW4 FT |ACCEPT|DROP|REJECT" (an empty sum = no counted rule), and
+# nothing at all when nft printed nothing - "an empty kernel" stays what it
+# was before: no counters from nft, then the iptables branch.
+BK_NFT_AWK='
+    length($0) > 0 { any = 1 }
+    index($0, "table inet fw4") { fw4 = 1 }
+    index($0, "flowtable ") { ft = 1 }
+    {
+        line = $0
+        sub(/comment ".*/, "", line)
+        nf = split(line, f, /[ \t]+/)
+        ha = hd = hr = 0
+        for (i = 1; i <= nf; i++) {
+            if (f[i] == "accept" || f[i] == "accept;") ha = 1
+            if (f[i] == "drop" || f[i] == "drop;") hd = 1
+            if (f[i] == "reject" || f[i] == "reject;") hr = 1
         }
-        END { if (n > 0) print sum }'
-}
+        if (!(ha || hd || hr)) next
+        for (i = 2; i <= nf; i++) if (f[i] == "packets" && f[i-1] == "counter") {
+            if (ha) { sa += f[i+1]; na++ }
+            if (hd) { sd += f[i+1]; nd++ }
+            if (hr) { sr += f[i+1]; nr++ }
+        }
+    }
+    END { if (any) print fw4 " " ft " |" (na > 0 ? sa : "") "|" (nd > 0 ? sd : "") "|" (nr > 0 ? sr : "") }'
 
 # Secte sloupec pkts u radku iptables s danym cilem (ACCEPT/DROP/REJECT).
 _ipt_target_packets() {
@@ -1450,16 +1911,25 @@ _ipt_target_packets() {
 # nainstalovana kompatibilni vrstva `iptables`, ktera o nich nevi a vypise
 # prazdnou tabulku. Puvodni poradi proto na takovem routeru cetlo prazdno
 # a firewall se netvaril, ze se nemeri - tvaril se, ze nic nezahazuje.
-# The ruleset is fetched once (it was dumped from the kernel four times a run
-# - hundreds of lines each on fw4) and reused for the three sums and the
-# enabled check below.
-bk_nft_rules=""
+# The ruleset is read once, in the one pass above (it was dumped from the
+# kernel four times a run before 0.1.7, and held in the shell until now).
+bk_nft_out=""
+bk_nft_fw4=0
+bk_nft_ft=0
 bk_have_nft=0
-command -v nft >/dev/null 2>&1 && { bk_have_nft=1; bk_nft_rules=$(nft list ruleset 2>/dev/null); }
-if [ -n "$bk_nft_rules" ]; then
-    fw_accepted=$(_nft_verdict_packets accept)
-    fw_dropped=$(_nft_verdict_packets drop)
-    fw_rejected=$(_nft_verdict_packets reject)
+if command -v nft >/dev/null 2>&1; then
+    bk_have_nft=1
+    bk_nft_out=$(nft -t list ruleset 2>/dev/null | awk "$BK_NFT_AWK")
+    # An nft too old for -t fails without printing anything, and so answers
+    # like an empty kernel: ask once more without it. On a kernel that really
+    # is empty this lists nothing a second time; the answer is the same.
+    [ -n "$bk_nft_out" ] || bk_nft_out=$(nft list ruleset 2>/dev/null | awk "$BK_NFT_AWK")
+fi
+if [ -n "$bk_nft_out" ]; then
+    bk_nft_fw4=${bk_nft_out%% *}; _fw_r=${bk_nft_out#* }
+    bk_nft_ft=${_fw_r%% *}; _fw_r=${_fw_r#* |}
+    fw_accepted=${_fw_r%%|*}; _fw_r=${_fw_r#*|}
+    fw_dropped=${_fw_r%%|*}; fw_rejected=${_fw_r#*|}
 elif command -v iptables >/dev/null 2>&1; then
     fw_accepted=$(_ipt_target_packets ACCEPT)
     fw_dropped=$(_ipt_target_packets DROP)
@@ -1485,8 +1955,8 @@ fi
 # server raises nothing on a null.
 firewall_enabled="null"
 if [ "$bk_have_nft" = 1 ]; then
-    case "$bk_nft_rules" in
-        *"table inet fw4"*) firewall_enabled="true" ;;
+    case "$bk_nft_fw4" in
+        1) firewall_enabled="true" ;;
         *) firewall_enabled="false" ;;
     esac
 elif command -v iptables >/dev/null 2>&1; then
@@ -1571,8 +2041,6 @@ fi
 [ -z "$LIBRESPEED_DIR" ] && LIBRESPEED_DIR="/tmp/librespeed-data"
 LIBRESPEED_STATE_FILE="$BK_PRIVATE_DIR/librespeed.state"
 BK_SPEED_PENDING="$BK_PRIVATE_DIR/pending.state"
-BK_NL='
-'
 speedtests_json="[]"
 speedtests_newest=""
 # An INTERVAL flag: the report covers the last ~60 s, so a test that ended
@@ -1753,7 +2221,7 @@ diskdev_active=" "
 # and the disk health list have to describe the same disks, and in a test
 # those are the fake root's, not the CI runner's.
 if [ -f "$BK_PROC/diskstats" ]; then
-    diskdev_now=$(date +%s)
+    diskdev_now=$now_ts   # the run's clock, not one more `date` fork
     # Kotva $ za nazvem znamenala, ze `mmcblk` sedelo jen na zarizeni doslova
     # pojmenovane "mmcblk" - jenze skutecne se jmenuje mmcblk0. Stejne tak
     # mtdblock0 a ubiblock0_0. Ze seznamu tedy vypadlo hlavni uloziste routeru
@@ -1767,7 +2235,8 @@ if [ -f "$BK_PROC/diskstats" ]; then
 
     if [ -n "$diskdev_cur" ]; then
         diskdev_prev_ts=""
-        [ -f "$DISKDEV_STATE_FILE" ] && diskdev_prev_ts=$(head -n 1 "$DISKDEV_STATE_FILE" 2>/dev/null)
+        # `head -n 1` as a builtin: the first line, whatever it holds.
+        [ -f "$DISKDEV_STATE_FILE" ] && { IFS= read -r diskdev_prev_ts; } 2>/dev/null < "$DISKDEV_STATE_FILE"
 
         _diskdev_out=$(printf '%s\n' "$diskdev_cur" | awk -F'|' \
             -v prev_file="$DISKDEV_STATE_FILE" -v now_ts="$diskdev_now" -v prev_ts="$diskdev_prev_ts" '
@@ -2035,6 +2504,9 @@ fi
 # hlasila u vsech procesu stejnou nesmyslnou hodnotu (20.0 %) a nulovou RAM.
 top_cpu_json="[]"
 top_ram_json="[]"
+# " name name ... " of every process in the snapshot, or empty when there is
+# no snapshot to ask (no top, no output, no header): bk_running then asks pidof.
+bk_top_names=""
 if command -v top >/dev/null 2>&1; then
     # procps-ng orezava sloupec COMMAND na sirku terminalu a useknute jmeno
     # oznaci plusem ("pyt+", "kr+"). -w 512 sirku vynuti; busybox top prepinac
@@ -2056,17 +2528,39 @@ if command -v top >/dev/null 2>&1; then
     COLUMNS=512 top $bk_top_args >"$BK_TOP_OUT" 2>/dev/null &
     bk_top_pid=$!
     wait "$bk_top_pid" 2>/dev/null
-    top_out=$(cat "$BK_TOP_OUT" 2>/dev/null)
-    if [ -z "$top_out" ] && [ "$bk_top_args" != "-bn1" ]; then
+    # `-s` asks the question without reading the file into the shell: the
+    # awk below reads the snapshot itself.
+    if [ ! -s "$BK_TOP_OUT" ] && [ "$bk_top_args" != "-bn1" ]; then
         COLUMNS=512 top -bn1 >"$BK_TOP_OUT" 2>/dev/null &
         bk_top_pid=$!
         wait "$bk_top_pid" 2>/dev/null
-        top_out=$(cat "$BK_TOP_OUT" 2>/dev/null)
     fi
-    rm -f "$BK_TOP_OUT" 2>/dev/null
-    if [ -n "$top_out" ]; then
-        top_parsed=$(echo "$top_out" | awk '
+    if [ -s "$BK_TOP_OUT" ]; then
+        # ONE awk over the snapshot. It was cat + a parse + a PID filter + two
+        # rankings of `awk | sort -rn | head -5 | awk` each: 17 forks, and the
+        # snapshot (about 100 processes on a router) went through the shell
+        # four times. Line 1 is the CPU ranking, line 2 the RAM ranking, line 3
+        # "P" plus every process name (see bk_running below the DNS probe).
+        #
+        # Every string is built the way the old pipe built it: the parse is
+        # the same code, the record is the "name|cpu|mb|pid" line re-split on
+        # "|" (so a name holding a "|" shifts its fields exactly as awk -F'|'
+        # shifted them), and the ranking is `sort -rn | head -5`: the larger
+        # number first, on equal numbers the byte-wise greater whole key line
+        # (sort's tie-break, reversed by -r). The number is compared as a
+        # float, the way a full busybox sort (FEATURE_SORT_BIG) compares it.
+        # OpenWrt's busybox has no SORT_BIG and its `sort -n` compared only
+        # the integer part, so there "12" (a VSZ of 12m) outranked "12.5";
+        # here the larger value is always first.
+        _top3=$(awk -v self="$$" -v sampler="$bk_top_pid" '
         function basename(p,   n, a) { n = split(p, a, "/"); return a[n]; }
+        function before(ka, la, kb, lb) { if (ka + 0 != kb + 0) return (ka + 0 > kb + 0); return (la > lb) }
+        # The five best key lines of ranking w in L[w, 1..n[w]], best first.
+        function keep(w, k, l,   i) {
+            for (i = n[w]; i > 0 && before(k, l, K[w, i], L[w, i]); i--)
+                if (i < 5) { K[w, i + 1] = K[w, i]; L[w, i + 1] = L[w, i] }
+            if (i < 5) { K[w, i + 1] = k; L[w, i + 1] = l; if (n[w] < 5) n[w]++ }
+        }
         # Hlavicka: najdeme indexy sloupcu podle nazvu
         !found && /PID/ && (/%CPU/ || /CPU%/ || /COMMAND/) {
             for (i = 1; i <= NF; i++) {
@@ -2112,36 +2606,35 @@ if command -v top >/dev/null 2>&1; then
             # Zbytkove orezani (starsi top bez -w): "pyt+" -> "pyt"
             sub(/\+$/, "", name);
             if (name == "" || name ~ /^[`|+-]+$/) next;
-            printf "%s|%s|%s|%s\n", name, cpu, mb, $pid_i;
-        }' 2>/dev/null)
-
-        # Vyhazuji se jen dve konkretni PID: agent sam a sampler, ktery prave
-        # bezel. Podle jmena se nefiltruje - rucne spusteny `top`, ktery opravdu
-        # zere CPU, ma zustat videt.
-        if [ -n "$top_parsed" ]; then
-            top_parsed=$(echo "$top_parsed" | awk -F'|' -v self="$$" -v sampler="$bk_top_pid" '
-                $4 != self && $4 != sampler { printf "%s|%s|%s\n", $1, $2, $3 }')
-        fi
-
-        if [ -n "$top_parsed" ]; then
-            # Obe hodnoty jdou do OBOU seznamu. Driv nesl zebricek podle CPU
-            # jen cpu a zebricek podle RAM jen ram_mb, takze v tabulce mela
-            # kazda radka jednu bunku prazdnou ("librespeed-cli 63,2 % / -").
-            # null se posila, kdyz hodnota u procesu opravdu chybi.
-            # The sort key goes FIRST and plain `sort -rn` does the work:
-            # OpenWrt builds busybox without FEATURE_SORT_BIG, where -t and -k
-            # are accepted and then ignored, so `-k2` compared whole lines and
-            # both rankings listed the wrong five processes on every router.
-            top_cpu_json=$(echo "$top_parsed" | awk -F'|' '$2 != "" { print $2 "|" $0 }' | sort -rn | head -5 | awk -F'|' '
-                BEGIN { printf "[" }
-                { if (NR > 1) printf ", "; printf "{\"name\":\"%s\",\"cpu\":%.1f,\"ram_mb\":%s}", $2, $3, ($4 != "" ? sprintf("%.1f", $4) : "null") }
-                END { printf "]" }')
-            top_ram_json=$(echo "$top_parsed" | awk -F'|' '$3 != "" { print $3 "|" $0 }' | sort -rn | head -5 | awk -F'|' '
-                BEGIN { printf "[" }
-                { if (NR > 1) printf ", "; printf "{\"name\":\"%s\",\"ram_mb\":%.1f,\"cpu\":%s}", $2, $4, ($3 != "" ? sprintf("%.1f", $3) : "null") }
-                END { printf "]" }')
-        fi
+            names = names " " name;
+            line = name "|" cpu "|" mb "|" $pid_i;
+            split(line, f, "|");
+            # Only two PIDs are dropped: the agent itself and the sampler that
+            # just ran. Not by name - a hand-started `top` that really eats
+            # the CPU stays visible.
+            if (!(f[4] != self && f[4] != sampler)) next;
+            rec = f[1] "|" f[2] "|" f[3];
+            if (f[2] != "") keep("c", f[2], f[2] "|" rec);
+            if (f[3] != "") keep("m", f[3], f[3] "|" rec);
+        }
+        END {
+            # Both values go into BOTH lists; null only where the process
+            # really has no value.
+            printf "[";
+            for (i = 1; i <= n["c"]; i++) { split(L["c", i], f, "|"); if (i > 1) printf ", "; printf "{\"name\":\"%s\",\"cpu\":%.1f,\"ram_mb\":%s}", f[2], f[3], (f[4] != "" ? sprintf("%.1f", f[4]) : "null") }
+            printf "]\n[";
+            for (i = 1; i <= n["m"]; i++) { split(L["m", i], f, "|"); if (i > 1) printf ", "; printf "{\"name\":\"%s\",\"ram_mb\":%.1f,\"cpu\":%s}", f[2], f[4], (f[3] != "" ? sprintf("%.1f", f[3]) : "null") }
+            printf "]\nP%s \n", names;
+        }' "$BK_TOP_OUT" 2>/dev/null)
+        case "$_top3" in
+            *"$BK_NL"*"$BK_NL"*)
+                top_cpu_json=${_top3%%"$BK_NL"*}; _top3=${_top3#*"$BK_NL"}
+                top_ram_json=${_top3%%"$BK_NL"*}; _top3=${_top3#*"$BK_NL"}
+                bk_top_names=${_top3#P}
+                [ "$bk_top_names" = " " ] && bk_top_names="" ;;
+        esac
     fi
+    rm -f "$BK_TOP_OUT" 2>/dev/null
 fi
 [ -z "$top_cpu_json" ] && top_cpu_json="[]"
 [ -z "$top_ram_json" ] && top_ram_json="[]"
@@ -2150,23 +2643,31 @@ fi
 mwan3_policies_json="[]"
 mwan3_active_gw=""
 if [ -f /etc/config/mwan3 ]; then
-    mwan3_status=$(mwan3 status 2>/dev/null)
-    if [ -n "$mwan3_status" ]; then
-        # `mwan3 status` prints " interface wan is online and tracking is
-        # active". The old grep for "active" returned the word "active" as the
-        # gateway, and the policy scan never saw a policy line before the
-        # interface section, so every entry carried an empty policy name.
-        mwan3_active_gw=$(printf '%s\n' "$mwan3_status" | sed -n 's/^ *interface \([^ ]*\) is online.*/\1/p' | head -1)
-        mwan3_policies_json=$(printf '%s\n' "$mwan3_status" | awk '
-        BEGIN { printf "[" }
-        /^ *interface [^ ]+ is (online|offline|disabled)/ {
-            st = ($4 == "online") ? "online" : "offline";
-            if (count > 0) printf ", ";
-            printf "{\"policy\":null,\"interface\":\"%s\",\"status\":\"%s\"}", $2, st; count++
-        }
-        END { printf "]" }')
-        [ -z "$mwan3_policies_json" ] && mwan3_policies_json="[]"
-    fi
+    # `mwan3 status` prints " interface wan is online and tracking is
+    # active". The old grep for "active" returned the word "active" as the
+    # gateway, and the policy scan never saw a policy line before the
+    # interface section, so every entry carried an empty policy name.
+    #
+    # One awk straight on the output (it was held in the shell and read twice,
+    # by printf | sed | head and by printf | awk: 8 forks, now 3). Line 1 is
+    # "G" + the gateway: the name in the FIRST "interface NAME is online" line,
+    # what the sed + head -1 printed (empty when that name is empty). Line 2
+    # is the policy list. Nothing is printed when mwan3 printed nothing, and
+    # the defaults stay, as they did when the status was empty.
+    _mw_out=$(mwan3 status 2>/dev/null | awk '
+    length($0) > 0 { any = 1 }
+    !gwdone && /^ *interface [^ ]* is online/ { s = $0; sub(/^ *interface /, "", s); gw = substr(s, 1, index(s, " ") - 1); gwdone = 1 }
+    /^ *interface [^ ]+ is (online|offline|disabled)/ {
+        st = ($4 == "online") ? "online" : "offline";
+        if (count > 0) js = js ", ";
+        js = js sprintf("{\"policy\":null,\"interface\":\"%s\",\"status\":\"%s\"}", $2, st); count++
+    }
+    END { if (any) printf "G%s\n[%s]", gw, js }')
+    case "$_mw_out" in
+        G*"$BK_NL"*)
+            mwan3_active_gw=${_mw_out%%"$BK_NL"*}; mwan3_active_gw=${mwan3_active_gw#G}
+            mwan3_policies_json=${_mw_out#*"$BK_NL"} ;;
+    esac
 fi
 [ -z "$mwan3_active_gw" ] && mwan3_active_gw="null" || mwan3_active_gw="\"$mwan3_active_gw\""
 
@@ -2607,8 +3108,8 @@ else
     # for the firewall counters, so this costs no fork.
     wp_flowtable="null"
     if command -v nft >/dev/null 2>&1; then
-        case "$bk_nft_rules" in
-            *"flowtable "*) wp_flowtable="true" ;;
+        case "$bk_nft_ft" in
+            1) wp_flowtable="true" ;;
             *) wp_flowtable="false" ;;
         esac
     fi
@@ -2796,14 +3297,18 @@ if [ -n "$lte_device" ] && [ "$lte_device" != "null" ] && [ -f /proc/net/dev ]; 
     }' /proc/net/dev 2>/dev/null)
     if [ -n "$lte_bytes" ]; then
         if [ -f "$NET_LTE_STATE_FILE" ]; then
-            prev_lte_ts=$(cut -d',' -f1 "$NET_LTE_STATE_FILE" 2>/dev/null)
-            prev_lte_dev=$(cut -d',' -f2 "$NET_LTE_STATE_FILE" 2>/dev/null)
-            prev_lte_bytes=$(cut -d',' -f3 "$NET_LTE_STATE_FILE" 2>/dev/null)
+            if bk_line1 "$NET_LTE_STATE_FILE"; then
+                bk_cut3 "$_sl" ,; prev_lte_ts=$_c1; prev_lte_dev=$_c2; prev_lte_bytes=$_c3
+            else
+                prev_lte_ts=$(cut -d',' -f1 "$NET_LTE_STATE_FILE" 2>/dev/null)
+                prev_lte_dev=$(cut -d',' -f2 "$NET_LTE_STATE_FILE" 2>/dev/null)
+                prev_lte_bytes=$(cut -d',' -f3 "$NET_LTE_STATE_FILE" 2>/dev/null)
+            fi
             if [ "$prev_lte_dev" = "$lte_device" ] && [ -n "$prev_lte_ts" ] && [ -n "$prev_lte_bytes" ]; then
                 elapsed_lte=$((now_ts - prev_lte_ts))
                 delta_lte=$((lte_bytes - prev_lte_bytes))
                 if [ "$elapsed_lte" -gt 0 ] && [ "$delta_lte" -ge 0 ]; then
-                    net_lte=$(awk -v d="$delta_lte" -v e="$elapsed_lte" 'BEGIN { printf "%.1f", (d / e) / 1024 }')
+                    bk_fdiv "$delta_lte" "$((elapsed_lte * 1024))" 1; net_lte=$_fd
                 fi
             fi
         fi
@@ -2851,8 +3356,35 @@ lte_sim_status_code="null"
 lte_api_host=""
 
 # Jedna hodnota z XML odpovedi: bk_xml_tag "<xml>" tag -> obsah, nebo prazdno.
+#
+# Builtin, into $_xr: the old `printf | sed -n "s|.*<T>\([^<]*\)</T>.*|\1|p"
+# | head -1` cost four forks a tag and HiLink asks for 21 tags a minute. Same
+# answer on any input: sed worked line by line, took the FIRST line with a
+# match and, its leading .* being greedy, the LAST <T>text</T> on that line,
+# where text runs up to the next '<'.
 bk_xml_tag() {
-    printf '%s' "$1" | sed -n "s|.*<$2>\([^<]*\)</$2>.*|\1|p" | head -1
+    _xr=""
+    case "$1" in *"<$2>"*"</$2>"*) ;; *) return 0 ;; esac
+    _xs=$1; _xf=""
+    while :; do
+        case "$_xs" in *"<$2>"*) ;; *) return 0 ;; esac
+        # A newline before the next <T> ends the line the match is on.
+        [ -n "$_xf" ] && case "${_xs%%"<$2>"*}" in *"$BK_NL"*) return 0 ;; esac
+        _xs=${_xs#*"<$2>"}; _xv=${_xs%%<*}
+        case "$_xs" in
+            "$_xv</$2>"*) case "$_xv" in *"$BK_NL"*) ;; *) _xr=$_xv; _xf=1 ;; esac ;;
+        esac
+    done
+}
+# Only the characters of bracket class $1 (0-9, or 0-9.-) of $_xr, as
+# `sed 's/[^0-9]//g'` left them.
+bk_xml_keep() {
+    while :; do
+        case "$_xr" in
+            *[!$1]*) _xk=${_xr%%[!$1]*}; _xr=$_xk${_xr#"$_xk"?} ;;
+            *) return 0 ;;
+        esac
+    done
 }
 
 # GET na HiLink API modemu. Nektere firmwary (E3372h-320, Brovi E3372-325)
@@ -2889,8 +3421,8 @@ bk_hilink_get() {
             elif command -v wget >/dev/null 2>&1; then
                 _hl_tok=$(wget -q -T 2 -O - "http://${lte_api_host}/api/webserver/SesTokInfo" 2>/dev/null)
             fi
-            _hl_ses=$(bk_xml_tag "$_hl_tok" SesInfo)
-            _hl_ver=$(bk_xml_tag "$_hl_tok" TokInfo)
+            bk_xml_tag "$_hl_tok" SesInfo; _hl_ses=$_xr
+            bk_xml_tag "$_hl_tok" TokInfo; _hl_ver=$_xr
             if [ -n "$_hl_ses" ] && [ -n "$_hl_ver" ]; then
                 if command -v curl >/dev/null 2>&1; then
                     _hl_body=$(curl -s -m 2 -H "Cookie: $_hl_ses" -H "__RequestVerificationToken: $_hl_ver" "$_hl_url" 2>/dev/null)
@@ -2911,11 +3443,18 @@ bk_hilink_get() {
 bk_hilink_cached() {
     _hc_file="$2"; _hc_ttl="$3"; _hc_key="$4"; _hl_out=""
     if [ -f "$_hc_file" ]; then
-        _hc_ts=$(sed -n '1p' "$_hc_file" 2>/dev/null)
-        _hc_k=$(sed -n '2p' "$_hc_file" 2>/dev/null)
+        # Builtin reads of line 1, line 2 and the rest (three sed forks
+        # before); the body loses its trailing newlines, as $(sed) did.
+        _hc_ts=""; _hc_k=""; _hc_body=""; _hc_l=""
+        {
+            IFS= read -r _hc_ts; IFS= read -r _hc_k
+            while IFS= read -r _hc_l; do _hc_body="$_hc_body$_hc_l$BK_NL"; _hc_l=""; done
+        } 2>/dev/null < "$_hc_file"
+        _hc_body="$_hc_body$_hc_l"
         case "$_hc_ts" in ''|*[!0-9]*) _hc_ts=0 ;; esac
         if [ $((now_ts - _hc_ts)) -lt "$_hc_ttl" ] && [ "$_hc_k" = "$_hc_key" ]; then
-            _hl_out=$(sed -n '3,$p' "$_hc_file" 2>/dev/null)
+            while :; do case "$_hc_body" in *"$BK_NL") _hc_body=${_hc_body%"$BK_NL"} ;; *) break ;; esac; done
+            _hl_out=$_hc_body
             [ -n "$_hl_out" ] && return 0
         fi
     fi
@@ -2927,14 +3466,20 @@ bk_hilink_cached() {
 }
 
 if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; then
-    lte_api_host=$(echo "$lte_ipv4" | sed 's/\.[0-9]*$/.1/')
+    # The last octet becomes .1 (`sed 's/\.[0-9]*$/.1/'`) without the two
+    # forks; an address that is not plain digits and dots still goes to sed.
+    case "$lte_ipv4" in
+        *[!0-9.]*) lte_api_host=$(echo "$lte_ipv4" | sed 's/\.[0-9]*$/.1/') ;;
+        *.*) lte_api_host=${lte_ipv4%.*}.1 ;;
+        *) lte_api_host=$lte_ipv4 ;;
+    esac
 
     # -- registrace do site: /api/monitoring/status --
     # ConnectionStatus 901 = pripojeno; 902/903/905 = odpojeno; 7/11/12/14/37
     # = sit pristup nepovolila (spatna SIM, zakazana sluzba). Neznamy kod se
     # neprevadi na nic - zustane null a surovy kod jde dal k posouzeni.
     bk_hilink_get /api/monitoring/status; lte_mon_xml="$_hl_out"
-    _cc=$(bk_xml_tag "$lte_mon_xml" ConnectionStatus | sed 's/[^0-9]//g')
+    bk_xml_tag "$lte_mon_xml" ConnectionStatus; bk_xml_keep 0-9; _cc=$_xr
     if [ -n "$_cc" ]; then
         lte_conn_code="$_cc"
         case "$_cc" in
@@ -2942,14 +3487,14 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
             902|903|905|7|11|12|14|37|201|202|203|204) lte_connected="false" ;;
         esac
     fi
-    _sc=$(bk_xml_tag "$lte_mon_xml" ServiceStatus | sed 's/[^0-9]//g')
+    bk_xml_tag "$lte_mon_xml" ServiceStatus; bk_xml_keep 0-9; _sc=$_xr
     [ -n "$_sc" ] && lte_service_code="$_sc"
     # SimStatus: 1 = platna; 0/255 = neni vlozena; 2/3/4 = SIM sit NEPRIJIMA
     # (neplatna pro hlasove / datove sluzby / oboje) - typicky deaktivovana nebo
     # zablokovana operatorem. Presne to mela SIM, kvuli ktere tahle kontrola
     # vznikla: /api/pin/status hlasil 257 "pripravena" (PIN je jina osa), ale
     # SimStatus 4 a ConnectionStatus 902.
-    _ss=$(bk_xml_tag "$lte_mon_xml" SimStatus | sed 's/[^0-9]//g')
+    bk_xml_tag "$lte_mon_xml" SimStatus; bk_xml_keep 0-9; _ss=$_xr
     [ -n "$_ss" ] && lte_sim_status_code="$_ss"
     case "$_ss" in
         1) lte_sim_state="ready" ;;
@@ -2962,7 +3507,7 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
     # 255 = zadna SIM, 256/262 = neplatna nebo zablokovana.
     # Ten minutes, or sooner when monitoring/status reports a different SimStatus.
     bk_hilink_cached /api/pin/status "$BK_PRIVATE_DIR/hilink-pin.cache" 600 "$lte_sim_status_code"; lte_pin_xml="$_hl_out"
-    _sim=$(bk_xml_tag "$lte_pin_xml" SimState | sed 's/[^0-9]//g')
+    bk_xml_tag "$lte_pin_xml" SimState; bk_xml_keep 0-9; _sim=$_xr
     if [ -n "$_sim" ]; then
         lte_sim_code="$_sim"
         # Blokujici stavy odsud maji prednost; "pripravena" (257) jen doplni,
@@ -2975,46 +3520,45 @@ if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; th
             257) [ "$lte_sim_state" = "null" ] && lte_sim_state="ready" ;;
         esac
     fi
-    _pin_left=$(bk_xml_tag "$lte_pin_xml" SimPinTimes | sed 's/[^0-9]//g')
+    bk_xml_tag "$lte_pin_xml" SimPinTimes; bk_xml_keep 0-9; _pin_left=$_xr
     [ -n "$_pin_left" ] && lte_sim_pin_left="$_pin_left"
 
     # -- sila signalu: /api/device/signal --
     bk_hilink_get /api/device/signal; lte_sig_xml="$_hl_out"
 
-    if echo "$lte_sig_xml" | grep -q "<rsrp>"; then
+    # "<rsrp>" holds no newline, so a substring test is what grep -q saw.
+    case "$lte_sig_xml" in *"<rsrp>"*) _hl_sig=1 ;; *) _hl_sig=0 ;; esac
+    if [ "$_hl_sig" = 1 ]; then
         # Hodnoty nesou jednotky primo v textu ("-83dBm", "-6.0dB"), tak se
         # necha jen cislo. Prazdny tag = udaj modem nehlasi -> null.
+        # Builtins into $_xr: the $(...) versions cost 8-9 forks a field.
         bk_xml_num() {
-            _v=$(echo "$lte_sig_xml" | sed -n "s|.*<$1>\([^<]*\)</$1>.*|\1|p" | head -1)
-            _v=$(echo "$_v" | sed 's/[^0-9.-]//g')
-            case "$_v" in
-                ''|-|.|--) printf 'null' ;;
-                *) printf '%s' "$_v" ;;
-            esac
+            bk_xml_tag "$lte_sig_xml" "$1"; bk_xml_keep 0-9.-
+            case "$_xr" in ''|-|.|--) _xr=null ;; esac
         }
         bk_xml_str() {
-            _v=$(echo "$lte_sig_xml" | sed -n "s|.*<$1>\([^<]*\)</$1>.*|\1|p" | head -1)
-            [ -z "$_v" ] && printf 'null' || printf '"%s"' "$(json_str "$_v")"
+            bk_xml_tag "$lte_sig_xml" "$1"
+            if [ -z "$_xr" ]; then _xr=null; else bk_js "$_xr"; _xr="\"$_jr\""; fi
         }
 
-        lte_rsrp=$(bk_xml_num rsrp)
-        lte_rsrq=$(bk_xml_num rsrq)
-        lte_sinr=$(bk_xml_num sinr)
-        lte_rssi=$(bk_xml_num rssi)
-        lte_pci=$(bk_xml_num pci)
-        lte_cell_id=$(bk_xml_num cell_id)
-        lte_plmn=$(bk_xml_str plmn)
-        lte_bandwidth=$(bk_xml_str dlbandwidth)
+        bk_xml_num rsrp; lte_rsrp=$_xr
+        bk_xml_num rsrq; lte_rsrq=$_xr
+        bk_xml_num sinr; lte_sinr=$_xr
+        bk_xml_num rssi; lte_rssi=$_xr
+        bk_xml_num pci; lte_pci=$_xr
+        bk_xml_num cell_id; lte_cell_id=$_xr
+        bk_xml_str plmn; lte_plmn=$_xr
+        bk_xml_str dlbandwidth; lte_bandwidth=$_xr
 
         # Pasmo hlasi modem jako cislo (1 = B1); ve zbytku systemu je to text.
-        _band=$(echo "$lte_sig_xml" | sed -n 's|.*<band>\([^<]*\)</band>.*|\1|p' | head -1)
+        bk_xml_tag "$lte_sig_xml" band; _band=$_xr
         [ -n "$_band" ] && lte_band="B${_band}"
 
         # Jmeno operatora ma jiny endpoint; bez nej zustava to, co uz mame.
         # Once per heavy interval, or when the PLMN code from device/signal changes.
         bk_hilink_cached /api/net/current-plmn "$BK_PRIVATE_DIR/hilink-plmn.cache" "$HEAVY_OP_INTERVAL_SEC" "$lte_plmn"; lte_plmn_xml="$_hl_out"
-        _carrier=$(bk_xml_tag "$lte_plmn_xml" FullName)
-        [ -z "$_carrier" ] && _carrier=$(bk_xml_tag "$lte_plmn_xml" ShortName)
+        bk_xml_tag "$lte_plmn_xml" FullName; _carrier=$_xr
+        [ -z "$_carrier" ] && { bk_xml_tag "$lte_plmn_xml" ShortName; _carrier=$_xr; }
         [ -n "$_carrier" ] && lte_carrier="$_carrier"
     fi
 fi
@@ -3107,9 +3651,22 @@ wan_last_reconnect="null"
 bk_state_file="/tmp/bk_wan_state"
 if [ -n "$wan_uptime" ] && [ "$wan_uptime" != "null" ] && [ "$wan_uptime" -gt 0 ] 2>/dev/null; then
     if [ -f "$bk_state_file" ]; then
-        prev_uptime=$(awk -F= '/^uptime=/{print $2}' "$bk_state_file" 2>/dev/null)
-        prev_count=$(awk -F= '/^count=/{print $2}' "$bk_state_file" 2>/dev/null)
-        prev_reconnect=$(awk -F= '/^reconnect=/{print $2}' "$bk_state_file" 2>/dev/null)
+        # One builtin pass for the three `awk -F= '/^key=/{print $2}'` reads:
+        # the text between the first and the second '=' of every line that
+        # starts with key=, one line per match, trailing newlines dropped.
+        prev_uptime=""; prev_count=""; prev_reconnect=""; _ws_l=""
+        while IFS= read -r _ws_l || [ -n "$_ws_l" ]; do
+            _ws_v=${_ws_l#*=}; _ws_v=${_ws_v%%=*}
+            case "$_ws_l" in
+                uptime=*) prev_uptime="$prev_uptime$_ws_v$BK_NL" ;;
+                count=*) prev_count="$prev_count$_ws_v$BK_NL" ;;
+                reconnect=*) prev_reconnect="$prev_reconnect$_ws_v$BK_NL" ;;
+            esac
+            _ws_l=""
+        done 2>/dev/null < "$bk_state_file"
+        while :; do case "$prev_uptime" in *"$BK_NL") prev_uptime=${prev_uptime%"$BK_NL"} ;; *) break ;; esac; done
+        while :; do case "$prev_count" in *"$BK_NL") prev_count=${prev_count%"$BK_NL"} ;; *) break ;; esac; done
+        while :; do case "$prev_reconnect" in *"$BK_NL") prev_reconnect=${prev_reconnect%"$BK_NL"} ;; *) break ;; esac; done
         # A previous sample exists, so the comparison below is real. A state
         # file written before the upgrade carries "count=0"; a file that was
         # never written carries nothing, and then this run is the first sample.
@@ -3120,7 +3677,7 @@ if [ -n "$wan_uptime" ] && [ "$wan_uptime" != "null" ] && [ "$wan_uptime" -gt 0 
         if [ -n "$prev_uptime" ] && [ "$wan_uptime" -lt "$prev_uptime" ] 2>/dev/null; then
             [ "$wan_reconnect_count" = "null" ] && wan_reconnect_count=0
             wan_reconnect_count=$((wan_reconnect_count + 1))
-            wan_last_reconnect=$(date +%s)
+            wan_last_reconnect=$now_ts   # the run's clock, no `date` fork
         fi
     fi
     printf "uptime=%s\ncount=%s\nreconnect=%s\n" "$wan_uptime" "$wan_reconnect_count" "$wan_last_reconnect" > "$bk_state_file" 2>/dev/null
@@ -3423,6 +3980,10 @@ boot_time="null"
 # nslookup says on stderr cannot match either sed expression.
 dns_resolver_ok="null"
 dns_latency_ms="null"
+# No -timeout: busybox waits up to 5 s, and a resolver that answers in 2-5 s
+# is slow, not dead. A 2 s bound (tried for 0.1.9) turned it into
+# dns_resolver_ok false with no latency, and the server into "resolver not
+# answering" - a changed meaning of an existing key, not a saving.
 if command -v nslookup >/dev/null 2>&1 && command -v time >/dev/null 2>&1; then
     dns_probe=$( { time nslookup example.com 127.0.0.1 >/dev/null; echo "rc $?"; } 2>&1 \
         | sed -n -e 's/.*real[[:space:]]*\([0-9]*\)m[[:space:]]*\([0-9.]*\)s.*/real=\1 \2/p' -e 's/^rc \([0-9][0-9]*\)$/rc=\1/p')
@@ -3502,7 +4063,13 @@ fi
 openvpn_tunnels="null"
 if command -v pidof >/dev/null 2>&1; then
     ovpn_pids=$(pidof openvpn 2>/dev/null)
-    openvpn_tunnels=$(echo "$ovpn_pids" | wc -w | tr -d '[:space:]')
+    # Counting the words in the shell: `echo | wc -w | tr` was four forks for
+    # a number `for` already knows. A PID list holds digits and blanks; any
+    # other character (wc -w splits on CR, VT, FF too) goes the old way.
+    case "$ovpn_pids" in
+        *[!0-9\ $BK_TAB$BK_NL]*) openvpn_tunnels=$(echo "$ovpn_pids" | wc -w | tr -d '[:space:]') ;;
+        *) openvpn_tunnels=0; for _p in $ovpn_pids; do openvpn_tunnels=$((openvpn_tunnels + 1)); done ;;
+    esac
     [ -z "$openvpn_tunnels" ] && openvpn_tunnels=0
 fi
 
@@ -3511,7 +4078,16 @@ fi
 # prosty vypis hlasil treba 16 "zarizeni" u routeru s jedinym flash diskem.
 usb_devices="null"
 if [ -d /sys/bus/usb/devices ]; then
-    usb_devices=$(ls /sys/bus/usb/devices 2>/dev/null | grep -E '^[0-9]+-[0-9]+(\.[0-9]+)*$' | wc -l | tr -d '[:space:]')
+    # ^[0-9]+-[0-9]+(\.[0-9]+)*$ as a glob loop: `ls | grep | wc | tr` was
+    # five forks. Like ls, the glob skips the dot entries.
+    usb_devices=0
+    for _u in /sys/bus/usb/devices/*; do
+        _u=${_u##*/}; _ub=${_u%%-*}; _up=${_u#*-}
+        [ "$_u" = "$_ub" ] && continue
+        case "$_ub" in ''|*[!0-9]*) continue ;; esac
+        case "$_up" in ''|*[!0-9.]*|.*|*.|*..*) continue ;; esac
+        usb_devices=$((usb_devices + 1))
+    done
     [ -z "$usb_devices" ] && usb_devices=0
 fi
 
@@ -3744,21 +4320,30 @@ if [ -n "$wifi_list" ] && command -v iwinfo >/dev/null 2>&1; then
         else sta=""; fi
         sv=""; [ "$have_iw" = 1 ] && sv=$(iw dev "$r" survey dump 2>/dev/null)
         # Card facts change only with the hardware: once a day, like the package list.
+        # The refresh time sits in wifi-caps.<radio>.ts: `date -r` was a fork
+        # per radio every minute only to learn the cache's age. A cache
+        # without the stamp (written by an older agent) is refreshed once.
         _cf="$BK_PRIVATE_DIR/wifi-caps.$r"; _cm=""
-        [ -f "$_cf" ] && _cm=$(date -r "$_cf" +%s 2>/dev/null)
+        [ -f "$_cf" ] && { read -r _cm _; } 2>/dev/null < "$_cf.ts"
         case "$_cm" in ''|*[!0-9]*) _cm=0 ;; esac
         if [ $((now_ts - _cm)) -ge "$HEAVY_OP_INTERVAL_SEC" ]; then
             # The cache is kept only when it is not empty, so a failed call is
             # not frozen for 24 h as "this card knows no modes and no bands".
             { iwinfo "$r" htmodelist; iwinfo "$r" freqlist; } > "$_cf.tmp" 2>/dev/null
-            if [ -s "$_cf.tmp" ]; then mv "$_cf.tmp" "$_cf"; else rm -f "$_cf.tmp"; fi
+            if [ -s "$_cf.tmp" ]; then mv "$_cf.tmp" "$_cf"; echo "$now_ts" > "$_cf.ts"; else rm -f "$_cf.tmp"; fi
         fi
         printf '@@RADIO %s %s %s\n' "$r" "$src" "$have_iw"
         # A command whose first letter is an s would be a scan, which takes the radio off its channel: never one of those two.
         iwinfo "$r" info 2>/dev/null
         iwinfo "$r" assoclist 2>/dev/null
         printf '@@STA\n%s\n@@SURVEY\n%s\n@@CAPS\n' "$sta" "$sv"
-        [ -r "$_cf" ] && cat "$_cf"
+        # A builtin copy instead of a cat per radio, byte for byte: a last
+        # line without its newline stays without one.
+        if [ -r "$_cf" ]; then
+            _cl=""
+            while IFS= read -r _cl; do printf '%s\n' "$_cl"; _cl=""; done < "$_cf"
+            [ -n "$_cl" ] && printf '%s' "$_cl"
+        fi
     done | awk -v prev="$WIFI_SURVEY_STATE" -v nstate="$WIFI_SURVEY_STATE.new" -v now="$now_ts" "$BK_WIFI_AWK")
     # Shortest suffix (%#*): cut at the LAST '#'. An SSID such as "Domov #5 GHz"
     # contains '#', and %%#* would cut the JSON there and send a broken payload.
@@ -3797,9 +4382,8 @@ fi
 # Written with escaped quotes for the same reason as the two embedded awk
 # programs: run_agent_metric_lint.php would otherwise read these nested names
 # as new top-level metrics that nobody stores.
-agent_tools_json=$(printf "{\"smartctl\":%s,\"smart_drivedb\":%s,\"hostapd_cli\":%s,\"iw\":%s,\"pkg_manager\":%s,\"smart_probe_age_s\":%s,\"smart_probe_running_s\":%s,\"librespeed_cli\":%s,\"ethtool\":%s,\"tc\":%s}" \
-    "$tool_smartctl" "$tool_drivedb" "$tool_hostapd" "$tool_iw" "$pkg_manager_json" \
-    "$smart_probe_age_s" "$smart_probe_running_s" "$tool_librespeed" "$tool_ethtool" "$tool_tc")
+# A plain assignment: the $(printf) was a fork for a string the shell builds.
+agent_tools_json="{\"smartctl\":$tool_smartctl,\"smart_drivedb\":$tool_drivedb,\"hostapd_cli\":$tool_hostapd,\"iw\":$tool_iw,\"pkg_manager\":$pkg_manager_json,\"smart_probe_age_s\":$smart_probe_age_s,\"smart_probe_running_s\":$smart_probe_running_s,\"librespeed_cli\":$tool_librespeed,\"ethtool\":$tool_ethtool,\"tc\":$tool_tc}"
 [ -z "$agent_tools_json" ] && agent_tools_json="null"
 
 # --- LAN / DHCP ---
@@ -3824,11 +4408,25 @@ fi
 # unknown, not "0 leases".
 dhcp_leases_count="null"
 if [ -f /tmp/dhcp.leases ]; then
-    dhcp_leases_count=$(wc -l < /tmp/dhcp.leases 2>/dev/null | xargs)
+    # `wc -l` counted newlines; so does a read loop (a last line without its
+    # newline is not counted by either). Unreadable stays empty, as it was.
+    dhcp_leases_count=""
+    { dhcp_leases_count=0; while IFS= read -r _dl; do dhcp_leases_count=$((dhcp_leases_count + 1)); done; } 2>/dev/null < /tmp/dhcp.leases
 fi
 dhcp_reservations_count="null"
 if command -v uci >/dev/null 2>&1; then
-    _uci_dhcp=$(uci show dhcp 2>/dev/null) && dhcp_reservations_count=$(printf '%s\n' "$_uci_dhcp" | grep -c "=host$")
+    # The lines ending in "=host", counted in the shell: `printf | grep -c`
+    # was three forks. A CR in the answer would end a line for neither.
+    # Split on newlines with globbing off ("@host[0]" is a glob pattern);
+    # empty lines vanish in the split, and they never end in "=host".
+    if _uci_dhcp=$(uci show dhcp 2>/dev/null); then
+        dhcp_reservations_count=0
+        _ud_ifs=$IFS; IFS=$BK_NL; set -f
+        for _ud in $_uci_dhcp; do
+            case "$_ud" in *=host) dhcp_reservations_count=$((dhcp_reservations_count + 1)) ;; esac
+        done
+        set +f; IFS=$_ud_ifs
+    fi
 fi
 
 # --- DNS Engine, Upstream Servers & DoT/DoH Encryption ---
@@ -3854,7 +4452,20 @@ elif command -v ss >/dev/null 2>&1; then
     ss -tn state established 2>/dev/null | grep -q ':853' && dns_active_853=1
 fi
 
-if pidof kresd >/dev/null 2>&1 || [ -f /etc/config/resolver ]; then
+# "Is NAME running?" from the top snapshot taken above, without a fork: the
+# chain below asked pidof up to eight times a run (every name but the last is
+# missing on a plain dnsmasq router), and each pidof walks all of /proc.
+# A name counts when it is the basename of a process's command as top prints
+# it: argv[0] under busybox top, comm under procps top - two of the three
+# things pidof matches (comm, argv[0] basename, exe basename). Every resolver
+# in the chain is a compiled daemon started by its own path, where the three
+# agree. No snapshot (no top, no output, no header) means pidof, as before.
+bk_running() {
+    [ -n "$bk_top_names" ] || { pidof "$1" >/dev/null 2>&1; return; }
+    case "$bk_top_names" in *" $1 "*) return 0 ;; esac
+    return 1
+}
+if bk_running kresd || [ -f /etc/config/resolver ]; then
     dns_engine="Knot Resolver (kresd)"
     res_fwd=$(uci -q get resolver.common.forward_custom 2>/dev/null)
     res_tls=$(uci -q get resolver.common.forward_upstream 2>/dev/null)
@@ -3867,7 +4478,7 @@ if pidof kresd >/dev/null 2>&1 || [ -f /etc/config/resolver ]; then
     else
         dns_encryption="Nešifrované DNS (UDP/53) - v konfiguraci není TLS upstream"
     fi
-elif pidof AdGuardHome >/dev/null 2>&1; then
+elif bk_running AdGuardHome; then
     dns_engine="AdGuard Home"
     agh_cfg=$(cat /etc/AdGuardHome/AdGuardHome.yaml /opt/AdGuardHome/AdGuardHome.yaml 2>/dev/null)
     if echo "$agh_cfg" | grep -qi 'https://'; then
@@ -3881,7 +4492,7 @@ elif pidof AdGuardHome >/dev/null 2>&1; then
     else
         dns_encryption="Nelze určit (konfigurace AdGuard Home nepřečtena)"
     fi
-elif pidof unbound >/dev/null 2>&1; then
+elif bk_running unbound; then
     dns_engine="Unbound"
     if grep -rqi -E 'tls-upstream:[[:space:]]*yes|forward-tls-upstream:[[:space:]]*yes' /etc/unbound/ 2>/dev/null; then
         dns_encryption="DoT dle konfigurace (tls-upstream: yes)"
@@ -3890,13 +4501,13 @@ elif pidof unbound >/dev/null 2>&1; then
     else
         dns_encryption="Nešifrované DNS (UDP/53)"
     fi
-elif pidof stubby >/dev/null 2>&1; then
+elif bk_running stubby; then
     dns_engine="Stubby"
     dns_encryption="DoT (Stubby je DoT-only resolver)"
-elif pidof https_dns_proxy >/dev/null 2>&1 || pidof cloudflared >/dev/null 2>&1 || pidof dnscrypt-proxy >/dev/null 2>&1; then
+elif bk_running https_dns_proxy || bk_running cloudflared || bk_running dnscrypt-proxy; then
     dns_engine="DoH proxy"
     dns_encryption="DoH - běží DoH proxy (https_dns_proxy/cloudflared/dnscrypt)"
-elif pidof dnsmasq >/dev/null 2>&1; then
+elif bk_running dnsmasq; then
     # The default of 0.1.6, now an answer instead of an assumption: the
     # process really is running, and dnsmasq has no encrypted upstream at all,
     # so "plain UDP/53" is a property of the program, not a guess.
@@ -3907,7 +4518,19 @@ elif [ "$dns_active_853" = "1" ]; then
 fi
 
 if [ -f /tmp/resolv.conf.auto ]; then
-    extra_dns=$(grep -i "nameserver" /tmp/resolv.conf.auto | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
+    # In the shell: awk's $2 of every line that holds "nameserver" in any
+    # case, joined with commas - what `grep -i | awk | tr | sed` gave at five
+    # forks a run. A CR, VT or FF (awk would split on it) sends the file down
+    # the old pipeline instead.
+    extra_dns=""; _rc_n=0; _rc_odd=""; _rc_l=""
+    { while IFS= read -r _rc_l || [ -n "$_rc_l" ]; do
+        case "$_rc_l" in *[Nn][Aa][Mm][Ee][Ss][Ee][Rr][Vv][Ee][Rr]*) ;; *) _rc_l=""; continue ;; esac
+        case "$_rc_l" in *["$BK_WSX"]*) _rc_odd=1; break ;; esac
+        bk_blank2 "$_rc_l"
+        if [ "$_rc_n" -gt 0 ]; then extra_dns="$extra_dns,$_b2"; else extra_dns=$_b2; fi
+        _rc_n=$((_rc_n + 1)); _rc_l=""
+    done; } 2>/dev/null < /tmp/resolv.conf.auto
+    [ -n "$_rc_odd" ] && extra_dns=$(grep -i "nameserver" /tmp/resolv.conf.auto | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
     if [ -n "$extra_dns" ]; then
         if [ -n "$dns_servers" ]; then
             dns_servers="$dns_servers, $extra_dns"
@@ -3932,7 +4555,7 @@ if [ -f "$SVC_CACHE_FILE" ]; then
 fi
 
 if [ $svc_cache_age -lt $HEAVY_OP_INTERVAL_SEC ] && [ -f "$SVC_CACHE_FILE" ]; then
-    discovered_services_json=$(cat "$SVC_CACHE_FILE" 2>/dev/null)
+    bk_slurp "$SVC_CACHE_FILE"; discovered_services_json=$_sl
     # An empty cache (write failed on a full /tmp, or read mid-write) used to
     # put `"discovered_services": ,` in the payload - and a 400 for the lot.
     [ -n "$discovered_services_json" ] || discovered_services_json="[]"
@@ -4026,7 +4649,7 @@ else
         if [ $_conf -ge 50 ] && [ $_no_hardware -eq 0 ]; then
             _evidence=$(echo "$_evidence" | sed 's/,$//')
             _missing=$(echo "$_missing" | sed 's/,$//')
-            _desc_esc=$(json_str "$_desc")
+            bk_js "$_desc"; _desc_esc=$_jr
             [ -n "$disc_list" ] && disc_list="$disc_list, "
             disc_list="${disc_list}{\"name\":\"$_name\",\"type\":\"$_type\",\"process\":\"$_proc\",\"port\":${_portdec:-0},\"confidence\":$_conf,\"description\":\"$_desc_esc\",\"evidence\":[$_evidence],\"missing\":[$_missing]}"
         fi
@@ -4114,40 +4737,110 @@ bk_uptime_cs
 if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
     agent_run_ms=$(( (_up_cs - BK_RUN_START_CS) * 10 ))
 fi
+# The router's clock as the payload leaves: the server takes |its clock -
+# agent_time| as clock_skew_s, so a clock read at the start of the run would
+# add the whole run to the skew. The run's one `date` (now_ts) plus the
+# uptime that has passed since, which a clock step cannot bend either. 0.1.8
+# read a second `date` in the middle of the run.
+agent_time=$now_ts
+if [ -n "$_up_cs" ] && [ -n "$BK_NOW_TS_CS" ] && [ "$_up_cs" -ge "$BK_NOW_TS_CS" ] 2>/dev/null; then
+    agent_time=$(( now_ts + (_up_cs - BK_NOW_TS_CS) / 100 ))
+fi
 
-# G42: the skipped runs since the last ACCEPTED report. One line per skip
-# ("l" = the previous run still held the lock, "p" = the POST failed), so the
-# count is what happened and not what a counter survived; every line read
-# here is dropped again once the server has taken this report. Counting is a
-# builtin read loop - the file holds a handful of bytes even on a router that
-# has been unreachable for a day.
+# G42: the skipped runs since the last ACCEPTED report: "l" = the previous
+# run still held the lock, "p" = the POST failed, "k" = a run wedged for
+# 300 s was killed to take its lock over (WW-07).
+#
+# IO-03: the counters are FOLDED, under the lock, into one line in
+# skipped.total ("L P K"). 0.1.8 kept one line per skip and re-read the whole
+# file every minute: a router that could not reach the server grew it by a
+# line a minute for as long as the outage lasted, and read up to 20,000 lines
+# each run (0.2-0.9 s of CPU on musl ash) - and after a long outage the drain
+# sent 20,000 and left the rest for later reports.
+#
+# Only the runs that meet the lock still append to `skipped`, because they do
+# not hold it. Its lines are taken by a rename, so a line appended while this
+# run counts lands in a new file and waits for the next run; nothing is ever
+# counted twice or lost to a truncate. A `.fold` left by a run that died in
+# the middle is counted first (it can only be a run killed by a takeover).
+# Each counter saturates at 100,000: the server drops larger values (its
+# range check), and a lost number is worse than a capped one.
 runs_skipped_lock=0
 runs_skipped_post=0
-bk_skipped_counted=0
+runs_skipped_killed=0
 BK_SKIPPED_FILE="$BK_PRIVATE_DIR/skipped"
-if [ -f "$BK_SKIPPED_FILE" ]; then
+BK_SKIPPED_TOTAL="$BK_PRIVATE_DIR/skipped.total"
+bk_sk_count() { # FILE: add its l/p/k lines to the counters
     while read -r _sk_line; do
-        bk_skipped_counted=$((bk_skipped_counted + 1))
-        # A router that cannot reach the server at all appends a line every
-        # minute and nothing ever drains it, so the loop is capped at about
-        # two weeks of minute runs: the counters saturate instead of costing
-        # more CPU every day. An accepted report drops the counted lines, so
-        # a backlog drains at this rate per report.
         case "$_sk_line" in
             l) runs_skipped_lock=$((runs_skipped_lock + 1)) ;;
             p) runs_skipped_post=$((runs_skipped_post + 1)) ;;
+            k) runs_skipped_killed=$((runs_skipped_killed + 1)) ;;
         esac
-        [ "$bk_skipped_counted" -ge 20000 ] && break
-    done < "$BK_SKIPPED_FILE"
+    done < "$1"
+}
+bk_sk_cap() {
+    [ "$runs_skipped_lock" -gt 100000 ] && runs_skipped_lock=100000
+    [ "$runs_skipped_post" -gt 100000 ] && runs_skipped_post=100000
+    [ "$runs_skipped_killed" -gt 100000 ] && runs_skipped_killed=100000
+    return 0
+}
+bk_sk_save() {
+    printf '%s %s %s\n' "$runs_skipped_lock" "$runs_skipped_post" "$runs_skipped_killed" > "$BK_SKIPPED_TOTAL" 2>/dev/null || true
+}
+if read -r _sk_l _sk_p _sk_k 2>/dev/null < "$BK_SKIPPED_TOTAL"; then
+    case "$_sk_l$_sk_p$_sk_k" in
+        ''|*[!0-9]*) ;;
+        *) runs_skipped_lock=$_sk_l; runs_skipped_post=$_sk_p; runs_skipped_killed=$_sk_k ;;
+    esac
+fi
+_sk_fold=""
+[ -s "$BK_SKIPPED_FILE.fold" ] && { bk_sk_count "$BK_SKIPPED_FILE.fold"; _sk_fold=1; }
+if [ -s "$BK_SKIPPED_FILE" ] && mv -f "$BK_SKIPPED_FILE" "$BK_SKIPPED_FILE.fold" 2>/dev/null; then
+    bk_sk_count "$BK_SKIPPED_FILE.fold"; _sk_fold=1
+fi
+[ "$bk_lock_killed" = 1 ] && { runs_skipped_killed=$((runs_skipped_killed + 1)); _sk_fold=1; }
+bk_sk_cap
+if [ -n "$_sk_fold" ]; then
+    # Total first, then empty the fold: a run killed in between counts a
+    # few skips twice, never loses one.
+    bk_sk_save
+    : > "$BK_SKIPPED_FILE.fold" 2>/dev/null
 fi
 
+# Every value the payload escapes, escaped here with builtins: a $(...) in
+# the heredoc forked once per field, and json_str/json_val three more times
+# (87 forks a report in 0.1.8).
+bk_jv "$lan_subnet"; _jv_lan_subnet=$_jr
+bk_jv "$dns_engine"; _jv_dns_engine=$_jr
+bk_jv "$dns_encryption"; _jv_dns_encryption=$_jr
+bk_jv "$dns_servers"; _jv_dns_servers=$_jr
+bk_jv "$wan_proto"; _jv_wan_proto=$_jr
+bk_jv "$wan_l3_device"; _jv_wan_l3_device=$_jr
+bk_jv "$wan_ipv4"; _jv_wan_ipv4=$_jr
+bk_jv "$wan_ipv6"; _jv_wan_ipv6=$_jr
+bk_jv "$wan_gateway"; _jv_wan_gateway=$_jr
+bk_jv "$wan_dns"; _jv_wan_dns=$_jr
+bk_jv "$lte_device"; _jv_lte_device=$_jr
+bk_jv "$lte_ipv4"; _jv_lte_ipv4=$_jr
+bk_jv "$lte_band"; _jv_lte_band=$_jr
+bk_jv "$lte_carrier"; _jv_lte_carrier=$_jr
+bk_jv "$lte_sim_state"; _jv_lte_sim_state=$_jr
+bk_jv "$wan_link_dev"; _jv_wan_link_dev=$_jr
+bk_js "$AGENT_KEY"; _js_AGENT_KEY=$_jr
+bk_js "$os_combined"; _js_os_combined=$_jr
+bk_js "$ow_hostname"; _js_ow_hostname=$_jr
+bk_js "$ow_kernel"; _js_ow_kernel=$_jr
+bk_js "$ow_model"; _js_ow_model=$_jr
+bk_js "$ow_board_name"; _js_ow_board_name=$_jr
+_bk_auto_update01=0; [ "$AUTO_UPDATE" = "1" ] && _bk_auto_update01=1
 payload=$(cat <<EOF
 {
-  "agent_key": "$(json_str "$AGENT_KEY")",
+  "agent_key": "$_js_AGENT_KEY",
   "agent_type": "openwrt",
   "version": "$AGENT_VERSION",
   "heavy_op_interval_hours": ${HEAVY_OP_INTERVAL_HOURS:-24},
-  "os": "$(json_str "$os_combined")",
+  "os": "$_js_os_combined",
   "cpu": $cpu,
   "cpu_cores": $cpu_cores,
   "cpu_core_max_pct": $cpu_core_max_pct,
@@ -4174,15 +4867,15 @@ payload=$(cat <<EOF
   "agent_tools": $agent_tools_json,
   "interfaces": $interfaces_json,
   "discovered_services": $discovered_services_json,
-  "lan_subnet": $(json_val "$lan_subnet"),
+  "lan_subnet": $_jv_lan_subnet,
   "dhcp_leases_count": $dhcp_leases_count,
   "dhcp_reservations_count": $dhcp_reservations_count,
   "dns_queries": $dns_queries,
   "dns_cache_hits": $dns_cache_hits,
   "dns_cache_misses": $dns_cache_misses,
-  "dns_engine": $(json_val "$dns_engine"),
-  "dns_encryption": $(json_val "$dns_encryption"),
-  "dns_servers": $(json_val "$dns_servers"),
+  "dns_engine": $_jv_dns_engine,
+  "dns_encryption": $_jv_dns_encryption,
+  "dns_servers": $_jv_dns_servers,
   "firewall_enabled": $firewall_enabled,
   "fw_accepted": $fw_accepted,
   "fw_dropped": $fw_dropped,
@@ -4207,17 +4900,17 @@ payload=$(cat <<EOF
   "load15": $load15,
   "uptime": $uptime_sec,
   "temperature": $temperature,
-  "hostname": "$(json_str "$ow_hostname")",
-  "kernel": "$(json_str "$ow_kernel")",
-  "model": "$(json_str "$ow_model")",
-  "board_name": "$(json_str "$ow_board_name")",
+  "hostname": "$_js_ow_hostname",
+  "kernel": "$_js_ow_kernel",
+  "model": "$_js_ow_model",
+  "board_name": "$_js_ow_board_name",
   "wan_up": $wan_up_json,
-  "wan_proto": $(json_val "$wan_proto"),
-  "wan_l3_device": $(json_val "$wan_l3_device"),
-  "wan_ipv4": $(json_val "$wan_ipv4"),
-  "wan_ipv6": $(json_val "$wan_ipv6"),
-  "wan_gateway": $(json_val "$wan_gateway"),
-  "wan_dns": $(json_val "$wan_dns"),
+  "wan_proto": $_jv_wan_proto,
+  "wan_l3_device": $_jv_wan_l3_device,
+  "wan_ipv4": $_jv_wan_ipv4,
+  "wan_ipv6": $_jv_wan_ipv6,
+  "wan_gateway": $_jv_wan_gateway,
+  "wan_dns": $_jv_wan_dns,
   "wan_uptime": $wan_uptime,
   "mwan3_policies": $mwan3_policies_json,
   "mwan3_active_gw": $mwan3_active_gw,
@@ -4227,9 +4920,9 @@ payload=$(cat <<EOF
   "sqm_dropped": $sqm_dropped,
   "sqm_ecn": $sqm_ecn,
   "lte_up": $lte_up,
-  "lte_device": $(json_val "$lte_device"),
+  "lte_device": $_jv_lte_device,
   "lte_uptime": $lte_uptime,
-  "lte_ipv4": $(json_val "$lte_ipv4"),
+  "lte_ipv4": $_jv_lte_ipv4,
   "lte_rssi": $lte_rssi,
   "lte_pci": $lte_pci,
   "lte_cell_id": $lte_cell_id,
@@ -4238,10 +4931,10 @@ payload=$(cat <<EOF
   "lte_rsrp": $lte_rsrp,
   "lte_rsrq": $lte_rsrq,
   "lte_sinr": $lte_sinr,
-  "lte_band": $(json_val "$lte_band"),
-  "lte_carrier": $(json_val "$lte_carrier"),
+  "lte_band": $_jv_lte_band,
+  "lte_carrier": $_jv_lte_carrier,
   "lte_connected": $lte_connected,
-  "lte_sim_state": $(json_val "$lte_sim_state"),
+  "lte_sim_state": $_jv_lte_sim_state,
   "lte_conn_code": $lte_conn_code,
   "lte_sim_code": $lte_sim_code,
   "lte_service_code": $lte_service_code,
@@ -4260,20 +4953,22 @@ payload=$(cat <<EOF
   "zerotier_networks": $zerotier_networks_json,
   "ups_status": $ups_status_json,
   "ups_battery_pct": $ups_battery_json,
-  "auto_update": $([ "$AUTO_UPDATE" = "1" ] && echo 1 || echo 0),
+  "auto_update": $_bk_auto_update01,
   "oom_kills": $oom_kills,
   "boot_time": $boot_time,
-  "agent_time": $now_sec,
+  "agent_time": $agent_time,
   "agent_run_ms": $agent_run_ms,
   "agent_prev_total_ms": $agent_prev_total_ms,
+  "agent_prev_cpu_ms": $agent_prev_cpu_ms,
   "runs_skipped_lock": $runs_skipped_lock,
   "runs_skipped_post": $runs_skipped_post,
+  "runs_skipped_killed": $runs_skipped_killed,
   "dns_resolver_ok": $dns_resolver_ok,
   "dns_latency_ms": $dns_latency_ms,
   "wan_latency_ms": $wan_latency_ms,
   "wan_internet": $wan_internet,
   "wan_link_mbit": $wan_link_mbit,
-  "wan_link_dev": $(json_val "$wan_link_dev"),
+  "wan_link_dev": $_jv_wan_link_dev,
   "wan_carrier_down_count": $wan_carrier_down_count,
   "wan_rx_mbps": $wan_rx_mbps,
   "wan_tx_mbps": $wan_tx_mbps,
@@ -4299,13 +4994,26 @@ EOF
 # copy is rebuilt from the text after the first "agent_type", so no quote or
 # backslash inside a key can leave a piece of it behind. If the cut did not
 # work, nothing is written at all.
+#
+# CAD-18/IO-11: and only when it answers a question. It used to be written on
+# every run - 97 % of what a minute run wrote to tmpfs (14 kB, ~20 MB a day)
+# and a subshell fork, for a copy nobody read. Now: on a plain --dry-run,
+# after a POST that failed (the one case where "what did it send?" matters),
+# and on every run while the owner keeps a flag file for it:
+#   touch /var/run/status-agent-openwrt/last-payload.on
+# An accepted report removes a copy left by an earlier failure, so a copy
+# that exists always belongs to the latest report that did not arrive.
 BK_LAST_PAYLOAD_FILE="$BK_PRIVATE_DIR/last-payload.json"
-lp_mark='"agent_type"'
-lp_tail=${payload#*"$lp_mark"}
-case "$lp_tail" in
-    "$payload"|*'"agent_key"'*) rm -f "$BK_LAST_PAYLOAD_FILE" 2>/dev/null ;;
-    *) ( umask 077; printf '{\n  "agent_key": "",\n  %s%s\n' "$lp_mark" "$lp_tail" > "$BK_LAST_PAYLOAD_FILE" ) 2>/dev/null || true ;;
-esac
+BK_LAST_PAYLOAD_ON="$BK_PRIVATE_DIR/last-payload.on"
+bk_keep_last_payload() {
+    lp_mark='"agent_type"'
+    lp_tail=${payload#*"$lp_mark"}
+    case "$lp_tail" in
+        "$payload"|*'"agent_key"'*) rm -f "$BK_LAST_PAYLOAD_FILE" 2>/dev/null ;;
+        *) ( umask 077; printf '{\n  "agent_key": "",\n  %s%s\n' "$lp_mark" "$lp_tail" > "$BK_LAST_PAYLOAD_FILE" ) 2>/dev/null || true ;;
+    esac
+}
+[ "$DRY_RUN" = "1" ] && [ -z "$BK_TEST_RESPONSE" ] && bk_keep_last_payload
 
 # The SMART reading itself happens OUTSIDE this run. It costs a drive access
 # and can hang for minutes behind a bad USB bridge, while the report has to go
@@ -4348,7 +5056,97 @@ if [ "$DRY_RUN" = "1" ]; then
     [ -z "$BK_TEST_RESPONSE" ] && exit 0
 fi
 
-log_debug "Odesilam data na $API_URL..."
+# WW-04: the run has a deadline. cron starts the next run 60 s after this one
+# started, and a run still holding the lock then costs that minute its report
+# ("l"). The POST used to wait up to 20 s whatever the clock said, so a slow
+# run plus a stalled server went over. Its limit now comes from the time left
+# until 58 s after the start (the uptime clock of agent_run_ms), minus 5 s
+# for the name lookup, which uclient-fetch's -T does not bound (5.0-5.5 s
+# measured). Never more than the 20 s it always had, never less than 5 s: a
+# run that is already late still gets a real chance to deliver. The
+# follow-ups after the report (action results, service checks, the update)
+# use what is left, and those that can wait for the next minute are skipped
+# below 12 s. No clock (no uptime to read): the fixed limits, as before.
+BK_RUN_DEADLINE_S=58
+bk_time_left() { # -> _left: whole seconds until the deadline, or empty
+    _left=""
+    bk_uptime_cs
+    if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
+        _left=$(( BK_RUN_DEADLINE_S - (_up_cs - BK_RUN_START_CS) / 100 ))
+    fi
+    return 0
+}
+bk_limit() { # LOW HIGH RESERVE -> _lim: _left minus RESERVE, clamped; HIGH without a clock
+    _lim=$2
+    [ -n "$_left" ] || return 0
+    _lim=$((_left - $3))
+    [ "$_lim" -gt "$2" ] && _lim=$2
+    [ "$_lim" -lt "$1" ] && _lim=$1
+    return 0
+}
+
+# IO-07: the self-update swap. NEW (a verified download in /tmp) becomes
+# TARGET through a rename inside TARGET's own directory. Until 0.1.8 the
+# script first copied itself to .bak and then did `mv /tmp/x /usr/bin/...`:
+# /tmp is another filesystem, so that mv unlinked the script and copied the
+# new one in - 2 x 224 kB of flash per update, and a window in which cron
+# found the agent missing (2 of 48 samples) or half written (27-44 of 48).
+# The .bak was never read by anything; a rollback is the server offering the
+# previous version again. Returns 0 when TARGET is the new version, else 1
+# with the reason in _sr_err (space: _sr_need kB were needed) and TARGET
+# untouched.
+bk_self_replace() { # NEW TARGET
+    _sr_new=$1; _sr_t=$2; _sr_err=""; _sr_need=""
+    bk_dirname "$_sr_t"
+    # A .new left by a swap that never finished (the run killed in it, a
+    # power cut, the OOM killer) goes first: on a tight overlay it would take
+    # the room the space check below asks for, and refuse every later update
+    # as "space", for good. This run holds the lock, so no other swap is
+    # using it.
+    rm -f "$_sr_t.new" 2>/dev/null
+    # The new copy sits next to the old one until the rename, and the
+    # running shell keeps the old inode until it exits: the whole new file
+    # plus 64 kB must fit, or a full overlay would break every later write
+    # on the router (config saves included). A df that says nothing does not
+    # stop the update - the copy itself then fails cleanly or not at all.
+    _sr_size=$(wc -c < "$_sr_new" 2>/dev/null); _sr_size=${_sr_size##* }
+    _sr_df=$(df -Pk "$_dn" 2>/dev/null); _sr_df=${_sr_df##*"$BK_NL"}
+    # shellcheck disable=SC2086
+    set -- $_sr_df
+    case "$_sr_size:${4:-x}" in
+        *[!0-9:]*|:*) ;;
+        *)
+            _sr_need=$(( _sr_size / 1024 + 65 ))
+            if [ "$4" -lt "$_sr_need" ]; then _sr_err=space; return 1; fi
+            ;;
+    esac
+    # The data on the flash before the name points at it: otherwise a power
+    # cut right after the rename can leave the name on an empty inode. dd
+    # conv=fsync flushes THIS file only. A global `sync` would wait for every
+    # mounted filesystem, and one disk that cannot write (a hung USB bridge,
+    # a hard NFS mount) would hold the update in D state for good; busybox
+    # `sync` takes no file argument (24.10 and master alike). A dd built
+    # without conv= fails at once and the plain copy follows: as durable as
+    # 0.1.8's swap, never an update refused for it.
+    if ! dd if="$_sr_new" of="$_sr_t.new" conv=fsync 2>/dev/null; then
+        if ! cp "$_sr_new" "$_sr_t.new" 2>/dev/null; then
+            rm -f "$_sr_t.new" 2>/dev/null; _sr_err=copy; return 1
+        fi
+    fi
+    chmod +x "$_sr_t.new" 2>/dev/null
+    if ! mv -f "$_sr_t.new" "$_sr_t" 2>/dev/null; then
+        rm -f "$_sr_t.new" 2>/dev/null; _sr_err=rename; return 1
+    fi
+    return 0
+}
+
+bk_time_left
+bk_limit 5 20 5; bk_post_t=$_lim
+# GNU wget tries twice: only when both tries fit, or when there is no clock.
+bk_wget_tries=2
+[ -n "$_left" ] && [ "$_left" -lt $((2 * bk_post_t + 5)) ] && bk_wget_tries=1
+
+log_debug "Odesilam data na $API_URL (limit ${bk_post_t} s)..."
 
 http_code=""
 body=""
@@ -4358,9 +5156,15 @@ if [ -n "$BK_TEST_RESPONSE" ]; then
     [ -z "$http_code" ] && http_code="000"
     body=$(sed -n '2,$p' "$BK_TEST_RESPONSE" 2>/dev/null)
 elif command -v curl >/dev/null 2>&1; then
-    response=$(curl -s -m 20 --connect-timeout 5 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d "$payload" "$API_URL")
-    http_code=$(echo "$response" | tail -n 1)
-    body=$(echo "$response" | head -n -1)
+    response=$(curl -s -m "$bk_post_t" --connect-timeout 5 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d "$payload" "$API_URL")
+    # Split in the shell: the code is the last line (-w "\n%{http_code}"),
+    # the body everything before it - `echo | tail -n 1` and `echo | head -n
+    # -1` were four forks on every report.
+    case "$response" in
+        *"$BK_NL"*) http_code=${response##*"$BK_NL"}; body=${response%"$BK_NL"*} ;;
+        *) http_code=$response; body="" ;;
+    esac
+    while :; do case "$body" in *"$BK_NL") body=${body%"$BK_NL"} ;; *) break ;; esac; done
 elif command -v uclient-fetch >/dev/null 2>&1; then
     # uclient-fetch je soucasti zakladni instalace OpenWrt a na rozdil od
     # holeho BusyBox wget ma spolehlivou HTTPS podporu (ustream-ssl).
@@ -4372,7 +5176,7 @@ elif command -v uclient-fetch >/dev/null 2>&1; then
     # error: ..." only when it is not quiet, and those are exactly what the
     # failure branch below parses. Its stderr goes to the file either way, so
     # nothing reaches the console.
-    if body=$(uclient-fetch -T 20 -O - --post-data="$payload" --header="Content-Type: application/json" "$API_URL" 2>"$uf_err"); then
+    if body=$(uclient-fetch -T "$bk_post_t" -O - --post-data="$payload" --header="Content-Type: application/json" "$API_URL" 2>"$uf_err"); then
         http_code="200"
     else
         http_code=$(sed -n 's/.*HTTP error \([0-9][0-9]*\).*/\1/p' "$uf_err" | head -n 1)
@@ -4382,7 +5186,7 @@ elif command -v uclient-fetch >/dev/null 2>&1; then
     rm -f "$uf_err"
 elif command -v wget >/dev/null 2>&1; then
     headers_file=$(mktemp /tmp/status-openwrt-wget-hdr.XXXXXX 2>/dev/null || echo "/tmp/status-openwrt-wget-hdr-$$")
-    body=$(wget -T 20 -t 2 --post-data="$payload" --header="Content-Type: application/json" --server-response -q -O - "$API_URL" 2>"$headers_file")
+    body=$(wget -T "$bk_post_t" -t "$bk_wget_tries" --post-data="$payload" --header="Content-Type: application/json" --server-response -q -O - "$API_URL" 2>"$headers_file")
     http_code=$(grep -E '^[[:space:]]*HTTP/' "$headers_file" | tail -n 1 | awk '{print $2}')
     rm -f "$headers_file"
 else
@@ -4392,23 +5196,20 @@ fi
 
 if [ "$http_code" = "200" ]; then
     log_debug "OK: Statistiky uspesne odeslany."
-
-    # G42: the report is stored, so the skips it carried are dealt with. Only
-    # the lines this run COUNTED are dropped - a skip appended while the POST
-    # was in flight belongs to the next report, and truncating the file would
-    # lose it. Same reason the file is rewritten instead of deleted: an empty
-    # file is a measured "nothing skipped", a missing one would be too on the
-    # next run, but the rewrite keeps a parallel writer's line.
-    if [ "$bk_skipped_counted" -gt 0 ] 2>/dev/null; then
-        _sk_i=0
-        : > "$BK_SKIPPED_FILE.tmp" 2>/dev/null
-        while read -r _sk_line; do
-            _sk_i=$((_sk_i + 1))
-            [ "$_sk_i" -le "$bk_skipped_counted" ] && continue
-            printf '%s\n' "$_sk_line" >> "$BK_SKIPPED_FILE.tmp" 2>/dev/null
-        done < "$BK_SKIPPED_FILE"
-        mv "$BK_SKIPPED_FILE.tmp" "$BK_SKIPPED_FILE" 2>/dev/null || rm -f "$BK_SKIPPED_FILE.tmp" 2>/dev/null
+    if [ -f "$BK_LAST_PAYLOAD_ON" ]; then
+        bk_keep_last_payload
+    elif [ -f "$BK_LAST_PAYLOAD_FILE" ]; then
+        rm -f "$BK_LAST_PAYLOAD_FILE" 2>/dev/null
     fi
+
+    # G42: the report is stored, so the skips it carried are dealt with: the
+    # folded total goes back to zero. A skip appended while the POST was in
+    # flight is still in `skipped` (never folded) and belongs to the next
+    # report. Written only when there was something to clear.
+    case "$runs_skipped_lock$runs_skipped_post$runs_skipped_killed" in
+        000) ;;
+        *) : > "$BK_SKIPPED_TOTAL" 2>/dev/null ;;
+    esac
 
     # A bare 200 is not a receipt. The server wraps its speedtest INSERT loop
     # in a try/catch so that a broken result never brings telemetry ingestion
@@ -4482,13 +5283,18 @@ if [ "$http_code" = "200" ]; then
             printf '%s|%s|%s\n' "$ar_id" "$ar_status" "$ar_msg" >> "$BK_TEST_RESPONSE.results" 2>/dev/null
             return 0
         fi
-        ar_payload="{\"agent_key\":\"$(json_str "$AGENT_KEY")\",\"action_result\":{\"action_id\":${ar_id},\"status\":\"$(json_str "$ar_status")\",\"message\":\"$(json_str "$ar_msg")\"}}"
+        # Escaped with the builtin: three $(json_str) subshells were three forks.
+        bk_js "$AGENT_KEY"; _ar_k=$_jr; bk_js "$ar_status"; _ar_s=$_jr; bk_js "$ar_msg"
+        ar_payload="{\"agent_key\":\"$_ar_k\",\"action_result\":{\"action_id\":${ar_id},\"status\":\"$_ar_s\",\"message\":\"$_jr\"}}"
+        # WW-04: bounded by the deadline, never skipped - the action has
+        # already run, and without its result it stays "sent" for ever.
+        bk_time_left; bk_limit 3 10 2
         if command -v curl >/dev/null 2>&1; then
-            curl -s -m 10 -X POST -H "Content-Type: application/json" -d "$ar_payload" "$API_URL" >/dev/null 2>&1
+            curl -s -m "$_lim" -X POST -H "Content-Type: application/json" -d "$ar_payload" "$API_URL" >/dev/null 2>&1
         elif command -v uclient-fetch >/dev/null 2>&1; then
-            uclient-fetch -q -T 10 -O /dev/null --post-data="$ar_payload" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
+            uclient-fetch -q -T "$_lim" -O /dev/null --post-data="$ar_payload" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
         elif command -v wget >/dev/null 2>&1; then
-            wget -T 10 --post-data="$ar_payload" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1
+            wget -T "$_lim" --post-data="$ar_payload" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1
         fi
     }
 
@@ -4655,7 +5461,19 @@ if [ "$http_code" = "200" ]; then
     # (/proc/net/tcp, tcp6 i udp) - a vysledky posle zpet jako
     # service_check_results. Zadna latence se nemeri; posila se jen fakt,
     # jestli sluzba bezi (vymyslene 0 ms by bylo horsi nez nic).
-    if echo "$body" | grep -q '"service_checks":\['; then
+    # A substring test is what `echo | grep -q` answered: the pattern holds no
+    # newline. Two forks on every accepted report.
+    case "$body" in *'"service_checks":['*) _sc_has=1 ;; *) _sc_has=0 ;; esac
+    # WW-04: the server lists the checks in every answer, so a minute that is
+    # out of time leaves them to the next one instead of running into it.
+    if [ "$_sc_has" = 1 ]; then
+        bk_time_left
+        if [ -n "$_left" ] && [ "$_left" -lt 12 ]; then
+            log_message "Kontroly sluzeb vynechany: do konce minuty zbyva ${_left} s."
+            _sc_has=0
+        fi
+    fi
+    if [ "$_sc_has" = 1 ]; then
         sc_list=$(echo "$body" | sed -n 's/.*"service_checks":\[\(.*\)\].*/\1/p' | sed 's/}[[:space:]]*,[[:space:]]*{/}|{/g')
         sc_results=""
         SC_OLD_IFS=$IFS
@@ -4684,20 +5502,25 @@ if [ "$http_code" = "200" ]; then
             sc_bool="false"
             [ "$sc_running" = "1" ] && sc_bool="true"
             [ -n "$sc_results" ] && sc_results="$sc_results, "
-            sc_results="${sc_results}{\"monitor_id\":$sc_id,\"running\":$sc_bool,\"detail\":\"$(json_str "$sc_detail")\"}"
+            # The builtin escaper: a $(json_str) here was a fork per check, every
+            # minute. It splits nothing, so the IFS='|' of this loop is harmless.
+            bk_js "$sc_detail"
+            sc_results="${sc_results}{\"monitor_id\":$sc_id,\"running\":$sc_bool,\"detail\":\"$_jr\"}"
         done
         IFS=$SC_OLD_IFS
 
         if [ -n "$sc_results" ]; then
-            sc_payload="{\"agent_key\":\"$(json_str "$AGENT_KEY")\",\"service_check_results\":[$sc_results]}"
+            bk_js "$AGENT_KEY"
+            sc_payload="{\"agent_key\":\"$_jr\",\"service_check_results\":[$sc_results]}"
+            bk_time_left; bk_limit 3 10 2
             if [ -n "$BK_TEST_RESPONSE" ]; then
                 : # response seam: a dry run never POSTs
             elif command -v curl >/dev/null 2>&1; then
-                curl -s -m 10 -X POST -H "Content-Type: application/json" -d "$sc_payload" "$API_URL" >/dev/null 2>&1
+                curl -s -m "$_lim" -X POST -H "Content-Type: application/json" -d "$sc_payload" "$API_URL" >/dev/null 2>&1
             elif command -v uclient-fetch >/dev/null 2>&1; then
-                uclient-fetch -q -T 10 -O /dev/null --post-data="$sc_payload" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
+                uclient-fetch -q -T "$_lim" -O /dev/null --post-data="$sc_payload" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
             elif command -v wget >/dev/null 2>&1; then
-                wget -T 10 --post-data="$sc_payload" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1
+                wget -T "$_lim" --post-data="$sc_payload" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1
             fi
             log_debug "Odeslany vysledky agent-side kontrol sluzeb."
         fi
@@ -4710,24 +5533,46 @@ if [ "$http_code" = "200" ]; then
     # nová verze.
     # Never under the response seam: a test must not replace the script it runs.
     if [ "$AUTO_UPDATE" = "1" ] && [ -z "$BK_TEST_RESPONSE" ]; then
-        update_available=$(echo "$body" | grep -o '"update_available":[a-z]*' | cut -d: -f2)
+        # `echo | grep -o '"update_available":[a-z]*' | cut -d: -f2` without
+        # its four forks a report: every occurrence's letters, one per line.
+        update_available=""; _ua_rest=$body
+        while :; do
+            case "$_ua_rest" in *'"update_available":'*) ;; *) break ;; esac
+            _ua_rest=${_ua_rest#*'"update_available":'}
+            _ua_v=${_ua_rest%%[!a-z]*}
+            update_available="$update_available$_ua_v$BK_NL"
+        done
+        while :; do case "$update_available" in *"$BK_NL") update_available=${update_available%"$BK_NL"} ;; *) break ;; esac; done
         if [ "$update_available" = "true" ]; then
             update_url=$(echo "$body" | sed -n 's/.*"update_url":"\([^"]*\)".*/\1/p' | sed 's,\\/,/,g')
             update_sha=$(echo "$body" | sed -n 's/.*"update_sha256":"\([a-f0-9]*\)".*/\1/p')
             latest_version=$(echo "$body" | sed -n 's/.*"latest_version":"\([^"]*\)".*/\1/p')
 
+            # WW-04: the offer comes with every report, so a minute that is
+            # out of time leaves the download to a later one.
+            bk_time_left
+            if [ -n "$_left" ] && [ "$_left" -lt 12 ]; then
+                log_debug "Aktualizace odlozena: do konce minuty zbyva ${_left} s."
+                update_url=""
+            fi
             if [ -n "$update_url" ] && [ -n "$update_sha" ]; then
                 self_path="$0"
-                tmp_file=$(mktemp /tmp/status-openwrt-update.XXXXXX 2>/dev/null || echo "/tmp/status-openwrt-update-$$")
+                bk_limit 5 60 2
+                # One fixed name in the private directory, not a new mktemp in
+                # /tmp each time: a run killed during the download or the swap
+                # (a takeover) would leave a whole agent there for good, one
+                # more per killed run. The next download starts over this one.
+                tmp_file="$BK_PRIVATE_DIR/update.dl"
+                rm -f "$tmp_file" 2>/dev/null
                 log_message "K dispozici je nova verze agenta $latest_version (aktualni $AGENT_VERSION), stahuji z $update_url..."
 
                 download_ok=0
                 if command -v curl >/dev/null 2>&1; then
-                    curl -fsS -m 60 --connect-timeout 10 -o "$tmp_file" "$update_url" && download_ok=1
+                    curl -fsS -m "$_lim" --connect-timeout 10 -o "$tmp_file" "$update_url" && download_ok=1
                 elif command -v uclient-fetch >/dev/null 2>&1; then
-                    uclient-fetch -q -T 60 -O "$tmp_file" "$update_url" && download_ok=1
+                    uclient-fetch -q -T "$_lim" -O "$tmp_file" "$update_url" && download_ok=1
                 elif command -v wget >/dev/null 2>&1; then
-                    wget -q -T 60 -t 2 -O "$tmp_file" "$update_url" && download_ok=1
+                    wget -q -T "$_lim" -t 2 -O "$tmp_file" "$update_url" && download_ok=1
                 fi
 
                 if [ "$download_ok" = "1" ]; then
@@ -4740,11 +5585,12 @@ if [ "$http_code" = "200" ]; then
 
                     if [ -n "$actual_sha" ] && [ "$actual_sha" = "$update_sha" ]; then
                         if sh -n "$tmp_file" 2>/dev/null; then
-                            cp "$self_path" "$self_path.bak" 2>/dev/null || true
-                            chmod +x "$tmp_file"
-                            if mv "$tmp_file" "$self_path"; then
+                            if bk_self_replace "$tmp_file" "$self_path"; then
+                                rm -f "$tmp_file" 2>/dev/null
                                 log_message "OK: Agent aktualizovan na verzi $latest_version. Nova verze se pouzije pri pristim spusteni."
                                 exit 0
+                            elif [ "$_sr_err" = space ]; then
+                                log_message "CHYBA UPDATE: Vedle $self_path neni misto na novou verzi ($_sr_need kB). Aktualizace zrusena."
                             else
                                 log_message "CHYBA UPDATE: Nepodarilo se nahradit $self_path (prava?). Aktualizace zrusena."
                             fi
@@ -4765,9 +5611,12 @@ if [ "$http_code" = "200" ]; then
     log_debug "Hotovo."
 else
     log_message "CHYBA: Odeslani selhalo (HTTP $http_code). Odpoved: $body"
-    # G42: this minute produced no stored report either. The line is written
-    # here and not where the POST is built, so a transport that came back
-    # with any other code is counted too.
-    printf 'p\n' >> "$BK_SKIPPED_FILE" 2>/dev/null || true
+    bk_keep_last_payload
+    # G42: this minute produced no stored report either. Counted here and
+    # not where the POST is built, so a transport that came back with any
+    # other code is counted too - and straight into the folded total: this
+    # run holds the lock and has the counters in hand, so no line has to be
+    # written and read back.
+    runs_skipped_post=$((runs_skipped_post + 1)); bk_sk_cap; bk_sk_save
     exit 1
 fi

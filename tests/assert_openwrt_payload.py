@@ -307,6 +307,10 @@ checks = {
     "wifi: htmodes_supported and phy_has_6ghz come from that cache - only the 6 GHz radio has a 6 GHz band": [radios[r]["phy_has_6ghz"] for r in ("wlan6", "phy0-ap0", "wlan0")] == [True, False, False] and radios["phy0-ap0"]["htmodes_supported"][-1] == "HE160",
     "payload budget: wifi_radios stays under 5500 B for six radios": len(json.dumps(d["wifi_radios"], separators=(",", ":"))) <= 5500,
     "firewall: accept/drop/reject sums and enabled from one ruleset": (d["fw_accepted"], d["fw_dropped"], d["fw_rejected"], d["firewall_enabled"]) == (200, 5, 3, True),
+    "firewall: one terse nft listing per payload run (-t leaves the set elements out) and never a second": log_lines("nft_calls.log", core_only=True) == ["-t list ruleset"] * 6,
+    "firewall: an nft without -t is asked again without it and answers the same (wdns1); an empty kernel is asked twice (wfw2)": collections.Counter(log_lines("nft_calls.log"))["list ruleset"] == 2 and (wdns1["fw_accepted"], wdns1["fw_dropped"], wdns1["fw_rejected"], wdns1["firewall_enabled"]) == (200, 5, 3, True) and path_of(wdns1, "flowtable_active") is True,
+    "netifd: the interface dump is loaded into jshn once per run - five payload runs have a dump (r3 has none), none loads it twice": sorted(collections.Counter(log_lines("jshn_calls.log", core_only=True)).values()) == [1] * 5,
+    "top: both rankings list the container's processes, never [] - the agent itself and its sampler are left out": all(isinstance(p[k], list) and len(p[k]) >= 1 and all(set(x) == {"name", "cpu", "ram_mb"} and isinstance(x["name"], str) and x["name"] for x in p[k]) for p in (d1, d) for k in ("top_cpu_processes", "top_ram_processes")),
     "wan: interface up and the bound echo answered": d["wan_up"] is True and d["wan_internet"] is True,
     "dhcp: no lease file is unknown, reservations counted": d["dhcp_leases_count"] is None and d["dhcp_reservations_count"] == 3,
     "cpu: null on the first run, a number on the second": d1["cpu"] is None and isinstance(d["cpu"], (int, float)),
@@ -325,7 +329,7 @@ checks = {
     "link roles: the WAN device is reported, the LTE rate is measured on the second run": d["wan_l3_device"] == "eth0" and d1["net_lte"] is None and isinstance(d["net_lte"], (int, float)),
     "no interfaces at all: no WAN device, no LTE rate": d3["wan_l3_device"] is None and d3["net_lte"] is None,
     "the log is trimmed on a router that has no stat applet": 0 < log_size <= 40000,
-    "version reported": d.get("version") == "0.1.8",
+    "version reported": d.get("version") == "0.1.9",
     # --- storage and SMART (CORE 2.3, 2.7; CORE e2e #22-#39, #44, #45) ---
     # CORE e2e #22
     "omnia: storage_disks has sda and no loop*, mtdblock*, zram* - and no mmcblk0; emmc is null":
@@ -826,6 +830,214 @@ checks.update({
         exp_cut is not None and wl[9]["log_errors_recent"] == exp_cut and "198.51" not in json.dumps(wl[9]["log_errors_recent"]),
     "log: bez logu jsou všechna pole null - ne 0 a ne [] (wlog8)":
         [wl[8][k] for k in LOG_KEYS] == [None, None, None, None, "on"],
+})
+# --- WW-07, IO-03, IO-11, WW-04, IO-07: waits and writes ---
+# (openwrt-stubs/run-in-container.sh: wtake*, wskip*, wlp*, wdl*, wupd*)
+def maybe(name):
+    """A payload that may legitimately be missing: None instead of a FAIL."""
+    try:
+        return json.load(open(f"{out}/{name}.json"))
+    except (FileNotFoundError, ValueError):
+        return None
+def killed(p):
+    return None if p is None else [p.get(k) for k in ("runs_skipped_lock", "runs_skipped_post", "runs_skipped_killed")]
+def procs(name):
+    """'holder=S 123 child=gone' -> {'holder': 'S', 'child': 'gone'} (state only)."""
+    return {k: v.split()[0] for k, v in re.findall(r"(\w+)=(\S+(?: \d+)?)", text(name) or "")}
+def err(name):
+    return text(f"{name}.err") or ""
+wt = {n: maybe(f"wtake{n}") for n in ("1", "1b", "1c", "2b", "3", "4")}
+ws1, ws2, ws2b, ws2c = maybe("wskip1"), maybe("wskip2"), maybe("wskip2b"), maybe("wskip2c")
+wlp1, wlp3 = maybe("wlp1"), maybe("wlp3")
+wlp1_kept, wlp3_kept = load_kept("wlp1_last.json"), load_kept("wlp3_last.json")
+wdl2 = maybe("wdl2")
+ns_core = log_lines("nslookup_calls.log", core_only=True)
+wt6a, wt6, wt8 = maybe("wtake6a"), maybe("wtake6"), maybe("wtake8")
+try:
+    ws1_total = [int(x) for x in (text("wskip1_total.txt") or "").split()]
+    ws1_left = int(text("wskip1_left.txt") or "-1")
+except ValueError:
+    ws1_total, ws1_left = [], -1
+try:
+    upd_old, upd_new = (int(x) for x in (text("wupd1_sizes.txt") or "").split())
+except ValueError:
+    upd_old = upd_new = -1
+# Read raw: text() strips, and an empty sample (a failed read) must count.
+try:
+    upd_seen = open(f"{out}/wupd1_seen.txt").read().split("\n")[:-1]
+    upd_samples = int(text("wupd1_samples.txt") or "0")
+except (FileNotFoundError, ValueError):
+    upd_seen, upd_samples = [], 0
+checks.update({
+    "lock: a holder 400 s old is killed together with its child, and the run goes on and reports it (wtake1)":
+        killed(wt["1"]) == [0, 0, 1] and procs("wtake1_procs.txt").get("holder") in ("gone", "Z")
+        and procs("wtake1_procs.txt").get("child") in ("gone", "Z") and text("wtake1_lock.txt") == "no"
+        and "ukoncuji ho" in err("wtake1"),
+    "lock: the takeover goes with the next accepted report and is then a measured 0 (wtake1b, wtake1c)":
+        killed(wt["1b"]) == [0, 0, 1] and killed(wt["1c"]) == [0, 0, 0]
+        and d1["runs_skipped_killed"] == 0 and d["runs_skipped_killed"] == 0,
+    "lock: a holder 30 s old is an ordinary busy minute - no report, nothing killed, the next report counts it (wtake2)":
+        text("wtake2.json") == "" and procs("wtake2_procs.txt") == {"holder": "S", "child": "S"}
+        and killed(wt["2b"]) == [1, 0, 0],
+    "lock: a PID that belongs to another process by now is not killed, and its lock is taken (wtake3)":
+        killed(wt["3"]) == [0, 0, 0] and procs("wtake3_procs.txt") == {"holder": "S", "child": "S"}
+        and "patri jinemu procesu" in err("wtake3"),
+    "lock: a holder that is a zombie already (busybox crond reaps every 10 s) is taken over (wtake4)":
+        killed(wt["4"]) == [0, 0, 1] and procs("wtake4_procs.txt") == {"zombie": "Z"},
+    "lock: a holder that survives SIGKILL keeps the lock - no report and no second run beside it (wtake5)":
+        text("wtake5.json") == "" and (text("wtake5_lock.txt") or "").splitlines() == ["1", "l"]
+        and "nejde ukoncit" in err("wtake5"),
+    "zámek: po převzetí zaseknutého běhu hlásí další report agent_prev_total_ms i agent_prev_cpu_ms null - ne čísla běhu před ním (wtake6)":
+        wt6a is not None and [x.isdigit() for x in (text("wtake6a_files.txt") or "").split()] == [True, True]
+        and wt6 is not None and wt6["agent_prev_total_ms"] is None and wt6["agent_prev_cpu_ms"] is None
+        and killed(wt6) == [0, 0, 1] and procs("wtake6_procs.txt").get("wedged") in ("gone", "Z"),
+    "zámek: běh, jehož zámek mezitím drží jiný běh, ho na konci nesmaže a nepřepíše run.total (wtake7)":
+        len((text("wtake7_lock.txt") or "").split()) == 3
+        and text("wtake7_lock.txt").split()[0] == text("wtake7_lock.txt").split()[1]
+        and text("wtake7_lock.txt").split()[2] == "no-total" and maybe("wtake7") is not None,
+    "zámek: běh, který převzetí ukončilo, ale jádro ho ještě drželo, se započítá, až jeho zámek někdo převezme; předek běhu značku nedostane (wtake8, wtake5)":
+        killed(wt8) == [0, 0, 1] and text("wtake8_lock.txt") == "no" and text("wtake5_killed.txt") == "no",
+    "skipped: 25,000 old lines plus 200 appended during the fold - each counted once, now or by the next run (wskip1)":
+        ws1 is not None and ws1["runs_skipped_lock"] >= 25000 and ws1["runs_skipped_post"] == 0
+        and ws1_total == [ws1["runs_skipped_lock"], 1, 0] and ws1["runs_skipped_lock"] + ws1_left == 25200
+        and text("wskip1_fold.txt") == "no",
+    "skipped: each counter stops at 100,000 (the server's range check), lines of an older agent count too (wskip2)":
+        killed(ws2) == [100000, 100000, 7] and killed(ws2b) == [100000, 100000, 7] and killed(ws2c) == [0, 0, 0],
+    "last payload: a failed POST keeps the copy - private and keyless (wlp1)":
+        wlp1 is not None and text("wlp1_mode.txt") == "-rw-------" and wlp1_kept == {**wlp1, "agent_key": ""},
+    "last payload: an accepted report removes it, and the owner's flag keeps it on every run (wlp2, wlp3)":
+        text("wlp2_file.txt") == "no" and wlp3 is not None and wlp3_kept == {**wlp3, "agent_key": ""},
+    "deadline: on time the POST keeps its 20 s and the service checks run (wdl0)":
+        "(limit 20 s)" in err("wdl0") and "Odeslany vysledky agent-side kontrol sluzeb." in err("wdl0"),
+    "deadline: 40 s late the POST gets 58-40-5 = 13 s and the checks still run (wdl1)":
+        "(limit 13 s)" in err("wdl1") and "Odeslany vysledky agent-side kontrol sluzeb." in err("wdl1"),
+    "deadline: 50 s late the POST gets its floor of 5 s and the checks wait for the next minute (wdl2)":
+        "(limit 5 s)" in err("wdl2") and "zbyva 8 s" in err("wdl2")
+        and "Odeslany vysledky agent-side kontrol sluzeb." not in err("wdl2")
+        and wdl2 is not None and wdl2["agent_run_ms"] == 50000,
+    "dns: každý běh s payloadem se ptá bez -timeout - resolver, který odpoví za 2-5 s, je pomalý, ne mrtvý (dns_resolver_ok zůstává, co byl v 0.1.8)":
+        len(ns_core) > 0 and set(ns_core) == {"example.com 127.0.0.1"},
+    "update: the swap across filesystems is a rename - never a missing or short agent, no .bak, no .new (wupd1)":
+        text("wupd1_rc.txt") == "rc=0 err=" and text("wupd1_cmp.txt") == "same" and upd_old > 0 and upd_new > 0
+        and upd_samples >= 10 and len(upd_seen) > 0 and set(upd_seen) <= {str(upd_old), str(upd_new)}
+        and text("wupd1_dir.txt") == "agent_openwrt.sh" and (text("wupd1_mode.txt") or "").startswith("-rwx"),
+    "update: without room for the new file next to the old one nothing is written (wupd2)":
+        (text("wupd2_rc.txt") or "").startswith("rc=1 err=space need=") and text("wupd2_cmp.txt") == "same"
+        and text("wupd2_dir.txt") == "agent_openwrt.sh",
+    "update: .new po přerušené výměně zmizí dřív, než se měří místo - jinak by na plném overlayi odmítal každou další aktualizaci (wupd2)":
+        (text("wupd2_rc.txt") or "").startswith("rc=1 err=space") and text("wupd2_dir.txt") == "agent_openwrt.sh",
+})
+# --- W1-7: what a run costs, and the budget it must stay in ---
+# (openwrt-stubs/run-in-container.sh: wbud0..wbud5)
+#
+# FORK_BUDGET holds one warm run of THIS harness - a verbose --dry-run with a
+# canned 200, no cfg, the stub fixtures, the SMART cache fresh - to its forks,
+# counted by the PID namespace's last-PID counter, so it is exact and the same
+# on every host. Measured when wave 1 (W1-1..W1-7) was done: 195 in each of 9
+# warm runs, back to back or 12 s apart; 0.1.8 before the wave: 510-515 in
+# the same setup. The margin of 5 is one step of 4 - identical warm runs of
+# 0.1.8 still alternated 511/515 here, and the audit saw 474/478 in 0.1.7;
+# none was seen after the wave, but its cause was never pinned - plus the one
+# extra fork a first warm run has shown in this wave (185 against 184 in the
+# cron-like profile). So a change that adds a pipeline to the minute run
+# fails here, or at the latest the one after it. Every change that saves forks
+# lowers the budget in the same commit (plan: migration rule 1); raising it
+# needs a reason in the commit, not a wider margin.
+# FORK_SLACK makes that rule a check: a budget more than 9 forks above the
+# measured run fails too (the margin of 5, plus one step of 4 in case the
+# alternation ever lands below 195). Without it a budget raised "for room"
+# would pass forever, and a saving would never be locked in.
+#
+# MAX_RSS_KB is the largest single process of such a run - the agent's shell
+# or any child, ru_maxrss over the whole tree from wait4(). Measured
+# 4,108-4,248 kB on arm64, the Wi-Fi awk (the shell itself is 2.7 MB).
+# 6,144 kB is about 45 % above: the x86_64 runner of CI was not measured, and
+# allocator and text size differ between the two. A change that holds a
+# table or a tool output several MB big in one process fails. Below 2,048 kB
+# the MEASUREMENT is broken (the shell alone is more), not the agent frugal -
+# e.g. a busybox whose `time` stopped multiplying %M by the page size.
+#
+# SHELL_ANON_KB is the agent shell's own heap and stack (RssAnon, the largest
+# of the 20 ms samples of wbud6): what a variable holding a whole tool output
+# grows, and what the tree ceiling above cannot see under the Wi-Fi awk.
+# Measured 488-504 kB on arm64 in this wave (0.1.8: 448-524 kB; an idle
+# busybox sh is 128 kB). RssAnon leaves out the busybox text, the part
+# that depends on the CPU, and both CI and this host are 64-bit, so the
+# margin is for the allocator only: 768 kB, about 50 % above. A shell that
+# keeps a few hundred kB of output in a variable fails. A sample can miss a
+# spike shorter than 20 ms: this can let one through, never fail a good run.
+# Below 256 kB the sampling is broken, not the shell small.
+#
+# PRIV_MAX_PAGES is what the warm runs leave in the private directory, in
+# 4 kB pages - on a router that is tmpfs, so RAM, and a file of a few bytes
+# still takes a whole page. Measured 26 pages (26 files, 4,117 B: the six
+# Wi-Fi interfaces of the fixture have two files each); 0.1.8 left 24 (20
+# files, one of them the 16.9 kB last-payload.json written by every run).
+# The fixture is fixed, so the count is exact and has no margin: a new state
+# file, or one that outgrows a page, raises it in its own commit, with the
+# reason there.
+FORK_BUDGET = 200
+FORK_SLACK = 9
+MAX_RSS_KB = 6144
+SHELL_ANON_KB = 768
+PRIV_MAX_PAGES = 26
+def bud(name):
+    """(forks or None, CPU ms by wait4, max RSS kB) of a run under `time`."""
+    forks = text(f"{name}_forks.txt")
+    try:
+        u, s, m = (text(f"{name}_time.txt") or "").splitlines()[-1].split()
+        cpu, rss = round((float(u) + float(s)) * 1000), int(m) // int(text("wbud_pagekb.txt"))
+    except (IndexError, ValueError, TypeError, ZeroDivisionError):
+        cpu = rss = None
+    return (int(forks) if forks and forks.isdigit() else None), cpu, rss
+wb = {n: maybe(f"wbud{n}") for n in "012345"}
+bud1, bud2 = bud("wbud1"), bud("wbud2")
+bud_forks = [b[0] for b in (bud1, bud2) if b[0] is not None]
+bud_rss = [b[2] for b in (bud1, bud2)]
+print(f"info  budget: warm forks {bud1[0]}, {bud2[0]} (budget {FORK_BUDGET}); max RSS {bud1[2]}, {bud2[2]} kB "
+      f"(ceiling {MAX_RSS_KB}); CPU by time {bud1[1]}, {bud2[1]} ms; wbud1 reported by wbud2: "
+      f"{(wb['2'] or {}).get('agent_prev_cpu_ms', 'MISSING')} ms")
+try:
+    shell_anon, shell_hwm, shell_samples = (int(v) for v in (text("wbud6_mem.txt") or "").split())
+except ValueError:
+    shell_anon = shell_hwm = shell_samples = None
+priv = []
+for line in (text("wbud_priv.txt") or "").splitlines():
+    size, _, name = line.partition(" ")
+    priv.append((int(size) if size.isdigit() else None, name))
+# ceil(size / 4096): tmpfs gives an empty file no page, any other at least one.
+priv_pages = sum(-(-s // 4096) for s, _ in priv if s is not None)
+print(f"info  memory: shell RssAnon peak {shell_anon} kB (VmHWM {shell_hwm} kB, {shell_samples} samples, "
+      f"ceiling {SHELL_ANON_KB}); private dir {len(priv)} files, {sum(s or 0 for s, _ in priv)} B, "
+      f"{priv_pages} pages (budget {PRIV_MAX_PAGES}): {' '.join(n for _, n in priv)}")
+def prev_cpu(p):
+    return "MISSING" if p is None else p.get("agent_prev_cpu_ms", "MISSING")
+checks.update({
+    "cost: every payload run carries agent_prev_cpu_ms, and the first run of all has no previous run - null, not 0":
+        all(prev_cpu(p) != "MISSING" for p in (d1, d, d2b, d3, d4, d5))
+        and d1["agent_prev_cpu_ms"] is None and prev_cpu(wb["0"]) is None,
+    "cost: the previous run's CPU is what `time` measured for it - user + system, children included, 10 ms steps (wbud1 -> wbud2)":
+        isinstance(prev_cpu(wb["2"]), int) and bud1[1] is not None
+        and prev_cpu(wb["2"]) > 0 and prev_cpu(wb["2"]) % 10 == 0
+        # Below: ticks truncated per field on both sides, and the `rm` of the
+        # lock that runs after the trap. Above: rounding only.
+        and bud1[1] - 60 <= prev_cpu(wb["2"]) <= bud1[1] + 20
+        and isinstance(d["agent_prev_cpu_ms"], int) and d["agent_prev_cpu_ms"] > 0,
+    "cost: a run killed before its EXIT trap leaves null for the next report, not the run before it (wbud3, wbud4)":
+        text("wbud3_runcpu.txt") == "0" and prev_cpu(wb["4"]) is None,
+    "cost: the first report of a new version does not carry the old version's run (wbud5)":
+        (text("wbud4_runcpu.txt") or "").isdigit() and prev_cpu(wb["5"]) is None,
+    f"budget: a warm run of the harness makes at most {FORK_BUDGET} forks (wbud1, wbud2)":
+        len(bud_forks) > 0 and max(bud_forks) <= FORK_BUDGET,
+    f"budget: the fork budget is at most {FORK_SLACK} above the measured warm run, so a saving lowers it (wbud1, wbud2)":
+        len(bud_forks) > 0 and FORK_BUDGET - max(bud_forks) <= FORK_SLACK,
+    f"budget: no process of a warm run holds more than {MAX_RSS_KB} kB, and the measurement is alive (wbud1, wbud2)":
+        all(r is not None and 2048 <= r <= MAX_RSS_KB for r in bud_rss),
+    f"budget: the agent shell's heap and stack stay under {SHELL_ANON_KB} kB, sampled while it runs (wbud6)":
+        shell_anon is not None and shell_samples >= 3 and 256 <= shell_anon <= SHELL_ANON_KB
+        and isinstance(prev_cpu(maybe("wbud6")), int),
+    f"budget: the warm runs leave at most {PRIV_MAX_PAGES} tmpfs pages in the private directory (wbud2)":
+        len(priv) > 0 and all(s is not None for s, _ in priv) and priv_pages <= PRIV_MAX_PAGES,
 })
 # Checks written down before the collector that can pass them: the stubs
 # already serve the real router, the Wi-Fi block of the agent is still the

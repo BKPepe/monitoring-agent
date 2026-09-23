@@ -5,6 +5,19 @@
 #   BK_STUB_NFT=foreign  mwan3's table and nothing else - the firewall never
 #                        loaded, but the kernel is not empty (G20)
 #   BK_STUB_NFT=empty    nft answers, the kernel holds no table at all
+#   BK_STUB_NFT_NOTERSE=1  an nft too old for -t: it refuses the option and
+#                        prints nothing, so the agent must list again without
+#                        it and still read the same sums
+# `-t` (terse) leaves the elements of named sets out, as the real nft does.
+# The fw4 table carries a named set with counted elements for that: it holds
+# no verdict, so the firewall sums are the same with and without -t. Every
+# call is logged.
+echo "$*" >> /work/out/nft_calls.log
+bk_terse=0
+if [ "$1" = "-t" ]; then
+    [ "$BK_STUB_NFT_NOTERSE" = 1 ] && { echo "nft: invalid option -- 't'" >&2; exit 1; }
+    bk_terse=1; shift
+fi
 [ "$1 $2" = "list ruleset" ] || exit 1
 if [ "$BK_STUB_NFT" = empty ]; then
     exit 0
@@ -31,6 +44,10 @@ cat <<'M'
 	}
 M
 fi
+# printf, a builtin: the stub's own forks count in the harness profile.
+printf '\tset bk_blocklist {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tcounter\n'
+[ "$bk_terse" = 1 ] || printf '\t\telements = { 192.0.2.66 counter packets 17 bytes 1020, 198.51.100.0/24 counter packets 4 bytes 240,\n\t\t\t     203.0.113.9 counter packets 0 bytes 0 }\n'
+printf '\t}\n'
 cat <<'M'
 	chain input {
 		type filter hook input priority filter; policy drop;

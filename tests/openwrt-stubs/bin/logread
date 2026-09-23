@@ -6,9 +6,14 @@
 # makes exactly once, between those two reads, so it is where the clock of the
 # fake router can be advanced - no sleep, no wall clock, and the expected
 # answer is exactly 4200 ms.
-if [ "$BK_STUB_UPTIME_BUMP" = 1 ] && [ -f "$STATUS_TEST_ROOT/proc/uptime" ]; then
+# BK_STUB_UPTIME_ADD=<s>: the same, by whole seconds - a run that is already
+# that late when it reaches its POST (the run deadline of WW-04).
+_bump=""
+[ "$BK_STUB_UPTIME_BUMP" = 1 ] && _bump=4.20
+[ -n "$BK_STUB_UPTIME_ADD" ] && _bump=$BK_STUB_UPTIME_ADD
+if [ -n "$_bump" ] && [ -f "$STATUS_TEST_ROOT/proc/uptime" ]; then
     read -r _u _i < "$STATUS_TEST_ROOT/proc/uptime"
-    awk -v u="$_u" -v i="$_i" 'BEGIN { printf "%.2f %.2f\n", u + 4.20, i }' \
+    awk -v u="$_u" -v i="$_i" -v b="$_bump" 'BEGIN { printf "%.2f %.2f\n", u + b, i }' \
         > "$STATUS_TEST_ROOT/proc/uptime.new" && mv "$STATUS_TEST_ROOT/proc/uptime.new" "$STATUS_TEST_ROOT/proc/uptime"
 fi
 # BK_STUB_LOG=pii|formats: a log written relative to NOW, so the agent's

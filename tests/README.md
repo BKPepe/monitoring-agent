@@ -148,6 +148,11 @@ with nobody on it.
   `nft` at all, where the image also has no `iptables` applet. A
   `/etc/init.d/firewall` stub answers `enabled` in ALL of them, on purpose: a
   fall-back to it would be visible as a `true` where the rules are not loaded.
+  The agent lists the ruleset once, with `nft -t`, which leaves the elements
+  of named sets out; the fw4 ruleset carries a counted set that only the
+  plain listing prints, and `BK_STUB_NFT_NOTERSE=1` (on `wdns1`) is an nft
+  that refuses `-t`, so the agent must list again without it and still read
+  the same sums. Every call lands in `nft_calls.log`.
   The DNS probe: the `nslookup` stub resolves by default and refuses instantly
   with `BK_STUB_DNS=fail`, and `wdns3` removes the stub AND busybox's own
   applet, because "no resolver client" cannot be built while `/bin/nslookup`
@@ -159,6 +164,43 @@ with nobody on it.
   reads - moves the fake router's uptime 4.20 s forward, so `agent_run_ms` is
   exactly 4200; `wrun6` reads that same number back as `agent_prev_total_ms`
   from the EXIT trap, and `wrun7` runs with no `proc/uptime` at all.
+- **Waits and writes (`wtake*`, `wskip*`, `wlp*`, `wdl*`, `wupd*`).**
+  `wtake1..5` plant a `run.lock` whose `info` names a real
+  process: a shell with a child 400 s old (both killed, the run reports
+  `runs_skipped_killed`), one 30 s old (left alone), a PID whose start time
+  is not the holder's (taken, nothing killed), a zombie (taken) and PID 1 of
+  the container standing in for a holder that survives SIGKILL (the lock
+  stays). `wtake6` hangs a real run in its first `df` (`BK_STUB_DF_HOLD` on
+  the `df` stub) and takes it over: the next report has no previous run's
+  numbers. `wtake7` hands a running run's lock to another PID: its EXIT trap
+  must leave it. `wtake8` reclaims a lock marked `killed` and counts it. A
+  child that survives SIGKILL (D state) cannot be made without a privileged
+  container, so that half of the takeover is not in this harness. `wskip1`
+  folds 25,000 queued skips while 200 more are appended and checks that
+  every line is counted exactly once; `wskip2` saturates the counters at
+  100,000. `wlp1..3` show the debug copy kept after a failed POST,
+  removed after an accepted one and kept by `last-payload.on`. `wdl0..2`
+  reach the POST 0, 40 and 50 s late (`BK_STUB_UPTIME_ADD` on the `logread`
+  stub) and read the POST limit and the skipped service checks from the log.
+  Every payload run's `nslookup` call must come without `-timeout`: a
+  resolver that answers in 2-5 s is slow, not dead.
+  `wupd1/2` run the self-update swap, taken out of the agent by name, across
+  two filesystems while a poller watches the target, and with a full flash
+  (`BK_STUB_DF_AVAIL` on the `df` stub) and a `.new` left by an interrupted
+  swap.
+- **Cost and budget (`wbud0..6`, W1-7).** `wbud1` and `wbud2` are warm runs
+  under busybox `time`: their forks are the PID namespace's last-PID delta,
+  their CPU and largest process come from `wait4()`. `wbud2` must report
+  `wbud1`'s CPU as `agent_prev_cpu_ms` (within the tick rounding), and both
+  must stay within `FORK_BUDGET` and `MAX_RSS_KB`; the private directory
+  they leave is held to `PRIV_MAX_PAGES` (tmpfs pages), and `wbud6`, whose
+  shell's `RssAnon` is sampled every 20 ms, to `SHELL_ANON_KB`. The numbers
+  and their margins are explained in `assert_openwrt_payload.py`. `wbud3`
+  hangs on a `wg` that sleeps and is killed by SIGKILL, so `wbud4` must say
+  null; `wbud5` runs under another version's stamp and must
+  say null too. A change that saves forks lowers the budget in the same
+  commit: a budget more than `FORK_SLACK` (9) above the measured run fails
+  as well, so room cannot be bought by raising it.
 - **The log runs `wlog1..8` (W1-C3).** The payload runs read the plain
   `logread` stub (two error lines, a fixed date). `BK_STUB_LOG=pii` and
   `BK_STUB_LOG=formats` serve a log written relative to the stub's own clock,
