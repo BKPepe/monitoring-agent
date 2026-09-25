@@ -117,9 +117,19 @@ case "$SMART_TIMEOUT_SEC" in ''|*[!0-9]*) SMART_TIMEOUT_SEC=60 ;; esac
 [ "$SMART_TIMEOUT_SEC" -gt 180 ] && SMART_TIMEOUT_SEC=180
 
 if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
+    # The token is best kept out of the command line: `ps` shows every
+    # process's arguments to every user, and shell histories keep them.
+    # BK_REG_TOKEN in the environment or "-" (read from stdin) avoid both;
+    # the old positional form still works for install lines already out there.
     REG_TOKEN="$2"
+    if [ "$REG_TOKEN" = "-" ]; then
+        REG_TOKEN=""
+        IFS= read -r REG_TOKEN || true
+    fi
+    [ -z "$REG_TOKEN" ] && REG_TOKEN="$BK_REG_TOKEN"
     if [ -z "$REG_TOKEN" ]; then
-        echo "Pouziti: $0 --register REGISTRATION_TOKEN [API_URL]"
+        echo "Pouziti: BK_REG_TOKEN=TOKEN $0 --register - [API_URL]"
+        echo "     nebo: echo TOKEN | $0 --register - [API_URL]"
         exit 1
     fi
     if [ -n "$3" ]; then
@@ -129,24 +139,36 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     echo "Registruji router na $API_URL..."
     # Stock OpenWrt ships uclient-fetch, not curl - registration used to fail
     # on exactly the routers this script is for. Values are escaped into the
-    # body, not eval'ed into a command line.
+    # body, not eval'ed into a command line, and the body goes through a file
+    # only root can read: as an argument it would put the token back in `ps`.
     bk_reg_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-    REG_BODY="{\"action\":\"register\",\"token\":\"$(bk_reg_esc "$REG_TOKEN")\",\"hostname\":\"$(bk_reg_esc "$HOSTNAME_VAL")\",\"agent_type\":\"openwrt\"}"
+    REG_FILE="/tmp/status-agent-register.$$"
+    ( umask 077; printf '{"action":"register","token":"%s","hostname":"%s","agent_type":"openwrt"}' \
+        "$(bk_reg_esc "$REG_TOKEN")" "$(bk_reg_esc "$HOSTNAME_VAL")" > "$REG_FILE" )
     if command -v curl >/dev/null 2>&1; then
-        RESP=$(curl -s -m 20 -X POST -H 'Content-Type: application/json' -d "$REG_BODY" "$API_URL")
+        RESP=$(curl -s -m 20 -X POST -H 'Content-Type: application/json' --data-binary "@$REG_FILE" "$API_URL")
     elif command -v uclient-fetch >/dev/null 2>&1; then
-        RESP=$(uclient-fetch -q -T 20 -O - --post-data="$REG_BODY" --header='Content-Type: application/json' "$API_URL" 2>&1)
+        RESP=$(uclient-fetch -q -T 20 -O - --post-file="$REG_FILE" --header='Content-Type: application/json' "$API_URL" 2>&1)
     elif command -v wget >/dev/null 2>&1; then
-        RESP=$(wget -q -T 20 -O - --post-data="$REG_BODY" --header='Content-Type: application/json' "$API_URL" 2>&1)
+        RESP=$(wget -q -T 20 -O - --post-file="$REG_FILE" --header='Content-Type: application/json' "$API_URL" 2>&1)
     else
+        rm -f "$REG_FILE"
         echo "CHYBA: Neni k dispozici curl, uclient-fetch ani wget."
         exit 1
     fi
+    rm -f "$REG_FILE"
     NEW_KEY=$(echo "$RESP" | sed -n 's/.*"agent_key":"\([^"]*\)".*/\1/p')
     if [ -n "$NEW_KEY" ]; then
-        echo "API_URL=\"$API_URL\"" > "$ScriptPath/agent_openwrt.cfg"
-        echo "AGENT_KEY=\"$NEW_KEY\"" >> "$ScriptPath/agent_openwrt.cfg"
-        echo "OK: Router zaregistrovan a ulozen do $ScriptPath/agent_openwrt.cfg (AGENT_KEY=$NEW_KEY)"
+        # 0600: the key signs every report and unlocks the remote actions.
+        ( umask 077
+          printf 'API_URL="%s"\nAGENT_KEY="%s"\n' "$API_URL" "$NEW_KEY" > "$ScriptPath/agent_openwrt.cfg" )
+        chmod 600 "$ScriptPath/agent_openwrt.cfg" 2>/dev/null
+        echo "OK: Router zaregistrovan, klic ulozen do $ScriptPath/agent_openwrt.cfg (jen pro roota)."
+        # sysupgrade.conf needs absolute paths; "./" would name nothing.
+        _reg_dir=$(cd "$ScriptPath" 2>/dev/null && pwd) || _reg_dir=$ScriptPath
+        echo "Aby prezil upgrade firmwaru, pridejte do /etc/sysupgrade.conf:"
+        echo "  $_reg_dir/agent_openwrt.sh"
+        echo "  $_reg_dir/agent_openwrt.cfg"
         exit 0
     else
         echo "CHYBA pri registraci: $RESP"
@@ -154,7 +176,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.9"
+AGENT_VERSION="0.1.10"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
 
@@ -167,7 +189,7 @@ for arg in "$@"; do
             echo "Pouziti: $0 [MOZNOSTI]"
             echo ""
             echo "Moznosti:"
-            echo "  --register TOKEN [API_URL]   Zaregistruje router na zadany monitoring server"
+            echo "  --register - [API_URL]       Zaregistruje router (token z BK_REG_TOKEN nebo stdin)"
             echo "  --update, --auto-update      Vynuti kontrolu a aktualizaci agenta ze serveru"
             echo "  --verbose, -v                Zobrazi podrobny prubeh sberu dat a odesilani"
             echo "  --dry-run, --print           Sesbira data a vypise JSON, neodesila (i bez registrace)"
@@ -224,6 +246,11 @@ BK_TEST_RESPONSE=""
 BK_ROOT=""
 [ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_ROOT" ] && BK_ROOT="$STATUS_TEST_ROOT"
 BK_SYS="$BK_ROOT/sys"; BK_PROC="$BK_ROOT/proc"
+
+# The third seam: STATUS_TEST_TTY=1 makes a redirected dry run count as one
+# typed at a terminal (see BK_RUN_COST_KEEP), which a harness cannot give it.
+BK_TEST_TTY=""
+[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_TTY" ] && BK_TEST_TTY="$STATUS_TEST_TTY"
 
 # G42: how long the run takes is the one number that says whether a minute
 # report still fits into its minute. Both ends are read from the KERNEL
@@ -327,14 +354,17 @@ fi
 # characters pass through untouched, as they did.
 bk_js() {
     _js=$1
-    case "$_js" in *[\\\"$BK_CR$BK_NL]*) ;; *) _jr=$_js; return 0 ;; esac
+    # [:cntrl:] covers CR and LF and also TAB and the rest of 0x01-0x1F: JSON
+    # forbids them raw inside a string, and one TAB in a modem's operator
+    # name made the server refuse every report until the name changed.
+    case "$_js" in *[\\\"[:cntrl:]]*) ;; *) _jr=$_js; return 0 ;; esac
     _jr=""
     while :; do
         case "$_js" in
-            *[\\\"$BK_CR$BK_NL]*) ;;
+            *[\\\"[:cntrl:]]*) ;;
             *) _jr=$_jr$_js; return 0 ;;
         esac
-        _jh=${_js%%[\\\"$BK_CR$BK_NL]*}; _js=${_js#"$_jh"}
+        _jh=${_js%%[\\\"[:cntrl:]]*}; _js=${_js#"$_jh"}
         _jc=${_js%"${_js#?}"}; _js=${_js#?}
         case "$_jc" in
             \\) _jr="$_jr$_jh\\\\" ;;
@@ -727,7 +757,6 @@ bk_lock_tree() {
         done
     done
 }
-bk_lock_killed=0
 if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
     # `read`, not $(cat): one fork less on every run that meets a lock.
     _lock_pid=""
@@ -813,7 +842,11 @@ if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
                 log_message "Predchozi beh (PID $_lock_pid) nejde ukoncit ani SIGKILL (zustava PID $_kt_keep), tento koncim."
                 _lock_pid=$_kt_keep
             else
-                bk_lock_killed=1
+                # Written NOW, not held until the fold at the end of the run:
+                # a run that hangs in the same collector as the one it killed
+                # is killed in turn, and a count kept in a variable died with
+                # it - an hour of hung runs was reported as one.
+                printf 'k\n' >> "$BK_PRIVATE_DIR/skipped" 2>/dev/null || true
                 _lock_pid=""
             fi
         fi
@@ -849,7 +882,7 @@ if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
         fi
         # A run the takeover signalled while the kernel still held it (the
         # lock was kept for it, see `killed` above) is gone now: it counts.
-        [ -e "$BK_LOCK_DIR.$$/killed" ] && bk_lock_killed=1
+        [ -e "$BK_LOCK_DIR.$$/killed" ] && { printf 'k\n' >> "$BK_PRIVATE_DIR/skipped" 2>/dev/null || true; }
         rm -rf "$BK_LOCK_DIR.$$" 2>/dev/null
     fi
     mkdir "$BK_LOCK_DIR" 2>/dev/null || exit 0
@@ -869,8 +902,17 @@ bk_proc_start "$$"
 # takeover runs no trap, and the report after a 300 s wedge would otherwise
 # name the run BEFORE it as "the previous run", a few seconds long.
 BK_RUN_TOTAL_FILE="$BK_PRIVATE_DIR/run.total"
+# A --dry-run typed at a terminal (the owner poking at it over SSH) prints
+# its payload and never POSTs. It must neither take the cron run's figures,
+# which would then never be reported, nor leave its own verbose run behind
+# as "the previous run". Redirected dry runs are the test harness standing in
+# for cron and keep the cron behaviour; the STATUS_TEST_TTY seam tests this.
+BK_RUN_COST_KEEP=""
+if [ "$DRY_RUN" = "1" ] && [ -z "$BK_TEST_RESPONSE" ]; then
+    { [ -t 1 ] || [ -t 2 ] || [ "$BK_TEST_TTY" = "1" ]; } && BK_RUN_COST_KEEP=1
+fi
 agent_prev_total_ms="null"
-if read -r _prev_total 2>/dev/null < "$BK_RUN_TOTAL_FILE"; then
+if [ -z "$BK_RUN_COST_KEEP" ] && read -r _prev_total 2>/dev/null < "$BK_RUN_TOTAL_FILE"; then
     case "$_prev_total" in ''|*[!0-9]*) ;; *) agent_prev_total_ms="$_prev_total" ;; esac
     : > "$BK_RUN_TOTAL_FILE" 2>/dev/null
 fi
@@ -888,7 +930,7 @@ fi
 # instead of passing off the cost of an older run as the last one.
 BK_RUN_CPU_FILE="$BK_PRIVATE_DIR/run.cpu"
 agent_prev_cpu_ms="null"
-if read -r _prev_cpu 2>/dev/null < "$BK_RUN_CPU_FILE"; then
+if [ -z "$BK_RUN_COST_KEEP" ] && read -r _prev_cpu 2>/dev/null < "$BK_RUN_CPU_FILE"; then
     case "$_prev_cpu" in ''|*[!0-9]*) ;; *) agent_prev_cpu_ms="$_prev_cpu" ;; esac
     : > "$BK_RUN_CPU_FILE" 2>/dev/null
 fi
@@ -920,6 +962,7 @@ bk_run_end() {
     _re_pid=""
     read -r _re_pid 2>/dev/null < "$BK_LOCK_DIR/pid"
     [ "$_re_pid" = "$$" ] || return 0
+    [ -n "$BK_RUN_COST_KEEP" ] && { rm -rf "$BK_LOCK_DIR"; return 0; }
     bk_uptime_cs
     if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
         printf '%s\n' "$(( (_up_cs - BK_RUN_START_CS) * 10 ))" > "$BK_RUN_TOTAL_FILE" 2>/dev/null || true
@@ -4767,8 +4810,9 @@ fi
 # each run (0.2-0.9 s of CPU on musl ash) - and after a long outage the drain
 # sent 20,000 and left the rest for later reports.
 #
-# Only the runs that meet the lock still append to `skipped`, because they do
-# not hold it. Its lines are taken by a rename, so a line appended while this
+# Only the runs that meet the lock, and a takeover that has just killed a
+# wedged run, still append to `skipped`: the first do not hold the lock, and
+# the second may itself be killed before it reaches the fold. Its lines are taken by a rename, so a line appended while this
 # run counts lands in a new file and waits for the next run; nothing is ever
 # counted twice or lost to a truncate. A `.fold` left by a run that died in
 # the middle is counted first (it can only be a run killed by a takeover).
@@ -4808,7 +4852,6 @@ _sk_fold=""
 if [ -s "$BK_SKIPPED_FILE" ] && mv -f "$BK_SKIPPED_FILE" "$BK_SKIPPED_FILE.fold" 2>/dev/null; then
     bk_sk_count "$BK_SKIPPED_FILE.fold"; _sk_fold=1
 fi
-[ "$bk_lock_killed" = 1 ] && { runs_skipped_killed=$((runs_skipped_killed + 1)); _sk_fold=1; }
 bk_sk_cap
 if [ -n "$_sk_fold" ]; then
     # Total first, then empty the fold: a run killed in between counts a

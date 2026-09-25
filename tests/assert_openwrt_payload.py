@@ -329,7 +329,7 @@ checks = {
     "link roles: the WAN device is reported, the LTE rate is measured on the second run": d["wan_l3_device"] == "eth0" and d1["net_lte"] is None and isinstance(d["net_lte"], (int, float)),
     "no interfaces at all: no WAN device, no LTE rate": d3["wan_l3_device"] is None and d3["net_lte"] is None,
     "the log is trimmed on a router that has no stat applet": 0 < log_size <= 40000,
-    "version reported": d.get("version") == "0.1.9",
+    "version reported": d.get("version") == "0.1.10",
     # --- storage and SMART (CORE 2.3, 2.7; CORE e2e #22-#39, #44, #45) ---
     # CORE e2e #22
     "omnia: storage_disks has sda and no loop*, mtdblock*, zram* - and no mmcblk0; emmc is null":
@@ -458,7 +458,8 @@ checks = {
     "seam: every test variable is read on one line, and that line asks for --dry-run": seam_lines == [
         '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_RESPONSE" ] && BK_TEST_RESPONSE="$STATUS_TEST_RESPONSE"',
         'BK_ROOT=""',
-        '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_ROOT" ] && BK_ROOT="$STATUS_TEST_ROOT"'],
+        '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_ROOT" ] && BK_ROOT="$STATUS_TEST_ROOT"',
+        '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_TTY" ] && BK_TEST_TTY="$STATUS_TEST_TTY"'],
     "wifi: every iwinfo call carries exactly one command": len(iwinfo_calls) > 0 and all(len(c.split()) <= 2 for c in iwinfo_calls),
     "wifi: iwinfo was never asked to scan": log_lines("iwinfo_scan.log") == [],
     "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 74 checks)": len(selftest) == 74 and all(l.startswith("ok ") for l in selftest),
@@ -1051,6 +1052,20 @@ checks.update({
     "awk: žádné sub()/gsub() s obráceným lomítkem v náhradě - busybox 1.37+ ho čte jinak a uvozovky by šly do JSON syrové":
         len(awk_subs) >= 50 and [r for r in awk_subs if "\\" in r] == [],
 })
+# --- 0.1.10 ---------------------------------------------------------------
+_wjs = text("wjs.txt")
+try:
+    _wjs_parsed = json.loads('"' + (_wjs or "") + '"')
+except ValueError:
+    _wjs_parsed = None
+checks.update({
+    "cost: a manual --dry-run neither takes the cron run's CPU and total nor writes its own (wdry)":
+        text("wdry_cost.txt") == "1234\n5678" and text("wdry_lock.txt") == "no",
+    "json: bk_js turns TAB and other control characters into spaces, so the string is valid JSON (wjs)":
+        _wjs_parsed is not None and not any(ord(c) < 32 for c in _wjs_parsed)
+        and '"' in _wjs_parsed and "\\" in _wjs_parsed,
+})
+
 # Checks written down before the collector that can pass them: the stubs
 # already serve the real router, the Wi-Fi block of the agent is still the
 # 0.1.6 one. A pending check does not fail the run, but one that PASSES does,

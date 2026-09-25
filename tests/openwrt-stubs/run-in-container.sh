@@ -816,6 +816,27 @@ mv $OUT/logread_now.log $OUT/wlog9_now.txt
 rm -f "$BK_LOG_OFF" $OUT/logread_now.log
 fresh
 
+# --- 0.1.10: a manual --dry-run leaves the cron run's cost alone ------------
+# A dry run at a terminal (STATUS_TEST_TTY=1 stands in for one) prints and
+# never POSTs, like an owner poking at it over SSH. The figures the cron run before it measured must
+# still be there for the next real report, and nothing of its own written.
+fresh
+echo 1234 > "$PRIV/run.cpu"; echo 5678 > "$PRIV/run.total"
+STATUS_TEST_TTY=1 sh agent_openwrt.sh --dry-run > $OUT/wdry.json 2> $OUT/wdry.err
+{ cat "$PRIV/run.cpu"; cat "$PRIV/run.total"; } > $OUT/wdry_cost.txt 2>/dev/null
+[ -d "$PRIV/run.lock" ] && echo yes > $OUT/wdry_lock.txt || echo no > $OUT/wdry_lock.txt
+fresh
+
+# --- 0.1.10: bk_js drops every control character JSON forbids raw -----------
+# A TAB in a modem's operator name (or any 0x01-0x1F) made json_decode refuse
+# the whole report. The function is taken from the agent itself and fed the
+# characters; the host parses what comes out.
+{ echo 'BK_CR=$(printf "\r"); BK_NL="'; echo '"'
+  sed -n '/^bk_js() {/,/^}/p' agent_openwrt.sh
+  echo 'bk_js "$(printf "a\tb\001c\037d\"e\\\\f\rg")"; printf "%s" "$_jr"'
+} > /tmp/wjs.sh
+sh /tmp/wjs.sh > $OUT/wjs.txt 2> $OUT/wjs.err
+
 # Agent hardening (identity cache, last payload, remote actions); the version
 # stamp it needs was written by the runs above and lives outside $PRIV.
 sh /work/stubs/runs-g28.sh

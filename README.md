@@ -437,6 +437,28 @@ and what it counted:
 - **Null, never an empty list**, when there is no readable log. `[]` means the
   log was read and holds no error line.
 
+### What 0.1.10 fixes (OpenWrt)
+
+0.1.10 sends the same keys as 0.1.9; the server needs no change.
+
+- **Every killed run is counted.** The takeover of a run wedged for 300 s now
+  writes its `k` line at once. 0.1.9 held the count in a variable until the
+  end of the run, so when the same collector hung again and the killer was
+  killed in turn, an hour of hung runs was reported as one.
+- **A manual `--dry-run` leaves the run cost alone.** Typed at a terminal it
+  neither takes the cron run's `agent_prev_cpu_ms` / `agent_prev_total_ms`
+  nor writes its own verbose run as "the previous run".
+- **Control characters no longer void a report.** A TAB or any other
+  0x01-0x1F byte in a value (a modem's operator name, a hand-edited
+  hostname) went into the JSON raw and the server refused the whole report;
+  it now becomes a space, like a newline always did.
+- **Registration keeps the token out of `ps`.** Pass it as
+  `BK_REG_TOKEN=... agent_openwrt.sh --register - URL` or on stdin
+  (`--register -`); the old positional form still works. The request body
+  goes through a root-only file, `agent_openwrt.cfg` is written 0600, the key
+  is no longer echoed, and the output names the two lines for
+  `/etc/sysupgrade.conf` so the agent survives a firmware upgrade.
+
 ### What 0.1.9 made lighter (OpenWrt)
 
 0.1.9 sends what 0.1.8 sent plus two keys about the agent itself; the rest of
