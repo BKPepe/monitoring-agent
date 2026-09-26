@@ -90,6 +90,14 @@ def refused(tag, reason):
     res = act_results.get(tag, [])
     return len(res) == 1 and res[0].split("|")[1] == "failed" and reason in res[0] and act_calls.get(tag) == []
 
+def uplink(item):
+    return (item.get("uplink"), item.get("uplink_evidence"), item.get("iface"))
+
+
+def by_stamp(p, ts):
+    return next((i for i in p["speedtests"] if i["timestamp"] == ts), {})
+
+
 def disk_names(payload):
     return {x["device"] for x in payload["disk_devices"]}
 def disk_dev(payload, name):
@@ -113,6 +121,7 @@ wack = [payload(f"wack{n}") for n in range(1, 7)]
 wactive = payload("wactive")
 wspeedfb, wspeed60, wspeedold = (payload(n) for n in ("wspeedfb", "wspeed60", "wspeedold"))
 wpath = [payload(f"wpath{n}") for n in range(1, 9)]
+wupl = {n: payload(f"wupl{n}") for n in (1, 3, 4, 6, 7)}
 # The gap runs of INDEX 5.1 step 7: what "the firewall is up" is read from
 # (G20), the DNS probe's exit status (G41), and the run's own clock together
 # with the runs that never produced a report (G42).
@@ -329,7 +338,7 @@ checks = {
     "link roles: the WAN device is reported, the LTE rate is measured on the second run": d["wan_l3_device"] == "eth0" and d1["net_lte"] is None and isinstance(d["net_lte"], (int, float)),
     "no interfaces at all: no WAN device, no LTE rate": d3["wan_l3_device"] is None and d3["net_lte"] is None,
     "the log is trimmed on a router that has no stat applet": 0 < log_size <= 40000,
-    "version reported": d.get("version") == "0.1.10",
+    "version reported": d.get("version") == "0.1.11",
     # --- storage and SMART (CORE 2.3, 2.7; CORE e2e #22-#39, #44, #45) ---
     # CORE e2e #22
     "omnia: storage_disks has sda and no loop*, mtdblock*, zram* - and no mmcblk0; emmc is null":
@@ -550,6 +559,21 @@ checks = {
         and wactive["speedtest_active"] is True and wactive["speedtests"] == [],
     "speed: one result stays under 400 B on the wire":
         max(len(json.dumps(i, separators=(",", ":"))) for i in d1["speedtests"]) <= 400,
+    "uplink: a result nobody saw start (there before the first run) says null, never a guess (wupl1, r2)":
+        [uplink(i) for i in wupl[1]["speedtests"]] == [(None, None, None)]
+        and all(uplink(i) == (None, None, None) for i in d1["speedtests"]),
+    "uplink: the night test that the modem port counted is backup, eth3, on the counters' evidence (wupl3)":
+        uplink(by_stamp(wupl[3], "2026-09-25T03:10:00+02:00")) == ("backup", "counters", "eth3"),
+    "uplink: offered again it keeps the verdict of the run that saw it start (wupl4, wupl6)":
+        uplink(by_stamp(wupl[4], "2026-09-25T03:10:00+02:00")) == ("backup", "counters", "eth3")
+        and uplink(by_stamp(wupl[6], "2026-09-25T03:10:00+02:00")) == ("backup", "counters", "eth3"),
+    "uplink: the test the WAN counted with the modem idle is wan, eth0 (wupl6)":
+        uplink(by_stamp(wupl[6], "2026-09-25T03:20:00+02:00")) == ("wan", "counters", "eth0"),
+    "uplink: counters that went backwards prove nothing - null (wupl7)":
+        uplink(by_stamp(wupl[7], "2026-09-25T03:30:00+02:00")) == (None, None, None),
+    "uplink: proto is the scheme of server.url only, null without one, and the url never leaves (wupl7)":
+        [i["proto"] for i in wupl[7]["speedtests"]] == ["https", "http", "https", None]
+        and "speed.example" not in json.dumps(wupl[7]["speedtests"]),
     # --- W-A4 the path the packets take (WAN 3.1.5 with X5; WAN e2e #9, #21) ---
     # The ubus device dump is no longer part of this: the switch is read every
     # run (see the "lan:" checks), and the hourly block reuses that one walk.
@@ -976,12 +1000,14 @@ checks.update({
 # files, one of them the 16.9 kB last-payload.json written by every run).
 # The fixture is fixed, so the count is exact and has no margin: a new state
 # file, or one that outgrows a page, raises it in its own commit, with the
-# reason there.
+# reason there. 0.1.11: 28 - uplink.ring (the counter snapshots the speedtest
+# uplink is judged on) and uplink.cache (the verdict of a result not yet
+# acknowledged), one page each.
 FORK_BUDGET = 200
 FORK_SLACK = 9
 MAX_RSS_KB = 6144
 SHELL_ANON_KB = 768
-PRIV_MAX_PAGES = 26
+PRIV_MAX_PAGES = 28
 def bud(name):
     """(forks or None, CPU ms by wait4, max RSS kB) of a run under `time`."""
     forks = text(f"{name}_forks.txt")

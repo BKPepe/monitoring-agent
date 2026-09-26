@@ -18,7 +18,8 @@
 #   r5   a SMART lock held by a live process
 # Then, on a clean private directory, the scenario runs - wpppoe and wwalk1..5
 # (one branch of the WAN walk each), wsmart, wlock, wspeed*/wack* (where the
-# speedtest results come from and what a 200 really acknowledges), wpath1..8
+# speedtest results come from and what a 200 really acknowledges), wupl1..7
+# (which uplink carried a speedtest), wpath1..8
 # (the path the packets take), wfw1..3 (what "the firewall is up" is read
 # from), wdns1/wdns3 (the DNS probe's exit status), wrun1..7 (the run's own
 # clock and the runs that produced no report) and wlog1..9 (the masked error
@@ -301,6 +302,63 @@ if [ -f "$PRIV/sent.state" ]; then echo yes; else echo no; fi > $OUT/wack5_sent.
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wack6.json 2> $OUT/wack6.err
 # A test running right now writes no file yet: only pidof can see it.
 BK_STUB_TEST_RUNNING=1 sh agent_openwrt.sh --dry-run > $OUT/wactive.json 2> $OUT/wactive.err
+
+# --- wupl1..wupl7: which uplink carried a speedtest (0.1.11) ----------------
+# The Turris cron test is not bound to the WAN and follows the default route,
+# which at night can be the LTE backup. The byte counters of the WAN (eth0)
+# and the modem port (eth3) between a snapshot from before the test and now
+# say which one carried it. The kernel uptime is the ring's clock, so the
+# runs move it by hand; the counters move by what each "test" would add.
+uplrun() {
+    echo "$2.00 1500.00" > /tmp/fakeroot/proc/uptime
+    BK_STUB_SPEED_DIR=/srv/speedup BK_STUB_LTE_DEV=eth3 sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err"
+}
+ctr() { echo "$3" > "/tmp/fakeroot/sys/class/net/$1/statistics/$2"; }
+# Everything moved here is put back afterwards: the later runs read it too.
+mkdir -p /tmp/upl-save
+cp /tmp/fakeroot/proc/uptime /tmp/upl-save/uptime
+for _c in eth0/statistics/rx_bytes eth0/statistics/tx_bytes eth3/statistics/rx_bytes eth3/statistics/tx_bytes; do
+    cp "/tmp/fakeroot/sys/class/net/$_c" "/tmp/upl-save/${_c%%/*}.${_c##*/}"
+done
+fresh
+mkdir -p /srv/speedup
+ctr eth0 rx_bytes 1000000000; ctr eth0 tx_bytes 200000000
+ctr eth3 rx_bytes 3000000; ctr eth3 tx_bytes 2000000
+# A result that was there before 0.1.11 ever ran: nothing saw it start.
+speed_file /srv/speedup "2026-09-24T03:00:00+02:00" <<'M'
+[{"timestamp":"2026-09-24T03:00:00.000000000+02:00","server":{"name":"Old","url":"https://speed.example/"},"bytes_sent":80000000,"bytes_received":100000000,"ping":37.7,"jitter":2.0,"upload":44.08,"download":47.18}]
+M
+uplrun wupl1 2000
+uplrun wupl2 2100
+# The night test over LTE: 105 MB in and 84 MB out on the modem port, the WAN
+# only its own background. http, as the owner's router ran it.
+speed_file /srv/speedup "2026-09-25T03:10:00+02:00" <<'M'
+[{"timestamp":"2026-09-25T03:10:00.000000000+02:00","server":{"name":"Praha","url":"http://speed.example/backend/"},"bytes_sent":80000000,"bytes_received":100000000,"ping":37.75,"jitter":2.1,"upload":44.08,"download":47.18}]
+M
+ctr eth3 rx_bytes 108000000; ctr eth3 tx_bytes 86000000
+ctr eth0 rx_bytes 1005000000; ctr eth0 tx_bytes 201000000
+uplrun wupl3 2160
+# Offered again (no receipt in a dry run): no longer fresh, so the verdict
+# comes from uplink.cache, not from a window that no longer holds the test.
+uplrun wupl4 2220
+uplrun wupl5 2400
+# The same line over the fibre: 500 MB each way on eth0, the modem idle.
+speed_file /srv/speedup "2026-09-25T03:20:00+02:00" <<'M'
+[{"timestamp":"2026-09-25T03:20:00.000000000+02:00","server":{"name":"Praha","url":"https://speed.example/backend/"},"bytes_sent":500000000,"bytes_received":500000000,"ping":3.49,"jitter":0.4,"upload":436.1,"download":393.2}]
+M
+ctr eth0 rx_bytes 1540000000; ctr eth0 tx_bytes 720000000
+ctr eth3 rx_bytes 108010000; ctr eth3 tx_bytes 86010000
+uplrun wupl6 2460
+# Counters that went backwards (a modem reset) prove nothing: null.
+speed_file /srv/speedup "2026-09-25T03:30:00+02:00" <<'M'
+[{"timestamp":"2026-09-25T03:30:00.000000000+02:00","server":{"name":"Praha"},"bytes_sent":80000000,"bytes_received":100000000,"ping":30.0,"jitter":2.0,"upload":40.0,"download":45.0}]
+M
+ctr eth3 rx_bytes 90000000; ctr eth3 tx_bytes 70000000
+uplrun wupl7 2520
+cp /tmp/upl-save/uptime /tmp/fakeroot/proc/uptime
+for _d in eth0 eth3; do for _k in rx_bytes tx_bytes; do
+    cp "/tmp/upl-save/$_d.$_k" "/tmp/fakeroot/sys/class/net/$_d/statistics/$_k"
+done; done
 
 # --- wpath1..wpath8: the path the packets take (WAN 3.1.5) -------------------
 # Every run starts on an empty private directory, because the answer is cached

@@ -157,8 +157,10 @@ fi
 # netdev NAME SPEED|- PHYSICAL(1|0) [LOWER ...] ; statistics default to 0.
 # A physical netdev (a port, a DSA user port) has a `device` link; a virtual
 # one (vlan, ppp, bridge) has none - that is how the WAN walk tells them apart.
+_ifx=1
 netdev() {
     _n="$S/class/net/$1"; mkdir -p "$_n/statistics" "$_n/queues/rx-0"
+    _ifx=$((_ifx + 1)); echo "$_ifx" > "$_n/ifindex"
     [ "$2" = "-" ] || echo "$2" > "$_n/speed"
     [ "$3" = 1 ] && { mkdir -p "$S/devices/$SOC/net-$1"; ln -s "../../../devices/$SOC/net-$1" "$_n/device"; }
     for _c in rx_bytes tx_bytes rx_packets tx_packets rx_errors tx_errors rx_dropped tx_dropped; do echo 0 > "$_n/statistics/$_c"; done

@@ -293,6 +293,8 @@ agent's job is to get them off the router before that happens.
   never the backend URL with its query string. `tool` is filled only when the
   file itself proves which program wrote it - a `tls` block is the owner's
   Rust port; a file without one stays null instead of being guessed.
+  From 0.1.11 also `uplink` / `uplink_evidence` / `iface` (see "What 0.1.11
+  adds") and `proto`, the scheme of the server URL.
 - **`speedtest_active`** is an INTERVAL flag, not an instant one: a report
   covers the last minute, so a test that ended twenty seconds ago still owns
   its CPU numbers. It is true when a result is new in this run's listing or
@@ -436,6 +438,27 @@ and what it counted:
   errors".
 - **Null, never an empty list**, when there is no readable log. `[]` means the
   log was read and holds no error line.
+
+### What 0.1.11 adds (OpenWrt)
+
+- **Which uplink carried each speed test.** Turris runs `librespeed-cli`
+  from cron without binding it to an interface, so at night a test can run
+  over the LTE backup and 0.1.10 reported that as the line's speed. The test
+  is not blocked; each result now carries `uplink` (`wan`, `backup`, `mixed`
+  or null), `uplink_evidence` (`counters`) and `iface`. The evidence is the
+  byte counters of the WAN device and the modem device between a snapshot
+  from before the test and now: background traffic can only add bytes, so
+  the modem covering at least half of the test in both directions means the
+  test went over it. A result nobody saw start (the first run of 0.1.11, a
+  gap in the runs, a counter reset) stays null. The verdict is taken once
+  and kept in `uplink.cache` until the server acknowledges the result.
+- **`proto`** is the scheme of `server.url` (`http` / `https`); the URL
+  itself still never leaves the router.
+- Two small files more in the private directory (`uplink.ring`, five
+  snapshot lines, and `uplink.cache`). No extra process per run.
+
+Needs a server that knows the `uplink`, `uplink_evidence` and `proto` keys;
+an older server ignores them.
 
 ### What 0.1.10 fixes (OpenWrt)
 

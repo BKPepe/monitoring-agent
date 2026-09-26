@@ -176,7 +176,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.10"
+AGENT_VERSION="0.1.11"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
 
@@ -2086,6 +2086,7 @@ LIBRESPEED_STATE_FILE="$BK_PRIVATE_DIR/librespeed.state"
 BK_SPEED_PENDING="$BK_PRIVATE_DIR/pending.state"
 speedtests_json="[]"
 speedtests_newest=""
+speed_listed=""
 # An INTERVAL flag: the report covers the last ~60 s, so a test that ended
 # half a minute ago still owns this report's CPU numbers. The file-name
 # format of the result files is not confirmed on hardware (data_dir was empty
@@ -2111,104 +2112,31 @@ if [ -d "$LIBRESPEED_DIR" ]; then
             # A path with a space cannot be handed to awk as an argument list
             # below; such a name is not ours and is left alone.
             if (index($0, " ") > 0) next;
+            if (base > nb) nb = base;
             # The name is an ISO time, which sorts the same way as a clock.
             if (last_sent != "" && base <= last_sent) next;
             c++; path[c] = $0;
         }
         END {
-            print (c ? 1 : 0);
+            # The newest name in the whole directory, sent or not, for the
+            # uplink ring: a later result newer than it is a fresh one.
+            print (c ? 1 : 0) "|" nb;
             for (i = 1; i <= c && i <= 50; i++) print path[i];
         }')
     speed_files=""
     case "$speed_sel" in
         1*) speedtest_active="true" ;;
     esac
+    speed_listed=${speed_sel%%"$BK_NL"*}
+    speed_listed=${speed_listed#*|}
     case "$speed_sel" in
         *"$BK_NL"*) speed_files=${speed_sel#*"$BK_NL"} ;;
     esac
 fi
-if [ -n "$speed_files" ]; then
-    # The selected files are read by awk itself - one fork for the whole
-    # batch instead of a `tr` per file. Line 1 of the output is the newest
-    # timestamp that really went into the array (a file without a speed is
-    # not an item), the rest is the array.
-    #
-    # link_mbit comes from THIS run's state: what the port was linked at when
-    # the result was picked up. Nothing else is invented for a result the
-    # router started - iface is unknown, and the tool is only named when the
-    # file itself proves it.
-    # shellcheck disable=SC2086
-    _sp_out=$(awk -v link_mbit="$wan_link_mbit" '
-        function pick(json, keys,   i, n, arr, re, m) {
-            n = split(keys, arr, ",");
-            for (i = 1; i <= n; i++) {
-                re = "\"" arr[i] "\"[[:space:]]*:[[:space:]]*-?[0-9.]+";
-                if (match(json, re)) {
-                    m = substr(json, RSTART, RLENGTH);
-                    sub(/.*:[[:space:]]*/, "", m);
-                    return m;
-                }
-            }
-            return "";
-        }
-        # Only the server block is searched. The client block holds the
-        # public address and the ISP name, and neither may ever leave the
-        # router; server.url carries query strings and is not wanted either.
-        function server_name(json,   part, m) {
-            if (!match(json, /"server"[[:space:]]*:[[:space:]]*\{[^}]*\}/)) return "";
-            part = substr(json, RSTART, RLENGTH);
-            if (!match(part, /"name"[[:space:]]*:[[:space:]]*"[^"]*"/)) return "";
-            m = substr(part, RSTART, RLENGTH);
-            sub(/.*:[[:space:]]*"/, "", m); sub(/"$/, "", m);
-            # A name with an escape would have been cut in the middle by the
-            # match above; send nothing rather than broken JSON.
-            if (index(m, "\\") > 0) return "";
-            return m;
-        }
-        function emit(   ts, n, p, dl, ul, pg, ji, br, bs, sv, tl) {
-            if (fname == "") return;
-            n = split(fname, p, "/"); ts = p[n]; sub(/\.json$/, "", ts);
-            dl = pick(body, "download,download_mbps,dl,downloadMbps");
-            ul = pick(body, "upload,upload_mbps,ul,uploadMbps");
-            pg = pick(body, "ping,ping_ms,latency");
-            ji = pick(body, "jitter,jitter_ms");
-            if (dl == "" && ul == "") return;
-            br = pick(body, "bytes_received");
-            bs = pick(body, "bytes_sent");
-            sv = server_name(body);
-            # The result file names no tool and no version. Only the Rust
-            # port writes a "tls" block (the Go client has none), so that is
-            # evidence; without it the tool stays null instead of a guess.
-            tl = (match(body, /"tls"[[:space:]]*:[[:space:]]*\{/) ? "\"rust\"" : "null");
-            out = out sprintf("%s{\"timestamp\":\"%s\",\"download_mbps\":%s,\"upload_mbps\":%s,\"ping_ms\":%s,\"jitter_ms\":%s,\"server\":%s,\"bytes_received\":%s,\"bytes_sent\":%s,\"started_by\":\"turris\",\"iface\":null,\"tool\":%s,\"link_mbit\":%s,\"diagnostics\":{\"v\":1,\"cpu_measured\":false}}",
-                (c++ ? "," : "["), ts,
-                (dl == "" ? "null" : dl), (ul == "" ? "null" : ul),
-                (pg == "" ? "null" : pg), (ji == "" ? "null" : ji),
-                (sv == "" ? "null" : "\"" sv "\""),
-                (br == "" ? "null" : br), (bs == "" ? "null" : bs),
-                tl, (link_mbit == "" ? "null" : link_mbit));
-            newest = ts;
-        }
-        FNR == 1 { emit(); body = ""; fname = FILENAME }
-        { body = body $0 }
-        END { emit(); print newest; printf "%s", (c ? out "]" : "[]") }' $speed_files)
-    speedtests_newest=${_sp_out%%"$BK_NL"*}
-    case "$_sp_out" in
-        *"$BK_NL"*) speedtests_json=${_sp_out#*"$BK_NL"} ;;
-    esac
-fi
-[ -z "$speedtests_json" ] && speedtests_json="[]"
-# A test running right now writes no file yet, so the listing above cannot
-# see it. One fork, and only when the listing did not answer already.
-if [ "$speedtest_active" = "false" ] && command -v pidof >/dev/null 2>&1; then
-    pidof librespeed-cli >/dev/null 2>&1 && speedtest_active="true"
-fi
-# Written BEFORE the POST: until the server says what it stored, the results
-# are still the router's. 0.1.6 advanced the state right here and lost every
-# result of a report that never arrived.
-if [ -n "$speedtests_newest" ]; then
-    printf '%s\n' "$speedtests_newest" > "$BK_SPEED_PENDING" 2>/dev/null || true
-fi
+# The items themselves are built further down, after the LTE section: which
+# uplink carried a result is read off the byte counters of BOTH uplinks, and
+# the backup device is only known there (see "Which uplink carried each
+# speedtest result").
 
 # --- Vsechny pripojene filesystemy ---
 #
@@ -3365,6 +3293,279 @@ if [ -n "$lte_device" ] && [ "$lte_device" != "null" ] && [ -f /proc/net/dev ]; 
         fi
         echo "${now_ts},${lte_device},${lte_bytes}" > "$NET_LTE_STATE_FILE" 2>/dev/null || true
     fi
+fi
+
+# --- Which uplink carried each speedtest result (0.1.11) ----------------------
+#
+# Turris runs librespeed-cli from cron without binding it to an interface, so
+# a test follows whatever the default route is at that moment. At night that
+# can be the LTE backup, and 0.1.10 sent such a result as if it were the
+# line's speed (47 Mbit/s on a 400 Mbit/s PPPoE). The test is NOT skipped or
+# blocked here: a backup measurement is a real measurement of the backup. It
+# is only attributed to the uplink that carried it.
+#
+# The evidence is the BYTE COUNTERS of the two uplink devices, never a route
+# or a ping. A route says where packets would go now, not where they went a
+# minute ago. Bytes are what the test consists of: the result file states how
+# many it received and sent, and the device that carried them must have
+# counted at least that many over an interval that contains the test.
+# Background traffic can only ADD bytes to a device, never remove them, so
+# "the LTE device covers >= 50 % of the test in each direction" cannot come
+# out true for a test that went over the WAN - the backup only carries its
+# health checks while it is not the default route. The interface counters
+# also include the IP/TCP (and TLS) overhead the application count leaves
+# out, which again only errs towards a larger delta.
+#
+# Every run keeps one snapshot line in a small ring: the kernel uptime
+# (centiseconds; the clock can step, uptime cannot), name + ifindex + rx/tx
+# bytes of the WAN l3 device and of the LTE device, and the newest result
+# name the directory listing held. The ring holds 5 lines, so a result that
+# appeared since the previous run still finds a snapshot from BEFORE the test
+# started. /var/run is a ramdisk, so a reboot (new counters) starts a new
+# ring. Builtins only: `read` of sysfs files and one printf; nothing forks.
+#
+# Only a FRESH result is judged: one newer than everything the previous run
+# (at most 150 s ago) listed. An older file - the whole directory on the
+# first run of 0.1.11, or after a gap - has no snapshot from before it, and
+# its uplink stays null rather than a guess.
+BK_UPLINK_RING="$BK_PRIVATE_DIR/uplink.ring"
+BK_UPLINK_CACHE="$BK_PRIVATE_DIR/uplink.cache"
+# The LTE device only counts when it is a device of its own: a router whose
+# WAN IS the modem reports it as the WAN, and the same counters must not be
+# charged to both.
+_ul_ldev=""
+if [ -n "$lte_device" ] && [ "$lte_device" != "null" ] && [ "$lte_device" != "$wan_l3_device" ]; then
+    _ul_ldev="$lte_device"
+fi
+# bk_ul_dev DEV -> _ul_d "dev|idx|rx|tx". An unreadable counter leaves its
+# field empty, which the evaluation reads as "counters missing", not zero.
+bk_ul_dev() {
+    _ul_d="$1|||"
+    [ -n "$1" ] || return 0
+    case "$1" in *[!A-Za-z0-9._@-]*) _ul_d="|||"; return 0 ;; esac
+    bk_netnum "$BK_SYS/class/net/$1/ifindex"; _ul_i="$_wv"
+    bk_netnum "$BK_SYS/class/net/$1/statistics/rx_bytes"; _ul_r="$_wv"
+    bk_netnum "$BK_SYS/class/net/$1/statistics/tx_bytes"; _ul_d="$1|$_ul_i|$_ul_r|$_wv"
+}
+# The counters and the uptime are read at the same moment, now; the listing
+# above ran seconds earlier, which only widens the interval.
+bk_uptime_cs; _ul_cs="$_up_cs"
+_ul_now=""
+if [ -n "$_ul_cs" ]; then
+    bk_ul_dev "$wan_l3_device"; _ul_w="$_ul_d"
+    bk_ul_dev "$_ul_ldev"; _ul_l="$_ul_d"
+    _ul_now="$_ul_cs|$_ul_w|$_ul_l"
+fi
+# The previous lines, oldest first, joined by ';' for awk (-v cannot carry a
+# newline on every awk). A line that is not ours is dropped.
+_ul_ring=""; _ul_keep=""; _ul_n=0
+if [ -r "$BK_UPLINK_RING" ]; then
+    while IFS= read -r _ul_line; do
+        case "$_ul_line" in
+            *';'*) ;;
+            [0-9]*'|'*)
+                _ul_ring="$_ul_ring${_ul_ring:+;}$_ul_line"
+                _ul_keep="$_ul_keep$_ul_line$BK_NL"; _ul_n=$((_ul_n + 1)) ;;
+        esac
+    done < "$BK_UPLINK_RING"
+fi
+while [ "$_ul_n" -gt 4 ]; do
+    _ul_keep=${_ul_keep#*"$BK_NL"}; _ul_n=$((_ul_n - 1))
+done
+if [ -n "$_ul_now" ]; then
+    printf '%s%s|%s\n' "$_ul_keep" "$_ul_now" "$speed_listed" > "$BK_UPLINK_RING" 2>/dev/null || true
+fi
+# awk writes the verdict cache itself, but only into a directory it can
+# write: a failed redirection is fatal in awk and would cost the results.
+_ul_cache=""
+[ -w "$BK_PRIVATE_DIR" ] && _ul_cache="$BK_UPLINK_CACHE"
+
+if [ -n "$speed_files" ]; then
+    # The selected files are read by awk itself - one fork for the whole
+    # batch instead of a `tr` per file. Line 1 of the output is the newest
+    # timestamp that really went into the array (a file without a speed is
+    # not an item), the rest is the array.
+    #
+    # link_mbit comes from THIS run's state: what the port was linked at when
+    # the result was picked up. Nothing else is invented for a result the
+    # router started: the tool is only named when the file itself proves it,
+    # and the uplink (with iface) only when the byte counters prove it.
+    #
+    # The uplink verdict is taken ONCE, the run that first sees a result, and
+    # kept in uplink.cache for as long as the result is offered: one offered
+    # again after a failed POST is no longer fresh and would come out null.
+    # shellcheck disable=SC2086
+    _sp_out=$(awk -v link_mbit="$wan_link_mbit" -v ring="$_ul_ring" -v nows="$_ul_now" \
+        -v cache="$_ul_cache" '
+        function pick(json, keys,   i, n, arr, re, m) {
+            n = split(keys, arr, ",");
+            for (i = 1; i <= n; i++) {
+                re = "\"" arr[i] "\"[[:space:]]*:[[:space:]]*-?[0-9.]+";
+                if (match(json, re)) {
+                    m = substr(json, RSTART, RLENGTH);
+                    sub(/.*:[[:space:]]*/, "", m);
+                    return m;
+                }
+            }
+            return "";
+        }
+        function server_block(json) {
+            if (!match(json, /"server"[[:space:]]*:[[:space:]]*\{[^}]*\}/)) return "";
+            return substr(json, RSTART, RLENGTH);
+        }
+        # Only the server block is searched. The client block holds the
+        # public address and the ISP name, and neither may ever leave the
+        # router; server.url carries query strings and is not wanted either.
+        function server_name(part,   m) {
+            if (!match(part, /"name"[[:space:]]*:[[:space:]]*"[^"]*"/)) return "";
+            m = substr(part, RSTART, RLENGTH);
+            sub(/.*:[[:space:]]*"/, "", m); sub(/"$/, "", m);
+            # A name with an escape would have been cut in the middle by the
+            # match above; send nothing rather than broken JSON.
+            if (index(m, "\\") > 0) return "";
+            return m;
+        }
+        # Only the SCHEME of server.url leaves the router, never the URL.
+        function server_proto(part) {
+            if (match(part, /"url"[[:space:]]*:[[:space:]]*"https:\/\//)) return "https";
+            if (match(part, /"url"[[:space:]]*:[[:space:]]*"http:\/\//)) return "http";
+            return "";
+        }
+        function num(s) { return (s ~ /^[0-9]+$/) ? s + 0 : -1 }
+        # Share of the test one device covers: the smaller of the two
+        # directions that carried bytes. -1 when its counters cannot answer
+        # (missing, another ifindex, gone backwards = reset).
+        function cover(i0, i1, r0, r1, t0, t1, br, bs,   dr, dt, c) {
+            if (i0 == "" || i0 != i1) return -1;
+            r0 = num(r0); r1 = num(r1); t0 = num(t0); t1 = num(t1);
+            if (r0 < 0 || r1 < 0 || t0 < 0 || t1 < 0 || r1 < r0 || t1 < t0) return -1;
+            dr = r1 - r0; dt = t1 - t0; c = 1e9;
+            if (br > 0 && dr / br < c) c = dr / br;
+            if (bs > 0 && dt / bs < c) c = dt / bs;
+            return c;
+        }
+        # The larger share, for "some of it went here".
+        function part(r0, r1, t0, t1, br, bs,   p) {
+            p = 0;
+            if (br > 0 && (num(r1) - num(r0)) / br > p) p = (num(r1) - num(r0)) / br;
+            if (bs > 0 && (num(t1) - num(t0)) / bs > p) p = (num(t1) - num(t0)) / bs;
+            return p;
+        }
+        # -> "uplink|evidence|iface", empty fields for unknown.
+        function judge(dl, ul, br, bs,   dur, i, s, best, w, l, cw, cl, lk, pl) {
+            if (nows == "" || prev == "" || br == "" && bs == "") return "||";
+            br = (br == "" ? 0 : br + 0); bs = (bs == "" ? 0 : bs + 0);
+            if (br <= 0 && bs <= 0) return "||";
+            # How long the transfer took, from its own numbers; two minutes
+            # when they cannot say. The snapshot must come from before the
+            # test STARTED, and the test ended after the previous listing.
+            dur = 120;
+            if (dl + 0 > 0 && ul + 0 > 0) dur = br * 8 / (dl * 1e6) + bs * 8 / (ul * 1e6);
+            best = 0;
+            for (i = nr; i >= 1; i--) {
+                split(rl[i], s, "|");
+                if (s[1] + 0 < now[1] + 0 && s[1] + 0 <= prv[1] - (dur + 60) * 100) { best = i; break }
+            }
+            if (!best) return "||";
+            split(rl[best], s, "|");
+            # A window longer than 15 minutes says little about one test.
+            if (now[1] - s[1] > 90000) return "||";
+            if (now[2] == "" || s[2] != now[2]) return "||";
+            cw = cover(s[3], now[3], s[4], now[4], s[5], now[5], br, bs);
+            # The backup must have been the same device through the window,
+            # or absent through all of it.
+            lk = (s[6] == "" && now[6] == "");
+            cl = -1;
+            if (!lk && s[6] == now[6]) {
+                cl = cover(s[7], now[7], s[8], now[8], s[9], now[9], br, bs);
+                lk = (cl >= 0);
+            }
+            if (!lk) return "||";
+            if (cl >= 0.5) return "backup|counters|" now[6];
+            pl = (cl >= 0 ? part(s[8], now[8], s[9], now[9], br, bs) : 0);
+            if (cw >= 0.5) return (pl >= 0.1 ? "mixed|counters|" : "wan|counters|" now[2]);
+            if (cw >= 0 && cl >= 0 && pl >= 0.1 && cw + pl >= 0.5) return "mixed|counters|";
+            return "||";
+        }
+        function q(s) { return (s == "" ? "null" : "\"" s "\"") }
+        function emit(   ts, n, p, dl, ul, pg, ji, br, bs, sb, sv, pr, tl, v, u) {
+            if (fname == "") return;
+            n = split(fname, p, "/"); ts = p[n]; sub(/\.json$/, "", ts);
+            dl = pick(body, "download,download_mbps,dl,downloadMbps");
+            ul = pick(body, "upload,upload_mbps,ul,uploadMbps");
+            pg = pick(body, "ping,ping_ms,latency");
+            ji = pick(body, "jitter,jitter_ms");
+            if (dl == "" && ul == "") return;
+            br = pick(body, "bytes_received");
+            bs = pick(body, "bytes_sent");
+            sb = server_block(body);
+            sv = server_name(sb);
+            pr = server_proto(sb);
+            # The result file names no tool and no version. Only the Rust
+            # port writes a "tls" block (the Go client has none), so that is
+            # evidence; without it the tool stays null instead of a guess.
+            tl = (match(body, /"tls"[[:space:]]*:[[:space:]]*\{/) ? "\"rust\"" : "null");
+            if (ts in cached) v = cached[ts];
+            else if (prev_listed == "" || ts > prev_listed) v = judge(dl, ul, br, bs);
+            else v = "||";
+            keep[++kn] = ts "|" v;
+            split(v, u, "|");
+            out = out sprintf("%s{\"timestamp\":\"%s\",\"download_mbps\":%s,\"upload_mbps\":%s,\"ping_ms\":%s,\"jitter_ms\":%s,\"server\":%s,\"bytes_received\":%s,\"bytes_sent\":%s,\"started_by\":\"turris\",\"iface\":%s,\"tool\":%s,\"link_mbit\":%s,\"uplink\":%s,\"uplink_evidence\":%s,\"proto\":%s,\"diagnostics\":{\"v\":1,\"cpu_measured\":false}}",
+                (c++ ? "," : "["), ts,
+                (dl == "" ? "null" : dl), (ul == "" ? "null" : ul),
+                (pg == "" ? "null" : pg), (ji == "" ? "null" : ji),
+                (sv == "" ? "null" : "\"" sv "\""),
+                (br == "" ? "null" : br), (bs == "" ? "null" : bs),
+                q(u[3]), tl, (link_mbit == "" ? "null" : link_mbit),
+                q(u[1]), q(u[2]), q(pr));
+            newest = ts;
+        }
+        BEGIN {
+            nr = (ring == "" ? 0 : split(ring, rl, ";"));
+            split(nows, now, "|");
+            # Fields: 1 uptime, 2-5 WAN dev/idx/rx/tx, 6-9 LTE, 10 newest listed.
+            prev = ""; prev_listed = "";
+            if (nr) {
+                split(rl[nr], prv, "|");
+                # The previous run must be recent and of this boot, or
+                # "newer than it listed" says nothing about when a file came.
+                if (nows != "" && prv[1] + 0 < now[1] + 0 && now[1] - prv[1] <= 15000) {
+                    prev = rl[nr]; prev_listed = prv[10];
+                }
+            }
+            if (cache != "") {
+                while ((getline line < cache) > 0) {
+                    if (split(line, f, "|") == 4) cached[f[1]] = f[2] "|" f[3] "|" f[4];
+                }
+                close(cache);
+            }
+        }
+        FNR == 1 { emit(); body = ""; fname = FILENAME }
+        { body = body $0 }
+        END {
+            emit();
+            if (cache != "" && kn) {
+                for (i = 1; i <= kn; i++) printf "%s\n", keep[i] > cache;
+                close(cache);
+            }
+            print newest; printf "%s", (c ? out "]" : "[]")
+        }' $speed_files)
+    speedtests_newest=${_sp_out%%"$BK_NL"*}
+    case "$_sp_out" in
+        *"$BK_NL"*) speedtests_json=${_sp_out#*"$BK_NL"} ;;
+    esac
+fi
+[ -z "$speedtests_json" ] && speedtests_json="[]"
+# A test running right now writes no file yet, so the listing above cannot
+# see it. One fork, and only when the listing did not answer already.
+if [ "$speedtest_active" = "false" ] && command -v pidof >/dev/null 2>&1; then
+    pidof librespeed-cli >/dev/null 2>&1 && speedtest_active="true"
+fi
+# Written BEFORE the POST: until the server says what it stored, the results
+# are still the router's. 0.1.6 advanced the state right here and lost every
+# result of a report that never arrived.
+if [ -n "$speedtests_newest" ]; then
+    printf '%s\n' "$speedtests_newest" > "$BK_SPEED_PENDING" 2>/dev/null || true
 fi
 
 # --- Signal, SIM a registrace z HiLink API modemu ----------------------------
