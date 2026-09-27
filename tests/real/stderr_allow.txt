@@ -1,0 +1,8 @@
+# Lines the real-image and router runs may print on stderr although they are
+# not agent log lines or carry an error marker (assert_real_payload.py).
+#
+#   <scope> <python-regex>  # why
+#
+# scope: a profile (openwrt-24.10, openwrt-master, ubuntu, alpine, rocky, hw)
+# or a glob of them (openwrt-*). An entry that matches no line of a run in its
+# scope fails as stale. Empty on purpose: no run has needed one yet.
