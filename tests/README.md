@@ -293,9 +293,10 @@ anything at all. Each case runs in its own sandbox directory with its own
 ### CI
 
 `.github/workflows/test.yml` runs on pull requests, on pushes to branches
-other than `main`, and as the first job of both deploys (`needs: test` in
-`deploy-agents.yml` and `deploy-worker.yml`), so nothing is uploaded from a
-red run. Three jobs:
+other than `main`, and on `main` as the first job of `deploy-worker.yml`
+(`needs: test`), so the Worker is not deployed from a red run. The agents are
+published by the monitoring repo from its submodule gitlink, and a release is
+a commit on `main` that passed this workflow. Three jobs:
 
 - `lint`: `bash -n agent.sh`, `dash -n agent_openwrt.sh`, `py_compile
   agent.py`, PowerShell's parser on `agent.ps1`; ShellCheck 0.11.0 (pinned
@@ -308,8 +309,7 @@ red run. Three jobs:
 - `windows-ps51`: `agent.ps1 -SelfCheck` and `-DryRun` on `windows-latest`
   under Windows PowerShell 5.1, the engine the scheduled task runs.
 
-A push to `main` that changes an agent runs the workflow twice, once per
-deploy that calls it.
+On `main` it runs once per push, from `deploy-worker.yml`.
 
 The TeamSpeak stub earns its keep: that query had never been run by any test.
 The first run of it showed the bash agent asking over bash's socket redirection

@@ -149,7 +149,8 @@ A refused action is reported to the dashboard as failed, with the reason.
 (`test.yml`) fails a push where they differ. The first release built from
 this code is the first one carrying the end line: agents already in the field
 do not look for it and take that release like any other, and from then on
-every agent accepts only files that have it.
+every agent accepts only files that have it. How a release reaches the
+hosting, and the one-time canary it needs: "Releasing and deployment" below.
 
 ### Optional packages on OpenWrt, and what each one unlocks
 
@@ -771,22 +772,42 @@ a refused one is reported to the dashboard as failed, with the reason:
   rule all agents share (see "Self-update and remote actions" above), never
   a path.
 
-### Deployment (self-deploy to the dashboard hosting)
+### Releasing and deployment
 
-`.github/workflows/deploy-agents.yml` uploads the four agent files to
-`public_html/status/` on every push that touches them, so self-updating routers
-and servers get a fix as soon as it lands here — no `monitoring`-repo submodule
-bump needed for the rollout (the bump remains as bookkeeping, and that repo's
-deploy still copies the agents too; the two uploads keep separate FTP state
-files and don't fight).
+This repo does not upload the agents. The `monitoring` repo is their one
+publisher: it carries this repo as the `agents` submodule, and its
+`deploy-status.yml` copies the four files of the pinned commit to
+`public_html/status/`, where every self-updating agent fetches them. Two
+publishers used to upload the same four files, each after its own checks,
+and whichever ran last decided what the fleet got; now it is exactly the
+gitlink. A release:
 
-One-time setup: add the same `FTP_SERVER`, `FTP_USERNAME` and `FTP_PASSWORD`
-secrets the `monitoring` repo uses under **Settings → Secrets and variables →
-Actions**. The workflow fails loudly when they're missing instead of
-pretending it deployed.
+1. Bump `AGENT_VERSION` and the last line of every agent that changed, and
+   merge to `main` here. `test.yml` must be green on that commit (on `main`
+   it runs as the first job of `deploy-worker.yml`).
+2. In `monitoring`, move the `agents` gitlink to that commit and push.
+3. Its `deploy-status.yml` uploads `agent.sh`, `agent.py`, `agent.ps1` and
+   `agent_openwrt.sh`; each agent takes the new version with its next
+   accepted report.
 
-Both deploys from this repo, `deploy-agents.yml` and `deploy-worker.yml`, first
-call `.github/workflows/test.yml` and upload nothing unless it passed
+**Canary the first release of security wave 1 by hand.** It lands on agents
+that check none of the update rules above: the fielded OpenWrt 0.1.11
+verifies the sha and `sh -n` only, keeps no `.prev` and starts no probation,
+so a broken file would stay broken on every router. Once, before the gitlink
+moves, on the Omnia:
+
+1. Copy the new `agent_openwrt.sh` to a temporary path, run `sh -n` on it,
+   then `BK_UPDATE_SELFCHECK=1 sh <copy> --selfcheck` must print
+   `{"agent_type":"openwrt","agent_version":"<new version>"}`, and
+   `sh <copy> --dry-run` must print a payload.
+2. Put it in place and wait for two or three accepted reports on the
+   dashboard (`agent_run_ms` and the CPU value where 0.1.11 had them).
+3. Then move the gitlink. From this release on, the agents check every later
+   one themselves: end line, self-check, probation and rollback.
+
+This repo's `FTP_*` secrets are no longer used. The Cloudflare Worker is
+still deployed from here: `deploy-worker.yml` runs on every push to `main`,
+calls `.github/workflows/test.yml` and deploys nothing unless it passed
 (`needs: test`). Pull requests and pushes to other branches run the same
 workflow on their own. See "Testing" below.
 

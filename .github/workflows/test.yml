@@ -1,16 +1,16 @@
-# The gate in front of every deploy from this repo (TST-01).
+# The gate in front of every release and deploy from this repo (TST-01).
 #
 # Until now nothing in this repo ran before an upload: a push to main went
 # straight to the hosting, and every self-updating agent in the field fetched
 # whatever had just been uploaded - a file that did not parse, sent a payload
 # the server refused or stopped half way would have reached the whole fleet.
-# deploy-agents.yml and deploy-worker.yml call this workflow and `needs:` it,
-# so a red run here stops the upload. Pull requests and pushes to other
-# branches run it on their own.
 #
-# On main it runs once per calling deploy: a push that changes an agent runs
-# it twice (deploy-agents and deploy-worker each call it). That is the price
-# of each deploy carrying its own gate.
+# This repo no longer uploads the agents: the monitoring repo publishes them
+# from its `agents` submodule gitlink (its deploy-status.yml), and a release
+# is a commit on main that passed this workflow. deploy-worker.yml calls it
+# and `needs:` it, so on main it runs once per push and a red run stops the
+# Worker deploy. Pull requests and pushes to other branches run it on their
+# own.
 name: Test agents
 
 on:
@@ -72,7 +72,7 @@ jobs:
       # The self-update of every agent refuses a download whose last line is
       # not "# bk-agent-end <offered version>" (W1-B). A release whose
       # sentinel and AGENT_VERSION disagree would be refused by the whole
-      # fleet, so they are compared here, before it is uploaded.
+      # fleet, so they are compared here, before it can be released.
       - name: Sentinel matches AGENT_VERSION
         run: |
           set -e
