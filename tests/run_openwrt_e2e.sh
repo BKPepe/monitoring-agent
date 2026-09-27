@@ -10,5 +10,7 @@ mkdir -p "$work/agent" "$work/out"
 cp "$here/../vps-agent/agent_openwrt.sh" "$work/agent/"
 cp -r "$here/openwrt-stubs" "$work/stubs"
 chmod +x "$work"/stubs/bin/*
-docker run --rm -v "$work:/work" busybox:1.36 sh /work/stubs/run-in-container.sh
+# BK_E2E_NAME: an optional container name, so a shared Docker host can tell
+# whose run it is (and a stuck one can be removed by name).
+docker run --rm ${BK_E2E_NAME:+--name "$BK_E2E_NAME"} -v "$work:/work" busybox:1.36 sh /work/stubs/run-in-container.sh
 python3 "$here/assert_openwrt_payload.py" "$work/out"

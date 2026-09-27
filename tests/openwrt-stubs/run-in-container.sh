@@ -23,8 +23,11 @@
 # (the path the packets take), wfw1..3 (what "the firewall is up" is read
 # from), wdns1/wdns3 (the DNS probe's exit status), wrun1..7 (the run's own
 # clock and the runs that produced no report) and wlog1..9 (the masked error
-# lines behind the log count, and who may switch them off) - and the
-# hardening runs (runs-g28.sh).
+# lines behind the log count, and who may switch them off), wupd1..11 with
+# wprob1..7, wconf0..2, wlim0..1 and wreb0..5 (the self-update: swap, end
+# mark, self-check, direction, probation, rollback, a reboot in the
+# probation), wcron0/wcron (a cron PATH without sbin) - and the hardening runs
+# (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -690,12 +693,16 @@ fresh
 #   wupd1  a poller reads the target's size the whole time: it may only ever
 #          see the old or the new size, never a missing or a short file;
 #          afterwards the target is the new file, executable, with no .bak
-#          and no .new next to it
+#          and no .new next to it - and the old file is agent_openwrt.sh.prev
+#          (W1-B), a hard link: the rollback costs no flash
 #   wupd2  the flash has 100 kB left (the df stub): nothing is written, the
 #          target is untouched and the reason is "space" - and the .new an
 #          interrupted swap left behind is gone, or it would hold that room
 #          for good
-sed -n -e '/^bk_dirname() {/,/^}/p' -e '/^bk_self_replace() {/,/^}/p' agent_openwrt.sh > /tmp/sr.sh
+# The swap self-checks the new copy (bk_selfcheck, which runs it with
+# --selfcheck), so that function and bk_slurp come along.
+sed -n -e '/^bk_dirname() {/,/^}/p' -e '/^bk_slurp() {/,/^}/p' -e '/^BK_SELFCHECK_TIMEOUT_S=/p' \
+    -e '/^bk_selfcheck() {/,/^}/p' -e '/^bk_self_replace() {/,/^}/p' agent_openwrt.sh > /tmp/sr.sh
 UPD=/root/upd; NEWF=/dev/shm/upd-new.sh
 rm -rf "$UPD"; mkdir -p "$UPD"
 cp agent_openwrt.sh "$UPD/agent_openwrt.sh"
@@ -710,22 +717,192 @@ rm -f /tmp/upd.done /tmp/upd-seen.txt
 _poll=$!
 sleep 0.3
 ( BK_NL='
-'; . /tmp/sr.sh; if bk_self_replace "$NEWF" "$UPD/agent_openwrt.sh"; then echo "rc=0 err=$_sr_err"; else echo "rc=1 err=$_sr_err"; fi ) > $OUT/wupd1_rc.txt
+'; BK_CR=$(printf '\r'); BK_PRIVATE_DIR=/dev/shm; . /tmp/sr.sh
+  if bk_self_replace "$NEWF" "$UPD/agent_openwrt.sh" 9.9.9; then echo "rc=0 err=$_sr_err prev=$_sr_prev"; else echo "rc=1 err=$_sr_err prev=$_sr_prev"; fi ) > $OUT/wupd1_rc.txt
 sleep 0.3
 touch /tmp/upd.done
 wait "$_poll" || true
 sort -u /tmp/upd-seen.txt > $OUT/wupd1_seen.txt
 if cmp -s "$NEWF" "$UPD/agent_openwrt.sh"; then echo same; else echo differ; fi > $OUT/wupd1_cmp.txt
+if cmp -s agent_openwrt.sh "$UPD/agent_openwrt.sh.prev"; then echo same; else echo differ; fi > $OUT/wupd1_prev.txt
 ls -A "$UPD" > $OUT/wupd1_dir.txt
 ls -l "$UPD/agent_openwrt.sh" | cut -c1-10 > $OUT/wupd1_mode.txt
+rm -f "$UPD/agent_openwrt.sh.prev"
 cp agent_openwrt.sh "$UPD/agent_openwrt.sh"
 printf 'half of an agent\n' > "$UPD/agent_openwrt.sh.new"
 ( export BK_STUB_DF_AVAIL=100; BK_NL='
-'; . /tmp/sr.sh; if bk_self_replace "$NEWF" "$UPD/agent_openwrt.sh"; then echo "rc=0 err=$_sr_err need=$_sr_need"; else echo "rc=1 err=$_sr_err need=$_sr_need"; fi ) > $OUT/wupd2_rc.txt
+'; BK_CR=$(printf '\r'); BK_PRIVATE_DIR=/dev/shm; . /tmp/sr.sh
+  if bk_self_replace "$NEWF" "$UPD/agent_openwrt.sh" 9.9.9; then echo "rc=0 err=$_sr_err need=$_sr_need"; else echo "rc=1 err=$_sr_err need=$_sr_need"; fi ) > $OUT/wupd2_rc.txt
 if cmp -s agent_openwrt.sh "$UPD/agent_openwrt.sh"; then echo same; else echo differ; fi > $OUT/wupd2_cmp.txt
 ls -A "$UPD" > $OUT/wupd2_dir.txt
 wc -l < /tmp/upd-seen.txt | tr -cd '0-9' > $OUT/wupd1_samples.txt
 rm -rf "$UPD" "$NEWF" /tmp/upd-seen.txt /tmp/upd.done /tmp/sr.sh
+
+# --- wupd3..wupd11, wprob1..7, wconf0..2: the whole self-update (W1-B) --------
+# Through the real agent, on a COPY in /root/upd (its own cfg: AUTO_UPDATE=1),
+# on canned answers, with STATUS_TEST_UPDATE letting the run go on into the
+# update, and update-curl.sh as the server's file store (/srv/upd). After
+# every refusal the target must be byte-identical to the agent it was:
+#   wupd3   an OLDER version offered: refused before any download
+#   wupd4   the SAME version offered: the same
+#   wupd5   a download cut short (its own sha, so the sha check passes): no
+#           end mark, refused - and remembered: wupd5b downloads nothing
+#   wupd6   the end mark names another version than the one offered
+#   wupd7   the self-check answers as another agent type
+#   wupd8   the self-check hangs: killed after 10 s with everything it
+#           started, refused
+#   wupd9   the sha does not match: refused and NOT remembered (a transfer
+#           can fail once), wupd9b downloads it again
+#   wupd10  --selfcheck by hand, without the updater's variable: refused,
+#           exit 2, nothing printed; wupd10b as the updater runs it
+#   wupd11  the next release as it will be published: taken, the old file
+#           kept as .prev, the probation started
+#   wprob1..2  the server is out of reach (000): the runs count, nothing is
+#           refused, the new version stays - an outage is no verdict
+#   wprob3..5  the server answers 400 to every report: three refusals
+#   wprob6  the next run rolls it back to .prev and remembers its sha
+#   wprob7  the old version is offered the same file again: no download
+#   wconf0..2  the same release again (a reboot forgot the verdict), and the
+#           first accepted report ends the probation: update.lastok, .prev
+#           gone; a later report changes nothing
+#   wlim0..1  the same release again, and 30 runs without any 200 behind it
+#           (planted): the next run rolls it back though nothing was refused
+#   wreb0..5  a reboot inside the probation: the tmpfs counters are gone after
+#           one refusal, the flash mark next to .prev is not - the count starts
+#           again, and three refusals after the reboot still roll it back
+UPD=/root/upd
+rm -rf "$UPD" /srv/upd /tmp/curlbin
+mkdir -p "$UPD" /srv/upd /tmp/curlbin
+cp /work/stubs/update-curl.sh /tmp/curlbin/curl
+chmod +x /tmp/curlbin/curl
+# A release as the server holds it: another AGENT_VERSION and its end mark.
+mkrel() { # VERSION [VERSION IN THE END MARK]
+    sed -e "s/^AGENT_VERSION=.*/AGENT_VERSION=\"$1\"/" -e "s/^# bk-agent-end .*/# bk-agent-end ${2:-$1}/" agent_openwrt.sh
+}
+mkrel 9.9.9 > /srv/upd/good.sh
+head -c 150000 /srv/upd/good.sh > /srv/upd/cut.sh
+mkrel 9.9.9 9.9.8 > /srv/upd/wrongend.sh
+sed 's/"agent_type":"openwrt","agent_version"/"agent_type":"bash","agent_version"/' /srv/upd/good.sh > /srv/upd/badtype.sh
+sed 's/printf .{"agent_type":"openwrt","agent_version"/sleep 37; &/' /srv/upd/good.sh > /srv/upd/hang.sh
+for _f in good cut wrongend badtype hang; do
+    printf '%s %s\n' "$_f" "$(sha256sum /srv/upd/$_f.sh | cut -d' ' -f1)"
+done > $OUT/upd_fixtures.txt
+usha() { sha256sum "/srv/upd/$1.sh" | cut -d' ' -f1; }
+offer() { # FILE SHA VERSION: a 200 that offers FILE
+    printf '200\n{"status":"ok","update_available":true,"update_url":"http:\\/\\/upd.test\\/%s.sh","update_sha256":"%s","latest_version":"%s"}\n' \
+        "$1" "$2" "$3" > /tmp/upd-resp.json
+}
+reset_upd() {
+    rm -f "$UPD"/agent_openwrt.sh*
+    cp agent_openwrt.sh "$UPD/agent_openwrt.sh"
+    echo "AUTO_UPDATE=1" > "$UPD/agent_openwrt.cfg"
+}
+urun() { # TAG: one cron-like run of the copy; what it left is filed under TAG
+    echo "# $1" >> $OUT/upd_curl.log
+    _rc=0
+    ( cd "$UPD" && PATH="/tmp/curlbin:$PATH" STATUS_TEST_RESPONSE=/tmp/upd-resp.json STATUS_TEST_UPDATE=1 \
+        sh "$UPD/agent_openwrt.sh" --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err" ) || _rc=$?
+    echo "$_rc" > "$OUT/$1_rc.txt"
+    if cmp -s agent_openwrt.sh "$UPD/agent_openwrt.sh"; then echo old
+    elif cmp -s /srv/upd/good.sh "$UPD/agent_openwrt.sh"; then echo new
+    else echo other; fi > "$OUT/$1_target.txt"
+    if [ -e "$UPD/agent_openwrt.sh.prev" ]; then
+        if cmp -s agent_openwrt.sh "$UPD/agent_openwrt.sh.prev"; then echo old; else echo other; fi
+    else echo none; fi > "$OUT/$1_prev.txt"
+    ls -A "$UPD" > "$OUT/$1_dir.txt"
+    cat "$UPD/agent_openwrt.sh.probation" > "$OUT/$1_mark.txt" 2>/dev/null || echo none > "$OUT/$1_mark.txt"
+    for _f in probation bad lastok; do
+        cat "$PRIV/update.$_f" 2>/dev/null || echo none
+    done > "$OUT/$1_state.txt"
+    for _f in update.dl update.check; do
+        [ -e "$PRIV/$_f" ] && echo "$_f"
+    done > "$OUT/$1_leftover.txt" || true
+}
+fresh
+reset_upd
+offer good "$(usha good)" 0.1.10
+urun wupd3
+offer good "$(usha good)" "$(sed -n 's/^AGENT_VERSION="\(.*\)"$/\1/p' agent_openwrt.sh)"
+urun wupd4
+offer cut "$(usha cut)" 9.9.9
+urun wupd5
+urun wupd5b
+fresh
+offer wrongend "$(usha wrongend)" 9.9.9
+urun wupd6
+fresh
+offer badtype "$(usha badtype)" 9.9.9
+urun wupd7
+fresh
+offer hang "$(usha hang)" 9.9.9
+urun wupd8
+ps 2>/dev/null | grep -c "[s]leep 37" > $OUT/wupd8_procs.txt || true
+fresh
+offer good 0000000000000000000000000000000000000000000000000000000000000000 9.9.9
+urun wupd9
+urun wupd9b
+fresh
+# --selfcheck is answered before the private directory, the lock and the
+# log: nothing of the run may be left behind by either call.
+wc -c < /tmp/status-agent-openwrt.log | tr -cd '0-9' > $OUT/wupd10_log_before.txt
+_rc=0; sh "$UPD/agent_openwrt.sh" --selfcheck > $OUT/wupd10.out 2> $OUT/wupd10.err || _rc=$?
+echo "$_rc" > $OUT/wupd10_rc.txt
+_rc=0; BK_UPDATE_SELFCHECK=1 sh "$UPD/agent_openwrt.sh" --selfcheck > $OUT/wupd10b.out 2> $OUT/wupd10b.err || _rc=$?
+echo "$_rc" > $OUT/wupd10b_rc.txt
+wc -c < /tmp/status-agent-openwrt.log | tr -cd '0-9' > $OUT/wupd10_log_after.txt
+ls -A "$PRIV" > $OUT/wupd10_priv.txt
+fresh
+offer good "$(usha good)" 9.9.9
+urun wupd11
+# From here the copy IS 9.9.9: first the server is out of reach, then every
+# report it sends is refused.
+printf '000\n\n' > /tmp/upd-resp.json
+urun wprob1
+urun wprob2
+printf '400\n{"error":"Invalid JSON"}\n' > /tmp/upd-resp.json
+for _i in 3 4 5 6; do urun "wprob$_i"; done
+offer good "$(usha good)" 9.9.9
+urun wprob7
+fresh
+reset_upd
+urun wconf0
+printf '200\n{"status":"ok"}\n' > /tmp/upd-resp.json
+urun wconf1
+urun wconf2
+fresh
+reset_upd
+offer good "$(usha good)" 9.9.9
+urun wlim0
+printf '9.9.9 %s 30 0\n' "$(usha good)" > "$PRIV/update.probation"
+printf '000\n\n' > /tmp/upd-resp.json
+urun wlim1
+fresh
+reset_upd
+offer good "$(usha good)" 9.9.9
+urun wreb0
+printf '400\n{"error":"Invalid JSON"}\n' > /tmp/upd-resp.json
+urun wreb1
+fresh
+for _i in 2 3 4 5; do urun "wreb$_i"; done
+rm -rf "$UPD" /srv/upd /tmp/curlbin /tmp/upd-resp.json
+fresh
+
+# --- wcron0, wcron: the PATH of a cron job (LC-02) ---------------------------
+# Debian's cron hands a job PATH=/usr/bin:/bin, and some OpenWrt builds leave
+# out the sbin directories too; every tool that lives there then read as "not
+# installed". `bridge` is the one 0.1.11 looked for by hand in /usr/sbin, and
+# that special case is gone: here it is ONLY in /usr/sbin and the run's PATH
+# does not name that directory. The switch ports must still be the same as a
+# run with the full PATH (wcron0).
+fresh
+sh agent_openwrt.sh --dry-run > $OUT/wcron0.json 2> $OUT/wcron0.err
+fresh
+stub_off bridge
+cp /work/stubs/bridge.off /usr/sbin/bridge
+PATH="/work/stubs/bin:/bin" sh agent_openwrt.sh --dry-run > $OUT/wcron.json 2> $OUT/wcron.err
+rm -f /usr/sbin/bridge
+stub_on bridge
+fresh
 
 # --- wbud0..wbud6: what a run costs, and the budget it must stay in (W1-7) ---
 # The agent reports the CPU of its previous run (agent_prev_cpu_ms, taken by

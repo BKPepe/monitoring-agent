@@ -137,6 +137,41 @@ _rc=0
 STATUS_TEST_RESPONSE="$OUT/w19_10.resp" sh agent_openwrt.sh --dry-run > $OUT/w19_10.json 2>$OUT/w19_10.err || _rc=$?
 echo "$_rc" > $OUT/w19_10_exit.txt
 cat $OUT/w19_10.resp.results >> $OUT/action_results.log 2>/dev/null || true
+# W1-C: the service-name rule all four agents share,
+# ^[A-Za-z0-9_][A-Za-z0-9_.@$-]{0,127}$. A leading "-" would be an option to
+# the tool the name is handed to; "$" is a Windows instance name, which the
+# rule lets through and /etc/init.d then simply does not have; 129 characters
+# are one too many.
+write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 ALLOWED_ACTIONS=restart_service
+action_run w19_12 restart_service a1b2c3d4e5f60012 0 ',"service_name":"-x"'
+action_run w19_13 restart_service a1b2c3d4e5f60013 0 ',"service_name":"MSSQL$SQLEXPRESS"'
+_long=$(awk 'BEGIN { while (n++ < 129) printf "a" }')
+action_run w19_14 restart_service a1b2c3d4e5f60014 0 ",\"service_name\":\"$_long\""
+action_run w19_15 restart_service a1b2c3d4e5f60015 0 ',"service_name":"a b"'
+# A timestamp of 19 digits: a number, but longer than any `[` takes - refused
+# before any use, like the letters of w19_10.
+write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 ALLOWED_ACTIONS=restart_wan
+printf '200\n{"success":true,"pending_action":{"action_id":16,"action":"restart_wan","timestamp":1234567890123456789,"nonce":"a1b2c3d4e5f60016","signature":"%s"}}\n' "$SIG" > $OUT/w19_16.resp
+for _log in action_calls action_results openssl_calls; do echo "# w19_16" >> $OUT/$_log.log; done
+_rc=0
+STATUS_TEST_RESPONSE="$OUT/w19_16.resp" sh agent_openwrt.sh --dry-run > $OUT/w19_16.json 2>$OUT/w19_16.err || _rc=$?
+echo "$_rc" > $OUT/w19_16_exit.txt
+cat $OUT/w19_16.resp.results >> $OUT/action_results.log 2>/dev/null || true
+# Digits only, but a leading zero: ash reads 089 as a bad octal constant, and
+# the arithmetic error ended the run before any signature was checked
+# (w19_17, the timestamp). An id with one (w19_18, a current timestamp) would
+# be invalid JSON in the result. Neither is a number the server writes.
+# lz_run TAG ACTION_ID TIMESTAMP: one such answer, by hand like w19_10.
+lz_run() {
+    printf '200\n{"success":true,"pending_action":{"action_id":%s,"action":"restart_wan","timestamp":%s,"nonce":"a1b2c3d4e5f600%s","signature":"%s"}}\n' "$2" "$3" "${1#w19_}" "$SIG" > "$OUT/$1.resp"
+    for _log in action_calls action_results openssl_calls; do echo "# $1" >> "$OUT/$_log.log"; done
+    _rc=0
+    STATUS_TEST_RESPONSE="$OUT/$1.resp" sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2>"$OUT/$1.err" || _rc=$?
+    echo "$_rc" > "$OUT/$1_exit.txt"
+    cat "$OUT/$1.resp.results" >> $OUT/action_results.log 2>/dev/null || true
+}
+lz_run w19_17 17 089
+lz_run w19_18 018 "$(date +%s)"
 # --- the private directory is checked, not assumed ----------------------
 # Both of its places planted as symlinks into a directory somebody else can
 # read: /var/run is refused, the /tmp fallback is replaced by a real 0700

@@ -468,7 +468,8 @@ checks = {
         '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_RESPONSE" ] && BK_TEST_RESPONSE="$STATUS_TEST_RESPONSE"',
         'BK_ROOT=""',
         '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_ROOT" ] && BK_ROOT="$STATUS_TEST_ROOT"',
-        '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_TTY" ] && BK_TEST_TTY="$STATUS_TEST_TTY"'],
+        '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_TTY" ] && BK_TEST_TTY="$STATUS_TEST_TTY"',
+        '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_UPDATE" ] && BK_TEST_UPDATE="$STATUS_TEST_UPDATE"'],
     "wifi: every iwinfo call carries exactly one command": len(iwinfo_calls) > 0 and all(len(c.split()) <= 2 for c in iwinfo_calls),
     "wifi: iwinfo was never asked to scan": log_lines("iwinfo_scan.log") == [],
     "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 74 checks)": len(selftest) == 74 and all(l.startswith("ok ") for l in selftest),
@@ -942,10 +943,11 @@ checks.update({
         and wdl2 is not None and wdl2["agent_run_ms"] == 50000,
     "dns: každý běh s payloadem se ptá bez -timeout - resolver, který odpoví za 2-5 s, je pomalý, ne mrtvý (dns_resolver_ok zůstává, co byl v 0.1.8)":
         len(ns_core) > 0 and set(ns_core) == {"example.com 127.0.0.1"},
-    "update: the swap across filesystems is a rename - never a missing or short agent, no .bak, no .new (wupd1)":
-        text("wupd1_rc.txt") == "rc=0 err=" and text("wupd1_cmp.txt") == "same" and upd_old > 0 and upd_new > 0
+    "update: the swap across filesystems is a rename - never a missing or short agent, no .bak, no .new, the old file kept as a hard-linked .prev (wupd1)":
+        text("wupd1_rc.txt") == "rc=0 err= prev=link" and text("wupd1_cmp.txt") == "same" and upd_old > 0 and upd_new > 0
         and upd_samples >= 10 and len(upd_seen) > 0 and set(upd_seen) <= {str(upd_old), str(upd_new)}
-        and text("wupd1_dir.txt") == "agent_openwrt.sh" and (text("wupd1_mode.txt") or "").startswith("-rwx"),
+        and (text("wupd1_dir.txt") or "").splitlines() == ["agent_openwrt.sh", "agent_openwrt.sh.prev"]
+        and text("wupd1_prev.txt") == "same" and (text("wupd1_mode.txt") or "").startswith("-rwx"),
     "update: without room for the new file next to the old one nothing is written (wupd2)":
         (text("wupd2_rc.txt") or "").startswith("rc=1 err=space need=") and text("wupd2_cmp.txt") == "same"
         and text("wupd2_dir.txt") == "agent_openwrt.sh",
@@ -1090,6 +1092,120 @@ checks.update({
     "json: bk_js turns TAB and other control characters into spaces, so the string is valid JSON (wjs)":
         _wjs_parsed is not None and not any(ord(c) < 32 for c in _wjs_parsed)
         and '"' in _wjs_parsed and "\\" in _wjs_parsed,
+})
+
+# --- W1-B / W1-C / W1-E (security wave 1) ---------------------------------
+# (openwrt-stubs/run-in-container.sh: wupd3..wupd11, wprob*, wconf*, wlim*,
+# wreb*, wcron*; runs-g28.sh: w19_12..w19_18)
+upd_curl = by_run("upd_curl.log")
+upd_fix = dict(l.split() for l in (text("upd_fixtures.txt") or "").splitlines() if len(l.split()) == 2)
+def upd(tag):
+    """What an update run left: exit code, the target (old/new/other), its
+    .prev (old/other/none), the agent directory, the private state
+    (probation, bad, lastok), leftovers, the download calls, its log."""
+    return {
+        "rc": text(f"{tag}_rc.txt"), "target": text(f"{tag}_target.txt"), "prev": text(f"{tag}_prev.txt"),
+        "dir": (text(f"{tag}_dir.txt") or "").splitlines(),
+        "state": (text(f"{tag}_state.txt") or "").splitlines(),
+        "leftover": text(f"{tag}_leftover.txt"), "curl": upd_curl.get(tag), "err": err(tag),
+        "mark": text(f"{tag}_mark.txt"),
+    }
+U = {t: upd(t) for t in ["wupd3", "wupd4", "wupd5", "wupd5b", "wupd6", "wupd7", "wupd8", "wupd9", "wupd9b",
+                          "wupd11", "wprob1", "wprob2", "wprob3", "wprob5", "wprob6", "wprob7",
+                          "wconf0", "wconf1", "wconf2", "wlim0", "wlim1",
+                          "wreb0", "wreb1", "wreb2", "wreb3", "wreb4", "wreb5"]}
+DIR_ONLY = ["agent_openwrt.cfg", "agent_openwrt.sh"]
+def state(u, i):
+    return u["state"][i] if len(u["state"]) > i else None
+def untouched(u):
+    """Refused: the agent is byte-identical, nothing else next to it, no
+    probation started, no download or check file left in the tmpfs."""
+    return u["target"] == "old" and u["dir"] == DIR_ONLY and state(u, 0) == "none" and u["leftover"] == ""
+good_sha = upd_fix.get("good", "")
+agent_version = re.search(r'^AGENT_VERSION="([^"]+)"$', agent_src, re.M)
+agent_version = agent_version.group(1) if agent_version else None
+agent_lines = agent_src.split("\n")
+wcron0, wcron = maybe("wcron0"), maybe("wcron")
+checks.update({
+    "update: the agent's LAST line is its end mark with its own version - they change together (W1-B)":
+        agent_version is not None and agent_src.endswith("\n") and agent_lines[-2] == f"# bk-agent-end {agent_version}",
+    "update: an older version offered is refused before any download, the agent untouched (wupd3)":
+        untouched(U["wupd3"]) and U["wupd3"]["curl"] == [] and "neni novejsi" in U["wupd3"]["err"],
+    "update: the same version offered is refused before any download (wupd4)":
+        untouched(U["wupd4"]) and U["wupd4"]["curl"] == [] and "neni novejsi" in U["wupd4"]["err"],
+    "update: a download cut short (its sha matching) has no end mark - refused, byte-identical (wupd5)":
+        untouched(U["wupd5"]) and U["wupd5"]["curl"] == ["http://upd.test/cut.sh"]
+        and "nekonci radkem '# bk-agent-end 9.9.9'" in U["wupd5"]["err"]
+        and (state(U["wupd5"], 1) or "").split()[:1] == [upd_fix.get("cut")],
+    "update: a file refused after its checks is not downloaded again for a day (wupd5b)":
+        untouched(U["wupd5b"]) and U["wupd5b"]["curl"] == [] and "neprosla" in U["wupd5b"]["err"],
+    "update: an end mark of another version than the one offered is refused (wupd6)":
+        untouched(U["wupd6"]) and U["wupd6"]["curl"] == ["http://upd.test/wrongend.sh"] and "bk-agent-end 9.9.9" in U["wupd6"]["err"],
+    "update: a self-check that answers as another agent type is refused, byte-identical, no .new left (wupd7)":
+        untouched(U["wupd7"]) and "vlastni kontrolou" in U["wupd7"]["err"] and "neni od OpenWrt agenta" in U["wupd7"]["err"],
+    "update: a self-check that hangs is killed after 10 s with what it started, and refused (wupd8)":
+        untouched(U["wupd8"]) and "neodpovedela do 10 s" in U["wupd8"]["err"] and text("wupd8_procs.txt") == "0",
+    "update: a sha mismatch is refused and NOT remembered - the next offer downloads again (wupd9, wupd9b)":
+        untouched(U["wupd9"]) and untouched(U["wupd9b"]) and "Checksum nesouhlasi" in U["wupd9"]["err"]
+        and U["wupd9b"]["curl"] == ["http://upd.test/good.sh"] and state(U["wupd9b"], 1) == "none",
+    "update: --selfcheck by hand is refused (exit 2, nothing on stdout) and leaves nothing behind (wupd10)":
+        text("wupd10_rc.txt") == "2" and text("wupd10.out") == "" and "jen pro kontrolu aktualizace" in (text("wupd10.err") or "")
+        and text("wupd10_priv.txt") == "" and text("wupd10_log_before.txt") == text("wupd10_log_after.txt"),
+    "update: --selfcheck from the updater prints one JSON object with the type and the version (wupd10b)":
+        text("wupd10b_rc.txt") == "0" and text("wupd10b.err") == ""
+        and (text("wupd10b.out") or "").count("\n") == 0
+        and json.loads(text("wupd10b.out") or "null") == {"agent_type": "openwrt", "agent_version": agent_version},
+    "update: the next release (its version, its end mark) is taken; the old file stays as .prev and the probation starts (wupd11)":
+        U["wupd11"]["rc"] == "0" and U["wupd11"]["target"] == "new" and U["wupd11"]["prev"] == "old"
+        and U["wupd11"]["dir"] == ["agent_openwrt.cfg", "agent_openwrt.sh", "agent_openwrt.sh.prev", "agent_openwrt.sh.probation"]
+        and U["wupd11"]["mark"] == f"9.9.9 {good_sha}"
+        and state(U["wupd11"], 0) == f"9.9.9 {good_sha} 0 0" and U["wupd11"]["leftover"] == ""
+        and "Agent aktualizovan na verzi 9.9.9" in U["wupd11"]["err"],
+    "update: a server out of reach (000) during the probation counts runs, refuses nothing, keeps the version (wprob1, wprob2)":
+        U["wprob1"]["target"] == "new" and state(U["wprob1"], 0) == f"9.9.9 {good_sha} 1 0"
+        and U["wprob2"]["target"] == "new" and state(U["wprob2"], 0) == f"9.9.9 {good_sha} 2 0",
+    "update: every 4xx answer to the new version counts as refused - after three it is still there (wprob3, wprob5)":
+        U["wprob3"]["target"] == "new" and state(U["wprob3"], 0) == f"9.9.9 {good_sha} 3 1"
+        and U["wprob5"]["target"] == "new" and U["wprob5"]["prev"] == "old" and state(U["wprob5"], 0) == f"9.9.9 {good_sha} 5 3",
+    "update: the run after the third refusal puts the old version back, byte-identical, and remembers the sha (wprob6)":
+        U["wprob6"]["target"] == "old" and U["wprob6"]["prev"] == "none" and U["wprob6"]["dir"] == DIR_ONLY
+        and state(U["wprob6"], 0) == "none" and (state(U["wprob6"], 1) or "").split()[:1] == [good_sha]
+        and "vracena predchozi verze" in U["wprob6"]["err"] and "odmitl 3" in U["wprob6"]["err"],
+    "update: a reboot inside the probation (tmpfs gone after one refusal) restarts the count from the flash mark, and three refusals after it still roll back (wreb0..5)":
+        U["wreb0"]["target"] == "new" and U["wreb0"]["mark"] == f"9.9.9 {good_sha}"
+        and state(U["wreb1"], 0) == f"9.9.9 {good_sha} 1 1"
+        and [state(U[f"wreb{i}"], 0) for i in (2, 3, 4)] == [f"9.9.9 {good_sha} {n} {n}" for n in (1, 2, 3)]
+        and all(U[f"wreb{i}"]["target"] == "new" for i in (1, 2, 3, 4))
+        and U["wreb5"]["target"] == "old" and U["wreb5"]["prev"] == "none" and U["wreb5"]["dir"] == DIR_ONLY
+        and U["wreb5"]["mark"] == "none" and state(U["wreb5"], 0) == "none"
+        and (state(U["wreb5"], 1) or "").split()[:1] == [good_sha] and "odmitl 3" in U["wreb5"]["err"],
+    "update: 30 runs without one 200, nothing refused, also roll the new version back (wlim0, wlim1)":
+        U["wlim0"]["target"] == "new" and U["wlim1"]["target"] == "old" and U["wlim1"]["dir"] == DIR_ONLY
+        and "za 30 behu" in U["wlim1"]["err"] and (state(U["wlim1"], 1) or "").split()[:1] == [good_sha],
+    "update: the old version is not handed the rolled-back file again (wprob7)":
+        untouched(U["wprob7"]) and U["wprob7"]["curl"] == [] and U["wprob7"]["rc"] == "0",
+    "update: the first accepted report ends the probation - update.lastok, .prev removed; later reports change nothing (wconf0..2)":
+        U["wconf0"]["target"] == "new" and U["wconf0"]["prev"] == "old"
+        and U["wconf1"]["target"] == "new" and U["wconf1"]["prev"] == "none" and state(U["wconf1"], 0) == "none"
+        and re.fullmatch(r"9\.9\.9 \d+", state(U["wconf1"], 2) or "") is not None
+        and "potvrzena" in U["wconf1"]["err"] and "potvrzena" not in U["wconf2"]["err"]
+        and U["wconf2"]["target"] == "new" and U["wconf2"]["dir"] == DIR_ONLY,
+    "actions: the shared service-name rule - a leading '-' is refused, nothing called (w19_12)":
+        refused("w19_12", "sluzby"),
+    "actions: the shared service-name rule lets a Windows instance name through; init.d has no such script (w19_13)":
+        act_calls.get("w19_13") == [] and act_results.get("w19_13") == ["13|failed|Sluzba 'MSSQL$SQLEXPRESS' nenalezena nebo neni spustitelna"],
+    "actions: the shared service-name rule - 129 characters and a space are refused (w19_14, w19_15)":
+        refused("w19_14", "sluzby") and refused("w19_15", "sluzby"),
+    "actions: a 19-digit timestamp is no number the agent takes - nothing runs, nothing is signed, the run goes on (w19_16)":
+        text("w19_16_exit.txt") == "0" and act_calls.get("w19_16") == [] and act_results.get("w19_16") == []
+        and signed.get("w19_16") == [] and "prilis dlouhe" in err("w19_16") and "out of range" not in err("w19_16"),
+    "actions: a leading zero is no number the agent takes - 089 as the timestamp does not end the run on an octal error, 018 as the id is refused too (w19_17, w19_18)":
+        all(text(f"{t}_exit.txt") == "0" and act_calls.get(t) == [] and act_results.get(t) == []
+            and signed.get(t) == [] and "uvodni nulou" in err(t) and "arithmetic" not in err(t)
+            for t in ("w19_17", "w19_18")),
+    "path: a cron PATH without /usr/sbin still finds the tools there - the switch ports are those of a full PATH (wcron)":
+        wcron0 is not None and wcron is not None and wcron0.get("lan_ports") is not None
+        and wcron.get("lan_ports") == wcron0.get("lan_ports"),
 })
 
 # Checks written down before the collector that can pass them: the stubs

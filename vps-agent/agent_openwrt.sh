@@ -12,6 +12,17 @@
 # rozhraní naopak čte přes ubus, protože to (na rozdíl od /proc) nemá čistou
 # univerzální alternativu - to je specifika, kterou VPS agent nemá.
 
+# LC-02: cron hands a job a PATH without the sbin directories on some builds,
+# and every tool that lives there (bridge, ip, iw, ...) then reads as "not
+# installed" - a null in the report, while the same agent run by hand at a
+# shell prompt measures it. Only the directories that are missing are added,
+# and at the END: an order that is already there is the owner's (or the test
+# harness's stubs) and stays. Builtins only, no fork.
+for _bk_p in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    case ":$PATH:" in *":$_bk_p:"*) ;; *) PATH="${PATH:+$PATH:}$_bk_p" ;; esac
+done
+export PATH
+
 # === VÝCHOZÍ KONFIGURACE ===
 # Hodnoty můžete nechat zde, nebo vytvořit soubor 'agent_openwrt.cfg' ve stejné složce.
 API_URL="http://localhost/status/agent_api.php"
@@ -182,8 +193,13 @@ NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
 
 VERBOSE="0"
 [ -t 1 ] && VERBOSE="1"
+BK_SELFCHECK_ARG=""
 for arg in "$@"; do
     case "$arg" in
+        --selfcheck)
+            # Not in --help: only the self-update asks for it (see below).
+            BK_SELFCHECK_ARG="1"
+            ;;
         --help|-h)
             echo "OpenWrt Status Agent v$AGENT_VERSION"
             echo "Pouziti: $0 [MOZNOSTI]"
@@ -230,6 +246,32 @@ for arg in "$@"; do
     esac
 done
 
+# W1-B: the self-check a downloaded update has to pass before it may replace
+# the running agent (bk_self_replace runs it on the copy next to the target).
+# The file must RUN, not only parse - the cfg reader and the argument loop
+# above are real code of the new version - and must answer as the agent the
+# server offered: this type, this version. It answers here, before the test
+# seams, the version stamp, the private directory and the lock, so it writes
+# nothing, sends nothing and never meets the lock the updating run holds.
+#
+# Honoured only with BK_UPDATE_SELFCHECK=1, which only the updater sets: a
+# `--selfcheck` typed by hand or left in a cron line must not look like a
+# healthy agent while it reports nothing, so without the variable it says so
+# and stops. log_message is not defined yet, hence the plain echo.
+#
+# What it cannot catch - a report the server refuses (a missing comma in the
+# payload), a crash deep in the collectors - is the job of the probation
+# further down: a new version that gets no report accepted within a few runs
+# is rolled back.
+if [ "$BK_SELFCHECK_ARG" = "1" ]; then
+    if [ "$BK_UPDATE_SELFCHECK" != "1" ]; then
+        echo "--selfcheck je jen pro kontrolu aktualizace (spousti ji agent sam)." >&2
+        exit 2
+    fi
+    printf '{"agent_type":"openwrt","agent_version":"%s"}\n' "$AGENT_VERSION"
+    exit 0
+fi
+
 # Test seam, honoured ONLY with --dry-run: a production cron run can never be
 # fed a canned server answer. STATUS_TEST_RESPONSE=<file>: line 1 is the HTTP
 # code (000 = transport failure), the rest is the body. A dry run stops before
@@ -251,6 +293,13 @@ BK_SYS="$BK_ROOT/sys"; BK_PROC="$BK_ROOT/proc"
 # typed at a terminal (see BK_RUN_COST_KEEP), which a harness cannot give it.
 BK_TEST_TTY=""
 [ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_TTY" ] && BK_TEST_TTY="$STATUS_TEST_TTY"
+
+# The fourth seam: STATUS_TEST_UPDATE=1 lets a run on a canned answer go on
+# into the self-update (download, checks, swap), which the response seam
+# otherwise never reaches - a test must not replace the script it runs by
+# accident. The harness runs a COPY of the agent for it.
+BK_TEST_UPDATE=""
+[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_UPDATE" ] && BK_TEST_UPDATE="$STATUS_TEST_UPDATE"
 
 # G42: how long the run takes is the one number that says whether a minute
 # report still fits into its minute. Both ends are read from the KERNEL
@@ -494,6 +543,8 @@ log_debug() {
 # root. So it must be a real directory (no symlink), ours (-O), and closed to
 # everyone else. The chmod also closes a 0755 directory left by 0.1.6.
 bk_private_dir_ok() {
+    # `test -O` is not POSIX, but busybox ash - the shell this runs in - has it.
+    # shellcheck disable=SC3067
     [ -d "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] && chmod 700 "$1" 2>/dev/null
 }
 BK_PRIVATE_DIR="/var/run/status-agent-openwrt"
@@ -978,6 +1029,143 @@ bk_run_end() {
 }
 trap bk_run_end EXIT
 
+# W1-B (MISS-owrt-bak): a self-update is on probation until the server has
+# accepted one report of the new version. The self-check before the swap
+# proves the new file runs and is the version offered; only a real report
+# proves it can deliver - a payload the server refuses with a 400 (one
+# missing comma) passes every check the router can make and used to leave
+# the agent silent for good, with the fix unreachable, because the offer of
+# a fixed version rides on an accepted report. So the updater writes
+# update.probation ("version sha runs refused") before the swap and keeps
+# the old file as <agent>.prev; every run of the new version counts itself
+# here, every 4xx answer to it counts as refused (the else branch of the
+# POST), and the 200 branch ends the probation (update.lastok). The new
+# version is swapped back for <agent>.prev when the server has ANSWERED
+# with a 4xx BK_UPD_REFUSED_MAX times, or after BK_UPD_RUNS_MAX runs without
+# one 200 (a version that dies before its POST gets no answer at all). A
+# server that is simply out of reach answers nothing and refuses nothing: an
+# outage right after an update does not roll it back within minutes. The
+# sha of a rolled-back file is remembered for a day (update.bad), so the old
+# version does not download it again every minute. The four agents share
+# these numbers.
+#
+# The counters live in the tmpfs (a flash write every minute is what this
+# agent avoids), but that a probation is ON must outlive a reboot: .prev is on
+# the flash, and a power cut or a reboot inside the window used to erase the
+# probation, so a version the server refuses was never rolled back - and no
+# fixed version could reach that router again, because offers come only with
+# accepted reports. So the updater also writes <agent>.probation ("version
+# sha") on the flash, once, next to .prev. When the tmpfs has no counters but
+# that mark names this version, the count starts again from zero.
+#
+# Only runs that can deliver a report count: a dry run never POSTs, so it is
+# no evidence against the version (the harness's canned answers stand in for
+# the POST and count). Here, after the trap, because the rollback exits and
+# the trap is what frees the lock. A normal run pays one `[ -f ]`.
+BK_UPD_PROBATION="$BK_PRIVATE_DIR/update.probation"
+BK_UPD_MARK="$0.probation"
+BK_UPD_LASTOK="$BK_PRIVATE_DIR/update.lastok"
+BK_UPD_BAD="$BK_PRIVATE_DIR/update.bad"
+BK_UPD_REFUSED_MAX=3
+BK_UPD_RUNS_MAX=30
+# The sha of a file this router refused after it had checked the download
+# (no end mark, no valid syntax, a failed self-check) or rolled back: the
+# verdict belongs to those bytes, so the old version does not fetch them
+# again every minute - 224 kB of data and a flash write each time. For a
+# day only, in the tmpfs (a reboot forgets it too): a false verdict, such as
+# a server outage during the probation, then costs a day, not the fleet.
+bk_upd_bad() { # SHA
+    case "$1" in ''|*[!a-f0-9]*) return 0 ;; esac
+    printf '%s %s\n' "$1" "$(date +%s)" > "$BK_UPD_BAD" 2>/dev/null
+    return 0
+}
+bk_upd_is_bad() { # SHA -> 0 while that sha is remembered
+    _bd_sha=""; _bd_ts=""
+    read -r _bd_sha _bd_ts 2>/dev/null < "$BK_UPD_BAD"
+    [ -n "$1" ] && [ "$_bd_sha" = "$1" ] || return 1
+    case "$_bd_ts" in ''|*[!0-9]*) return 1 ;; esac
+    _bd_now=$(date +%s)
+    [ "$_bd_now" -ge "$_bd_ts" ] && [ $((_bd_now - _bd_ts)) -lt 86400 ]
+}
+# The probation file as _pb_v _pb_sha _pb_runs _pb_ref; 1 when it is not
+# this version's (written for another one: the swap failed after it, or the
+# owner copied an agent in by hand) - then it is removed, nothing to judge.
+# Without the tmpfs file the flash mark (BK_UPD_MARK) is read, and the
+# counters start again at 0 0 in a new tmpfs file.
+bk_upd_probation_read() {
+    _pb_v=""; _pb_sha=""; _pb_runs=""; _pb_ref=""
+    if [ -f "$BK_UPD_PROBATION" ]; then
+        read -r _pb_v _pb_sha _pb_runs _pb_ref 2>/dev/null < "$BK_UPD_PROBATION"
+    else
+        read -r _pb_v _pb_sha 2>/dev/null < "$BK_UPD_MARK"
+    fi
+    case "$_pb_runs" in ''|*[!0-9]*) _pb_runs=0 ;; esac
+    case "$_pb_ref" in ''|*[!0-9]*) _pb_ref=0 ;; esac
+    if [ "$_pb_v" = "$AGENT_VERSION" ]; then
+        [ -f "$BK_UPD_PROBATION" ] || printf '%s %s 0 0\n' "$_pb_v" "$_pb_sha" > "$BK_UPD_PROBATION" 2>/dev/null
+        return 0
+    fi
+    rm -f "$BK_UPD_PROBATION" "$BK_UPD_MARK" 2>/dev/null
+    return 1
+}
+# The flash mark, written before the swap. dd conv=fsync puts it on the flash
+# before the rename that follows (a power cut right after the swap must not
+# find the new version without it); a dd without conv= falls back to a plain
+# write, as in bk_self_replace.
+bk_upd_mark() { # VERSION SHA
+    printf '%s %s\n' "$1" "$2" | dd of="$BK_UPD_MARK" conv=fsync 2>/dev/null \
+        || printf '%s %s\n' "$1" "$2" > "$BK_UPD_MARK" 2>/dev/null
+}
+bk_upd_probation() {
+    bk_upd_probation_read || return 0
+    if [ "$_pb_ref" -lt "$BK_UPD_REFUSED_MAX" ] && [ "$_pb_runs" -lt "$BK_UPD_RUNS_MAX" ]; then
+        printf '%s %s %s %s\n' "$_pb_v" "$_pb_sha" "$((_pb_runs + 1))" "$_pb_ref" > "$BK_UPD_PROBATION" 2>/dev/null
+        return 0
+    fi
+    rm -f "$BK_UPD_PROBATION" "$BK_UPD_MARK" 2>/dev/null
+    _pb_why="server odmitl $_pb_ref jeji hlaseni"
+    [ "$_pb_ref" -lt "$BK_UPD_REFUSED_MAX" ] && _pb_why="za $_pb_runs behu neprijal server ani jedno jeji hlaseni"
+    # A rename inside the agent's directory: the old version is whole at its
+    # name at every moment, as in bk_self_replace.
+    if [ -f "$0.prev" ] && mv -f "$0.prev" "$0" 2>/dev/null; then
+        bk_upd_bad "$_pb_sha"
+        log_message "CHYBA UPDATE: Verze $AGENT_VERSION neobstala ($_pb_why) - vracena predchozi verze z $0.prev. Stejny soubor agent znovu zkusi nejdriv za 24 h."
+        # The shell still reads the unlinked new file; nothing more of it runs.
+        exit 1
+    fi
+    log_message "CHYBA UPDATE: Verze $AGENT_VERSION neobstala ($_pb_why), ale predchozi verze ($0.prev) neni k dispozici - zustava tato."
+    return 0
+}
+if { [ -f "$BK_UPD_PROBATION" ] || [ -f "$BK_UPD_MARK" ]; } && { [ "$DRY_RUN" != "1" ] || [ -n "$BK_TEST_RESPONSE" ]; }; then
+    bk_upd_probation
+fi
+# A 4xx is the server refusing this version's report (a 5xx or no answer at
+# all can be the server's own trouble). Called from the POST's else branch.
+bk_upd_refused() { # HTTP_CODE
+    case "$1" in 4[0-9][0-9]) ;; *) return 0 ;; esac
+    bk_upd_probation_read || return 0
+    printf '%s %s %s %s\n' "$_pb_v" "$_pb_sha" "$_pb_runs" "$((_pb_ref + 1))" > "$BK_UPD_PROBATION" 2>/dev/null
+    return 0
+}
+# The server has accepted a report of this version: the probation is over.
+# update.lastok ("version epoch") is the stamp that says so, and the old
+# version's file is no longer needed - on a small overlay its 224 kB are
+# worth having back. A .prev without a probation (a hand-made one, or left by
+# an agent from before the flash mark) goes the same way. Called from the 200
+# branch only.
+bk_upd_confirm() {
+    if [ -f "$BK_UPD_PROBATION" ] || [ -f "$BK_UPD_MARK" ]; then
+        bk_upd_probation_read || return 0
+        rm -f "$BK_UPD_PROBATION" "$BK_UPD_MARK" 2>/dev/null
+        printf '%s %s\n' "$AGENT_VERSION" "$(date +%s)" > "$BK_UPD_LASTOK" 2>/dev/null
+        rm -f "$0.prev" 2>/dev/null
+        log_message "Aktualizace na verzi $AGENT_VERSION potvrzena: server prijal jeji hlaseni."
+    elif [ -e "$0.prev" ]; then
+        rm -f "$0.prev" 2>/dev/null
+    fi
+    return 0
+}
+
 # V rezimu --dry-run se klic nekontroluje: smysl toho rezimu je podivat se,
 # co agent na novem routeru nasbira, jeste nez ho nekdo zaregistruje.
 if [ "$AGENT_KEY" = "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE" ] && [ "$DRY_RUN" != "1" ]; then
@@ -995,6 +1183,8 @@ if [ ! -f "$JSHN" ]; then
     log_message "CHYBA: $JSHN nenalezen (soucast libubox, mel by byt pritomny vsude, kde je ubus)."
     exit 1
 fi
+# libubox's own file, on the router; nothing for a linter to follow here.
+# shellcheck source=/dev/null
 . "$JSHN"
 
 log_debug "Ziskavam statistiky routeru (OpenWrt agent v$AGENT_VERSION)..."
@@ -1038,6 +1228,9 @@ fi
 
 # RAM % and MB breakdown - MemAvailable stejne jako moderni "free" (used = total - available),
 # se zalohou na free+buffers+cached na starsich jadrech bez MemAvailable.
+# The awk prints nothing but name=integer pairs; split and eval'd as one line
+# as it always was.
+# shellcheck disable=SC2046
 eval $(awk '
 /^MemTotal:/ { total=int($2/1024) }
 /^MemFree:/ { free=int($2/1024) }
@@ -1346,6 +1539,8 @@ if bk_iface_load wan; then
 
     # Prvni IPv4 adresa (pole "ipv4-address")
     json_get_keys ipv4_keys "ipv4-address"
+    # ipv4_keys is assigned by jshn's json_get_keys, an eval shellcheck cannot see.
+    # shellcheck disable=SC2154
     for k in $ipv4_keys; do
         json_select "ipv4-address"
         json_select "$k"
@@ -1357,6 +1552,8 @@ if bk_iface_load wan; then
 
     # Brana - neni samostatne pole, dopocitava se z vychozi trasy (mask 0)
     json_get_keys route_keys route
+    # route_keys is assigned by jshn's json_get_keys, an eval shellcheck cannot see.
+    # shellcheck disable=SC2154
     for k in $route_keys; do
         json_select route
         json_select "$k"
@@ -1371,6 +1568,8 @@ if bk_iface_load wan; then
 
     # DNS servery - pole retezcu, spojene carkou
     json_get_keys dns_keys "dns-server"
+    # dns_keys is assigned by jshn's json_get_keys, an eval shellcheck cannot see.
+    # shellcheck disable=SC2154
     for k in $dns_keys; do
         json_select "dns-server"
         json_get_var dns_entry "$k"
@@ -1472,6 +1671,8 @@ if [ -n "$dump_json" ] && bk_iface_scan; then
         [ "$_bi_n" = "wan6" ] || continue
         json_select "$_bi_k"
         json_get_keys v6_keys "ipv6-address"
+        # v6_keys is assigned by jshn's json_get_keys, an eval shellcheck cannot see.
+        # shellcheck disable=SC2154
         for vk in $v6_keys; do
             json_select "ipv6-address"
             json_select "$vk"
@@ -2017,6 +2218,8 @@ fi
 # vypsala slovo "pkts" z hlavicky tabulky.
 for _fw_var in fw_accepted fw_dropped fw_rejected; do
     eval "_fw_val=\$$_fw_var"
+    # _fw_val is assigned by the eval above.
+    # shellcheck disable=SC2154
     case "$_fw_val" in
         ''|*[!0-9]*) eval "$_fw_var=null" ;;
     esac
@@ -2950,16 +3153,10 @@ bk_lan_ports() {
     lan_ports_json="null"
     [ "$_lc_any" = 1 ] || return 0
     [ -n "$_lc_members" ] || return 0
-    _lp_bin=""
-    if command -v bridge >/dev/null 2>&1; then
-        _lp_bin=bridge
-    elif [ -x /usr/sbin/bridge ]; then
-        # cron hands a job a PATH without sbin on some builds; the tool is
-        # there, so look where OpenWrt puts it before giving up.
-        _lp_bin=/usr/sbin/bridge
-    else
-        return 0
-    fi
+    # The sbin directories are on PATH since the top of the script (LC-02),
+    # so a `bridge` that is installed is found here like every other tool.
+    command -v bridge >/dev/null 2>&1 || return 0
+    _lp_bin=bridge
     _lp_dsa=0
     while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp _lc_ca _lc_du _lc_pc; do
         [ -n "$_lc_d" ] || continue
@@ -4643,6 +4840,8 @@ agent_tools_json="{\"smartctl\":$tool_smartctl,\"smart_drivedb\":$tool_drivedb,\
 lan_subnet=""
 if bk_iface_load lan; then
     json_get_keys lan_v4_keys "ipv4-address"
+    # lan_v4_keys is assigned by jshn's json_get_keys, an eval shellcheck cannot see.
+    # shellcheck disable=SC2154
     for k in $lan_v4_keys; do
         json_select "ipv4-address"
         json_select "$k"
@@ -4698,6 +4897,9 @@ case "$wan_dns" in ''|null) ;; *) dns_servers="$wan_dns" ;; esac
 #  1) aktivni spojeni na port 853 (DoT) nebo 443 na znamy DoH endpoint,
 #  2) az potom konfigurace. Bez dukazu se hlasi "nelze urcit", ne DoT.
 dns_active_853=0
+# Never set to 1 and never read: the DoH (443) half of the proof above was
+# not written. Kept as the marker of that gap.
+# shellcheck disable=SC2034
 dns_active_443=0
 if command -v netstat >/dev/null 2>&1; then
     netstat -tn 2>/dev/null | grep -q ':853 .*ESTABLISHED' && dns_active_853=1
@@ -5338,25 +5540,98 @@ bk_limit() { # LOW HIGH RESERVE -> _lim: _left minus RESERVE, clamped; HIGH with
     return 0
 }
 
+# W1-B: 0 when version A is newer than version B. Both must be dotted
+# numbers (what AGENT_VERSION always is); anything else in A is no version
+# and is never newer. A part that is missing counts as 0, so 0.2 = 0.2.0.
+bk_version_newer() { # A B
+    case "$1" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+    case "$2" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+    # Each part is compared as a number; more than 9 digits in one part is
+    # no version this project writes, and `[` would refuse the number.
+    case ".$1.$2." in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 1 ;; esac
+    _vn_a=$1; _vn_b=$2
+    while [ -n "$_vn_a$_vn_b" ]; do
+        _vn_x=${_vn_a%%.*}; _vn_y=${_vn_b%%.*}
+        case "$_vn_a" in *.*) _vn_a=${_vn_a#*.} ;; *) _vn_a="" ;; esac
+        case "$_vn_b" in *.*) _vn_b=${_vn_b#*.} ;; *) _vn_b="" ;; esac
+        [ "${_vn_x:-0}" -gt "${_vn_y:-0}" ] && return 0
+        [ "${_vn_x:-0}" -lt "${_vn_y:-0}" ] && return 1
+    done
+    return 1
+}
+
+# W1-B: does FILE answer --selfcheck as the OpenWrt agent of VERSION? The
+# file is run - under a watchdog, since a new version that hangs must not
+# hang the update with it: busybox has no `timeout` applet, so it is the
+# same poll-and-kill as the SMART reader's. The answer must be one line, one
+# JSON object, exit status 0, naming this agent type and the version the
+# server offered (a newer answer may carry more members). Returns 0 when it
+# does, else 1 with the reason in _ck_err.
+BK_SELFCHECK_TIMEOUT_S=10
+bk_selfcheck() { # FILE VERSION
+    _ck_err=""
+    _ck_out="$BK_PRIVATE_DIR/update.check"
+    rm -f "$_ck_out" 2>/dev/null
+    BK_UPDATE_SELFCHECK=1 sh "$1" --selfcheck > "$_ck_out" 2>/dev/null &
+    _ck_pid=$!; _ck_w=0
+    while [ -d "/proc/$_ck_pid" ] && [ "$_ck_w" -lt "$BK_SELFCHECK_TIMEOUT_S" ]; do sleep 1; _ck_w=$((_ck_w + 1)); done
+    if [ -d "/proc/$_ck_pid" ]; then
+        # The whole tree: a check hung in a tool it started would leave that
+        # tool running on the router once its shell is gone.
+        bk_lock_tree "$_ck_pid"
+        for _ck_p in $_kt_list; do kill -9 "$_ck_p" 2>/dev/null; done
+        wait "$_ck_pid" 2>/dev/null
+        rm -f "$_ck_out" 2>/dev/null
+        _ck_err="neodpovedela do ${BK_SELFCHECK_TIMEOUT_S} s"
+        return 1
+    fi
+    wait "$_ck_pid"; _ck_rc=$?
+    bk_slurp "$_ck_out"
+    rm -f "$_ck_out" 2>/dev/null
+    if [ "$_ck_rc" != 0 ]; then _ck_err="skoncila s kodem $_ck_rc"; return 1; fi
+    case "$_sl" in
+        *"$BK_NL"*|*"$BK_CR"*) _ck_err="odpoved neni jeden radek"; return 1 ;;
+        "{"*"}") ;;
+        *) _ck_err="odpoved neni JSON objekt"; return 1 ;;
+    esac
+    case "$_sl" in
+        *'"agent_type":"openwrt"'*) ;;
+        *) _ck_err="odpoved neni od OpenWrt agenta"; return 1 ;;
+    esac
+    case "$_sl" in
+        *"\"agent_version\":\"$2\""*) ;;
+        *) _ck_err="odpoved neni od verze $2"; return 1 ;;
+    esac
+    return 0
+}
+
 # IO-07: the self-update swap. NEW (a verified download in /tmp) becomes
 # TARGET through a rename inside TARGET's own directory. Until 0.1.8 the
 # script first copied itself to .bak and then did `mv /tmp/x /usr/bin/...`:
 # /tmp is another filesystem, so that mv unlinked the script and copied the
 # new one in - 2 x 224 kB of flash per update, and a window in which cron
 # found the agent missing (2 of 48 samples) or half written (27-44 of 48).
-# The .bak was never read by anything; a rollback is the server offering the
-# previous version again. Returns 0 when TARGET is the new version, else 1
-# with the reason in _sr_err (space: _sr_need kB were needed) and TARGET
-# untouched.
-bk_self_replace() { # NEW TARGET
-    _sr_new=$1; _sr_t=$2; _sr_err=""; _sr_need=""
+# That .bak was never read by anything. W1-B makes the old version a real
+# rollback instead: TARGET.prev, a hard link to the old file (no flash
+# written, the old inode simply keeps a name), which the probation above
+# renames back when the new version cannot get a report accepted. A
+# filesystem without hard links gets a copy if there is room for it, and an
+# update without either still goes ahead - it is then exactly as safe as
+# before, and the log says so.
+# The copy is self-checked (bk_selfcheck) where it will run, next to the
+# old one: that is the directory whose cfg the new version reads.
+# Returns 0 when TARGET is the new version (_sr_prev: link, copy or empty),
+# else 1 with the reason in _sr_err (space: _sr_need kB were needed;
+# selfcheck: _ck_err says why) and TARGET untouched.
+bk_self_replace() { # NEW TARGET VERSION
+    _sr_new=$1; _sr_t=$2; _sr_v=$3; _sr_err=""; _sr_need=""; _sr_prev=""
     bk_dirname "$_sr_t"
     # A .new left by a swap that never finished (the run killed in it, a
     # power cut, the OOM killer) goes first: on a tight overlay it would take
     # the room the space check below asks for, and refuse every later update
     # as "space", for good. This run holds the lock, so no other swap is
     # using it.
-    rm -f "$_sr_t.new" 2>/dev/null
+    rm -f "$_sr_t.new" "$_sr_t.prev.tmp" 2>/dev/null
     # The new copy sits next to the old one until the rename, and the
     # running shell keeps the old inode until it exits: the whole new file
     # plus 64 kB must fit, or a full overlay would break every later write
@@ -5366,9 +5641,11 @@ bk_self_replace() { # NEW TARGET
     _sr_df=$(df -Pk "$_dn" 2>/dev/null); _sr_df=${_sr_df##*"$BK_NL"}
     # shellcheck disable=SC2086
     set -- $_sr_df
+    _sr_avail=""
     case "$_sr_size:${4:-x}" in
         *[!0-9:]*|:*) ;;
         *)
+            _sr_avail=$4
             _sr_need=$(( _sr_size / 1024 + 65 ))
             if [ "$4" -lt "$_sr_need" ]; then _sr_err=space; return 1; fi
             ;;
@@ -5387,8 +5664,25 @@ bk_self_replace() { # NEW TARGET
         fi
     fi
     chmod +x "$_sr_t.new" 2>/dev/null
+    if ! bk_selfcheck "$_sr_t.new" "$_sr_v"; then
+        rm -f "$_sr_t.new" 2>/dev/null; _sr_err=selfcheck; return 1
+    fi
+    # The old version keeps a name before the new one takes TARGET's.
+    if ln -f "$_sr_t" "$_sr_t.prev" 2>/dev/null; then
+        _sr_prev="link"
+    else
+        rm -f "$_sr_t.prev" 2>/dev/null
+        # A second whole file must fit next to the new one, with the same
+        # 64 kB to spare; without a df answer the copy is not attempted.
+        if [ -n "$_sr_avail" ] && [ "$_sr_avail" -ge $(( 2 * (_sr_size / 1024) + 65 )) ] \
+            && cp "$_sr_t" "$_sr_t.prev.tmp" 2>/dev/null && mv -f "$_sr_t.prev.tmp" "$_sr_t.prev" 2>/dev/null; then
+            _sr_prev="copy"
+        else
+            rm -f "$_sr_t.prev.tmp" 2>/dev/null
+        fi
+    fi
     if ! mv -f "$_sr_t.new" "$_sr_t" 2>/dev/null; then
-        rm -f "$_sr_t.new" 2>/dev/null; _sr_err=rename; return 1
+        rm -f "$_sr_t.new" "$_sr_t.prev" 2>/dev/null; _sr_prev=""; _sr_err=rename; return 1
     fi
     return 0
 }
@@ -5449,6 +5743,10 @@ fi
 
 if [ "$http_code" = "200" ]; then
     log_debug "OK: Statistiky uspesne odeslany."
+    # W1-B: a normal run pays three `[ ]` tests here, nothing else.
+    if [ -f "$BK_UPD_PROBATION" ] || [ -f "$BK_UPD_MARK" ] || [ -e "$0.prev" ]; then
+        bk_upd_confirm
+    fi
     if [ -f "$BK_LAST_PAYLOAD_ON" ]; then
         bk_keep_last_payload
     elif [ -f "$BK_LAST_PAYLOAD_FILE" ]; then
@@ -5600,12 +5898,20 @@ if [ "$http_code" = "200" ]; then
             *",$act_type,"*) ;;
             *) act_refused="akce '$act_type' neni v ALLOWED_ACTIONS"; return 0 ;;
         esac
-        # The name becomes part of a path run as root: no "/", no "..".
+        # The name becomes part of a path run as root. W1-C: one rule on all
+        # four agents, so the server and the app can check a name once:
+        # ^[A-Za-z0-9_][A-Za-z0-9_.@$-]{0,127}$ - no "/" and no space; the
+        # first character neither "." (no "..") nor "-" (never an option to
+        # the tool it is handed to); "@" for systemd templates and "$" for
+        # Windows instance names (MSSQL$SQLEXPRESS), which no init script
+        # here carries - such a name passes the rule and is then simply not
+        # found under /etc/init.d.
         if [ "$act_type" = "restart_service" ]; then
             svc_name=$(echo "$body" | sed -n 's/.*"service_name":"\([^"]*\)".*/\1/p')
             case "$svc_name" in
-                ''|.*|*[!A-Za-z0-9_.-]*) act_refused="neplatny nazev sluzby"; return 0 ;;
+                ''|[!A-Za-z0-9_]*|*[!A-Za-z0-9_.@\$-]*) act_refused="neplatny nazev sluzby"; return 0 ;;
             esac
+            if [ "${#svc_name}" -gt 128 ]; then act_refused="neplatny nazev sluzby (delsi nez 128 znaku)"; return 0; fi
         fi
         return 0
     }
@@ -5620,12 +5926,26 @@ if [ "$http_code" = "200" ]; then
         # timestamp in shell arithmetic, the id unquoted in the result JSON.
         # A letter in the timestamp ended the whole run on an arithmetic
         # error - no service checks, no self-update that minute. Not a
-        # number = no action.
+        # number = no action. W1-C: and not longer than a number is - more
+        # than 18 digits is out of range for `[` (ash prints an error and
+        # the test is false) and for the server's integer id.
         case "$act_id$act_ts" in
             *[!0-9]*)
                 log_message "VAROVANI: Vzdalena akce ma neciselne action_id nebo timestamp, ignoruji ji."
                 act_id=""; act_ts="" ;;
         esac
+        # A leading zero is no number the server writes (json_encode never
+        # does), and ash reads "089" as a bad octal constant: the arithmetic
+        # error below would end the run just like a letter did.
+        case "$act_id:$act_ts" in
+            0[0-9]*|*:0[0-9]*)
+                log_message "VAROVANI: Vzdalena akce ma action_id nebo timestamp s uvodni nulou, ignoruji ji."
+                act_id=""; act_ts="" ;;
+        esac
+        if [ "${#act_id}" -gt 18 ] || [ "${#act_ts}" -gt 18 ]; then
+            log_message "VAROVANI: Vzdalena akce ma prilis dlouhe action_id nebo timestamp, ignoruji ji."
+            act_id=""; act_ts=""
+        fi
 
         if [ -n "$act_id" ] && [ -n "$act_type" ] && [ -n "$act_ts" ] && [ -n "$act_sig" ]; then
             now_ts=$(date +%s 2>/dev/null || echo 0)
@@ -5636,7 +5956,7 @@ if [ "$http_code" = "200" ]; then
                 calc_str="action=${act_type}|ts=${act_ts}|nonce=${act_nonce}"
                 calc_sig=""
                 if command -v openssl >/dev/null 2>&1; then
-                    calc_sig=$(echo -n "$calc_str" | openssl dgst -sha256 -hmac "$AGENT_KEY" 2>/dev/null | awk '{print $NF}')
+                    calc_sig=$(printf '%s' "$calc_str" | openssl dgst -sha256 -hmac "$AGENT_KEY" 2>/dev/null | awk '{print $NF}')
                 fi
                 
                 act_refused=""
@@ -5784,8 +6104,9 @@ if [ "$http_code" = "200" ]; then
     # se stáhne do dočasného souboru, ověří se checksum i syntaxe (sh -n) a teprve
     # potom se atomicky nahradí tento skript. Při dalším spuštění (cron) už poběží
     # nová verze.
-    # Never under the response seam: a test must not replace the script it runs.
-    if [ "$AUTO_UPDATE" = "1" ] && [ -z "$BK_TEST_RESPONSE" ]; then
+    # Never under the response seam alone: a test must not replace the script
+    # it runs. STATUS_TEST_UPDATE is the harness asking for it, on a copy.
+    if [ "$AUTO_UPDATE" = "1" ] && { [ -z "$BK_TEST_RESPONSE" ] || [ "$BK_TEST_UPDATE" = "1" ]; }; then
         # `echo | grep -o '"update_available":[a-z]*' | cut -d: -f2` without
         # its four forks a report: every occurrence's letters, one per line.
         update_available=""; _ua_rest=$body
@@ -5800,6 +6121,23 @@ if [ "$http_code" = "200" ]; then
             update_url=$(echo "$body" | sed -n 's/.*"update_url":"\([^"]*\)".*/\1/p' | sed 's,\\/,/,g')
             update_sha=$(echo "$body" | sed -n 's/.*"update_sha256":"\([a-f0-9]*\)".*/\1/p')
             latest_version=$(echo "$body" | sed -n 's/.*"latest_version":"\([^"]*\)".*/\1/p')
+
+            # W1-B: only ever forward. An older (or the same) version offered
+            # is refused before anything is downloaded: a reverted release
+            # or a stale file on the server must not turn a fixed agent back
+            # into the one it replaced. The offer comes with every report, so
+            # this is debug output, not a log line a minute.
+            if ! bk_version_newer "$latest_version" "$AGENT_VERSION"; then
+                log_debug "Server nabizi verzi '$latest_version', ktera neni novejsi nez $AGENT_VERSION - aktualizace odmitnuta."
+                update_url=""
+            fi
+            # A file this router has already refused or rolled back is not
+            # fetched again for a day (see bk_upd_bad): the verdict is about
+            # these exact bytes, and a republished file has another sha.
+            if [ -n "$update_url" ] && [ -f "$BK_UPD_BAD" ] && bk_upd_is_bad "$update_sha"; then
+                log_debug "Verze $latest_version (sha $update_sha) uz tu neprosla, znovu se zkusi nejdriv 24 h od te chvile."
+                update_url=""
+            fi
 
             # WW-04: the offer comes with every report, so a minute that is
             # out of time leaves the download to a later one.
@@ -5837,18 +6175,44 @@ if [ "$http_code" = "200" ]; then
                     fi
 
                     if [ -n "$actual_sha" ] && [ "$actual_sha" = "$update_sha" ]; then
-                        if sh -n "$tmp_file" 2>/dev/null; then
-                            if bk_self_replace "$tmp_file" "$self_path"; then
-                                rm -f "$tmp_file" 2>/dev/null
-                                log_message "OK: Agent aktualizovan na verzi $latest_version. Nova verze se pouzije pri pristim spusteni."
-                                exit 0
-                            elif [ "$_sr_err" = space ]; then
+                        # W1-B: the last line of every agent is its end mark
+                        # with its version. A transfer cut short can still
+                        # parse (sh -n reads a file that stops between two
+                        # functions as fine) and the sha the server sends is
+                        # the sha of whatever it holds, cut short or not.
+                        _upd_end=$(tail -n 1 "$tmp_file" 2>/dev/null)
+                        if [ "$_upd_end" != "# bk-agent-end $latest_version" ]; then
+                            log_message "CHYBA UPDATE: Stazeny soubor nekonci radkem '# bk-agent-end $latest_version' (neuplny, nebo jina verze). Aktualizace zrusena."
+                            bk_upd_bad "$update_sha"
+                        elif ! sh -n "$tmp_file" 2>/dev/null; then
+                            log_message "CHYBA UPDATE: Stazeny soubor neprosel kontrolou syntaxe. Aktualizace zrusena."
+                            bk_upd_bad "$update_sha"
+                        elif ! { printf '%s %s 0 0\n' "$latest_version" "$update_sha" > "$BK_UPD_PROBATION"; } 2>/dev/null \
+                            || ! bk_upd_mark "$latest_version" "$update_sha"; then
+                            # The probation is written BEFORE the swap: a run
+                            # killed right after the rename must not leave a
+                            # new version without one. Without it a new
+                            # version that cannot report would never go back.
+                            rm -f "$BK_UPD_PROBATION" "$BK_UPD_MARK" 2>/dev/null
+                            log_message "CHYBA UPDATE: Zkusebni lhutu nove verze nejde zapsat do $BK_PRIVATE_DIR a $BK_UPD_MARK - bez ni by se nova verze, ktera neodesila, sama nevratila. Aktualizace zrusena."
+                        elif bk_self_replace "$tmp_file" "$self_path" "$latest_version"; then
+                            rm -f "$tmp_file" 2>/dev/null
+                            [ -n "$_sr_prev" ] || log_message "VAROVANI: Predchozi verzi nejde ponechat jako $self_path.prev (souborovy system bez pevnych odkazu a bez mista na kopii) - kdyby nova verze neodesilala, neni kam se vratit."
+                            log_message "OK: Agent aktualizovan na verzi $latest_version. Nova verze se pouzije pri pristim spusteni."
+                            exit 0
+                        else
+                            # No swap: the probation names a version that does
+                            # not run. (Were the run killed before this rm,
+                            # the next one drops it: bk_upd_probation_read.)
+                            rm -f "$BK_UPD_PROBATION" "$BK_UPD_MARK" 2>/dev/null
+                            if [ "$_sr_err" = space ]; then
                                 log_message "CHYBA UPDATE: Vedle $self_path neni misto na novou verzi ($_sr_need kB). Aktualizace zrusena."
+                            elif [ "$_sr_err" = selfcheck ]; then
+                                log_message "CHYBA UPDATE: Nova verze neprosla vlastni kontrolou (--selfcheck: $_ck_err). Aktualizace zrusena."
+                                bk_upd_bad "$update_sha"
                             else
                                 log_message "CHYBA UPDATE: Nepodarilo se nahradit $self_path (prava?). Aktualizace zrusena."
                             fi
-                        else
-                            log_message "CHYBA UPDATE: Stazeny soubor neprosel kontrolou syntaxe. Aktualizace zrusena."
                         fi
                     else
                         log_message "CHYBA UPDATE: Checksum nesouhlasi (oceavan $update_sha, stazen $actual_sha). Aktualizace zrusena."
@@ -5865,6 +6229,7 @@ if [ "$http_code" = "200" ]; then
 else
     log_message "CHYBA: Odeslani selhalo (HTTP $http_code). Odpoved: $body"
     bk_keep_last_payload
+    [ -f "$BK_UPD_PROBATION" ] && bk_upd_refused "$http_code"
     # G42: this minute produced no stored report either. Counted here and
     # not where the POST is built, so a transport that came back with any
     # other code is counted too - and straight into the folded total: this
@@ -5873,3 +6238,9 @@ else
     runs_skipped_post=$((runs_skipped_post + 1)); bk_sk_cap; bk_sk_save
     exit 1
 fi
+# W1-B: the end mark. The self-update of every later version takes a file
+# only when its LAST line is this, with the version the server offered: a
+# download cut short, or a file of another version, stops there. It stays
+# the last line and changes together with AGENT_VERSION (the e2e harness
+# checks both).
+# bk-agent-end 0.1.11
