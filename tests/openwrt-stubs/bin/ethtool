@@ -1,9 +1,12 @@
 #!/bin/sh
-# ethtool stub, kept OFF the default PATH: the owner's router does not have
-# the package (REAL_FACTS), so every payload run has to answer "not measured".
-# The wpath runs put it back to prove the parser.
+# ethtool stub, kept OFF the default PATH. Turris OS ships the small ethtool
+# (an essential package) and the owner's router answers `ethtool -S`: its
+# ring drops reach the server. The payload runs still leave it out, because
+# "no ethtool" is the null path that has to be pinned. The wpath runs put it
+# back to prove the parser.
 #
-#   BK_STUB_ETHTOOL=other   a driver whose MIB has neither counter name
+#   BK_STUB_ETHTOOL=other    a driver whose MIB has none of the names
+#   BK_STUB_ETHTOOL=partial  a driver with the two ring names and nothing else
 echo "$*" >> /work/out/ethtool_calls.log 2>/dev/null
 [ "$1" = "-S" ] || exit 1
 [ -n "$2" ] || exit 1
@@ -16,15 +19,38 @@ NIC statistics:
 M
   exit 0
 fi
-# mvneta's HW MIB: the two names the driver accumulates ring drops into sit
-# among two dozen others, and the sum of THOSE two is the answer (5 + 2).
+if [ "$BK_STUB_ETHTOOL" = partial ]; then
+  cat <<'M'
+NIC statistics:
+     rx_packets: 33100000
+     rx_discard: 5
+     rx_overrun: 2
+     tx_packets: 78000
+M
+  exit 0
+fi
+# mvneta's MIB, in the driver's own order (mvneta_statistics[]). The two names
+# the driver accumulates ring drops into sit among two dozen others, and the
+# sum of THOSE two is the ring (5 + 2). The split names are all different
+# numbers, so a counter read off its neighbour shows: bad_frames_received and
+# jabber_received are not CRC errors, and skb_alloc_errors is never sent
+# (with hardware buffer management it never moves). oversize_received is a
+# measured 0, which must stay 0 and not become null.
 cat <<'M'
 NIC statistics:
      good_octets_received: 40558104195
      good_frames_received: 33100000
      bad_octets_received: 0
+     bad_frames_received: 11
+     oversize_received: 0
+     jabber_received: 6
+     mac_receive_error: 1
+     bad_crc_event: 3
      rx_discard: 5
      rx_overrun: 2
-     mac_trans_error: 0
      good_octets_sent: 2765975303
+     internal_mac_transmit_err: 0
+     skb_alloc_errors: 0
+     refill_errors: 4
+     rx_xdp_redirect: 0
 M

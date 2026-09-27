@@ -238,6 +238,13 @@ while read -r _path _hw; do
         f10e4078.thermal) _t=58000 ;; mt7915_phy0) _t=62000 ;; sfp) _t=49000 ;; *) _t=$((45000 + _i * 500)) ;;
     esac
     echo "$_t" > "$S/class/hwmon/hwmon$_i/temp1_input"
+    # The module's own warning and alarm limits (synthetic; sfp.c shows them
+    # when the module sets its alarm flags). No power2_*: the Omnia's module
+    # is copper, and the optical-like run adds them itself.
+    if [ "$_hw" = sfp ]; then
+        echo 70000 > "$S/class/hwmon/hwmon$_i/temp1_max"
+        echo 75000 > "$S/class/hwmon/hwmon$_i/temp1_crit"
+    fi
     _i=$((_i + 1))
 done < "$HERE/omnia/hwmon_names.txt"
 echo "$R"

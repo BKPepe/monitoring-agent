@@ -152,8 +152,26 @@ with nobody on it.
   agree, so a `lan_port_cap_mbit` read off `speed` would look right.
   The payload runs prove the other half: six runs, one `uci` read of each
   option and one `ubus` device dump between them. `tc` and `ethtool` are NOT
-  applets of the image (the owner's router has neither), so removing the stub
-  really removes the tool.
+  applets of this image, so removing the stub really removes the tool. The
+  payload runs keep `ethtool` out to pin the null path; the owner's router
+  has it (Turris OS ships the small ethtool, and its ring drops reach the
+  server).
+- **The port's MIB split and the SFP module (`wpath9..wpath12`, 0.1.13).**
+  The `ethtool` stub serves mvneta's names in the driver's order, each split
+  counter with its own number (overrun 2, discard 5, CRC 3, MAC receive 1,
+  refill 4, oversize a measured 0) next to the neighbours a parser could slip
+  onto (`bad_frames_received`, `jabber_received`, `skb_alloc_errors`), so
+  `wpath1` pins every one of them and a ring that is still 5 + 2. The fake
+  root carries the capture's `sfp` hwmon (49 C against the module's own
+  70 / 75 limits, no RX power: the owner's module is copper) and the PHY
+  inside it, `i2csfp11`, whose die temperature must never be sent. `wpath9`
+  is a driver with the two ring names only (`BK_STUB_ETHTOOL=partial`: the
+  other four null), `wpath10` an optical-like module (RX power 350 uW
+  against its own 50 / 20, `i2csfp11` moved away: the PHY flag is false,
+  which is "none seen", never "optical"), `wpath11` a router with neither
+  hwmon, and `wpath12` one with a second cage (`sfp1`), where nothing says
+  which module is the WAN's and every module value is null. The stub logs
+  its calls: one `-S` per hourly read, never a second one for the split.
 - **The gap runs `wfw1..3`, `wdns1`/`wdns3`, `wrun1..7`.** What "the firewall
   is up" is read from: the `nft` stub serves three rulesets - fw4 (every other
   run), `BK_STUB_NFT=foreign` (mwan3's table and nothing else) and

@@ -1,7 +1,7 @@
 {
   "agent_key": "",
   "agent_type": "openwrt",
-  "version": "0.1.12",
+  "version": "0.1.12.1",
   "heavy_op_interval_hours": 24,
   "os": "TurrisOS 7.2.3",
   "cpu": 52.4,
@@ -978,7 +978,7 @@
   "wan_rx_dropped": 0,
   "wan_tx_dropped": 0,
   "wan_path": {
-    "checked_at": 1790539802,
+    "checked_at": 1793245209,
     "flow_offloading": true,
     "flow_offloading_hw": false,
     "flowtable_active": true,
@@ -987,6 +987,19 @@
     "wan_rps_mask": "0",
     "wan_threaded_napi": false,
     "wan_rx_ring_drops": 7,
+    "rx_overrun": 2,
+    "rx_discard": 5,
+    "bad_crc_event": 3,
+    "mac_receive_error": 1,
+    "refill_errors": 4,
+    "oversize_received": 0,
+    "sfp_temp_mc": 49000,
+    "sfp_temp_max_mc": 70000,
+    "sfp_temp_crit_mc": 75000,
+    "sfp_rx_power_uw": null,
+    "sfp_rx_power_min_uw": null,
+    "sfp_rx_power_lcrit_uw": null,
+    "sfp_phy_hwmon": true,
     "sqm": [
       {
         "iface": "eth2",

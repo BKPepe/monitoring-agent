@@ -1819,6 +1819,12 @@ bk_netnum() {
     [ -r "$1" ] && read -r _wv < "$1" 2>/dev/null
     case "$_wv" in ''|*[!0-9]*) _wv="" ;; esac
 }
+# The same for a sysfs number that may be negative (a hwmon temperature).
+bk_sysint() {
+    _wv=""
+    [ -r "$1" ] && read -r _wv < "$1" 2>/dev/null
+    case "${_wv#-}" in ''|*[!0-9]*) _wv="" ;; esac
+}
 wan_link_dev=""; wan_link_mbit="null"; wan_carrier_down_count="null"
 # Every netdev the walk passed through, for the SQM match of the path cache:
 # a queue on ANY device of the chain shapes this WAN.
@@ -3450,25 +3456,98 @@ else
         esac
     fi
 
-    # Ring drops of the port. ethtool is not in every image, and a driver
-    # that does not carry these two counter names answers nothing - which is
-    # null, never 0 (R7: on this router ethtool is not installed at all).
-    wp_ring="null"
+    # The port's own MIB, from ONE `ethtool -S`. Turris OS ships the small
+    # ethtool; an image without it answers null for all of it, and so does a
+    # driver that prints none of these names - null, never 0.
+    # Ring drops are rx_discard + rx_overrun, as before. The same read keeps
+    # the names apart too, because neither that sum nor wan_rx_errors says
+    # why a frame was lost (mvneta, the Omnia):
+    #   rx_overrun         the receive FIFO was full: the router's load
+    #   rx_discard         address filtering OR no room: harmless or load
+    #   bad_crc_event,     damaged frames from the line or the module
+    #   mac_receive_error
+    #   oversize_received  frames longer than the port takes: an MTU mismatch
+    #   refill_errors      the driver could not refill a receive buffer; with
+    #                      hardware buffer management the one software counter
+    #                      that moves (skb_alloc_errors never does, not sent)
+    # All are totals since boot, like the sysfs counters: the server steps them.
+    wp_ring="null"; wp_overrun="null"; wp_discard="null"; wp_crc="null"
+    wp_mac_rx="null"; wp_refill="null"; wp_oversize="null"
     if [ -n "$wan_link_dev" ] && command -v ethtool >/dev/null 2>&1; then
-        _wp_sum=""
+        _wp_sum=""; _wp_ovr=""; _wp_dsc=""; _wp_crc=""; _wp_mrx=""; _wp_rfl=""; _wp_ovs=""
         while read -r _wp_k _wp_n; do
+            # ethtool prints %llu: no sign and no leading zero, which $(( ))
+            # would read as octal.
+            case "$_wp_n" in
+                ''|*[!0-9]*|0?*) continue ;;
+            esac
             case "$_wp_k" in
-                rx_discard:|rx_overrun:)
-                    case "$_wp_n" in
-                        ''|*[!0-9]*) continue ;;
-                    esac
-                    _wp_sum=$(( ${_wp_sum:-0} + _wp_n ))
-                    ;;
+                rx_discard:) _wp_sum=$(( ${_wp_sum:-0} + _wp_n )); _wp_dsc=$(( ${_wp_dsc:-0} + _wp_n )) ;;
+                rx_overrun:) _wp_sum=$(( ${_wp_sum:-0} + _wp_n )); _wp_ovr=$(( ${_wp_ovr:-0} + _wp_n )) ;;
+                bad_crc_event:) _wp_crc=$(( ${_wp_crc:-0} + _wp_n )) ;;
+                mac_receive_error:) _wp_mrx=$(( ${_wp_mrx:-0} + _wp_n )) ;;
+                refill_errors:) _wp_rfl=$(( ${_wp_rfl:-0} + _wp_n )) ;;
+                oversize_received:) _wp_ovs=$(( ${_wp_ovs:-0} + _wp_n )) ;;
             esac
         done <<EOF_ETH
 $(ethtool -S "$wan_link_dev" 2>/dev/null)
 EOF_ETH
         [ -n "$_wp_sum" ] && wp_ring="$_wp_sum"
+        [ -n "$_wp_ovr" ] && wp_overrun="$_wp_ovr"
+        [ -n "$_wp_dsc" ] && wp_discard="$_wp_dsc"
+        [ -n "$_wp_crc" ] && wp_crc="$_wp_crc"
+        [ -n "$_wp_mrx" ] && wp_mac_rx="$_wp_mrx"
+        [ -n "$_wp_rfl" ] && wp_refill="$_wp_rfl"
+        [ -n "$_wp_ovs" ] && wp_oversize="$_wp_ovs"
+    fi
+
+    # The SFP module, from the hwmon the kernel's sfp driver registers for a
+    # module with diagnostics, named after its cage ("sfp" on the Omnia).
+    # Kernel units, no conversion here: millidegrees C and microwatts. The
+    # module's OWN limits come with the readings, because a reading means
+    # something only against them. They are sent only when exactly ONE such
+    # hwmon exists: with two cages nothing here says which module is the
+    # WAN's. One cage is the Omnia, where a module IS the WAN port (it cannot
+    # be told from sysfs without the device tree, so this is an assumption,
+    # and a router with one LAN cage breaks it). RX power is absent for a
+    # module that needs external calibration, the limits for one without
+    # alarm flags: null.
+    # sfp_phy_hwmon: a hwmon of a PHY INSIDE a module ("i2csfp11" on the
+    # Omnia, "i2c:sfp:11" from drivers that keep the colons). The kernel
+    # probes such a PHY only for copper (BASE-T) modules, so true proves
+    # copper. Many copper PHYs register no hwmon, so false is only "none
+    # seen", never "optical". Null: no hwmon names at all, or more than one
+    # cage or PHY to choose from. The PHY's die temperature is not the
+    # module's and is not read, and nothing that identifies the module
+    # (EEPROM, serial number) is read at all. `read` only, no fork.
+    wp_sfp_temp="null"; wp_sfp_temp_max="null"; wp_sfp_temp_crit="null"
+    wp_sfp_rx="null"; wp_sfp_rx_min="null"; wp_sfp_rx_lcrit="null"; wp_sfp_phy="null"
+    _wp_hw=0; _wp_nsfp=0; _wp_nphy=0; _wp_sfp=""
+    for _wp_h in "$BK_SYS"/class/hwmon/hwmon*; do
+        [ -r "$_wp_h/name" ] || continue
+        _wp_m=""
+        IFS= read -r _wp_m < "$_wp_h/name" 2>/dev/null
+        [ -n "$_wp_m" ] || continue
+        _wp_hw=1
+        case "$_wp_m" in
+            sfp*) _wp_nsfp=$((_wp_nsfp + 1)); _wp_sfp="$_wp_h" ;;
+            i2csfp*|i2c:sfp*) _wp_nphy=$((_wp_nphy + 1)) ;;
+        esac
+    done
+    if [ "$_wp_nsfp" = 1 ]; then
+        bk_sysint "$_wp_sfp/temp1_input"; wp_sfp_temp=${_wv:-null}
+        bk_sysint "$_wp_sfp/temp1_max"; wp_sfp_temp_max=${_wv:-null}
+        bk_sysint "$_wp_sfp/temp1_crit"; wp_sfp_temp_crit=${_wv:-null}
+        bk_netnum "$_wp_sfp/power2_input"; wp_sfp_rx=${_wv:-null}
+        bk_netnum "$_wp_sfp/power2_min"; wp_sfp_rx_min=${_wv:-null}
+        bk_netnum "$_wp_sfp/power2_lcrit"; wp_sfp_rx_lcrit=${_wv:-null}
+    fi
+    if [ "$_wp_hw" = 1 ]; then
+        if [ "$_wp_nphy" = 0 ]; then
+            wp_sfp_phy="false"
+        elif [ "$_wp_nphy" = 1 ] && [ "$_wp_nsfp" -le 1 ]; then
+            wp_sfp_phy="true"
+        fi
     fi
 
     # SQM. An empty list means "checked, no queue on the WAN path"; null
@@ -3510,14 +3589,14 @@ EOF_SQM
     # taken this run, and asking ubus for the same 27 kB twice a minute buys
     # nothing.
 
-    wan_path_json="{\"checked_at\":$now_ts,\"flow_offloading\":$wp_flow,\"flow_offloading_hw\":$wp_flow_hw,\"flowtable_active\":$wp_flowtable,\"packet_steering\":$wp_steering,\"packet_steering_active\":$wp_steer_active,\"wan_rps_mask\":$wp_rps_mask,\"wan_threaded_napi\":$wp_threaded,\"wan_rx_ring_drops\":$wp_ring,\"sqm\":$wp_sqm,\"lan_port_max_mbit\":${lan_port_max:-null},\"lan_port_cap_mbit\":${lan_port_cap:-null},\"lan_conduits\":${lan_conduits:-null}}"
+    wan_path_json="{\"checked_at\":$now_ts,\"flow_offloading\":$wp_flow,\"flow_offloading_hw\":$wp_flow_hw,\"flowtable_active\":$wp_flowtable,\"packet_steering\":$wp_steering,\"packet_steering_active\":$wp_steer_active,\"wan_rps_mask\":$wp_rps_mask,\"wan_threaded_napi\":$wp_threaded,\"wan_rx_ring_drops\":$wp_ring,\"rx_overrun\":$wp_overrun,\"rx_discard\":$wp_discard,\"bad_crc_event\":$wp_crc,\"mac_receive_error\":$wp_mac_rx,\"refill_errors\":$wp_refill,\"oversize_received\":$wp_oversize,\"sfp_temp_mc\":$wp_sfp_temp,\"sfp_temp_max_mc\":$wp_sfp_temp_max,\"sfp_temp_crit_mc\":$wp_sfp_temp_crit,\"sfp_rx_power_uw\":$wp_sfp_rx,\"sfp_rx_power_min_uw\":$wp_sfp_rx_min,\"sfp_rx_power_lcrit_uw\":$wp_sfp_rx_lcrit,\"sfp_phy_hwmon\":$wp_sfp_phy,\"sqm\":$wp_sqm,\"lan_port_max_mbit\":${lan_port_max:-null},\"lan_port_cap_mbit\":${lan_port_cap:-null},\"lan_conduits\":${lan_conduits:-null}}"
 
     # Written through a temporary name, like the identity cache: a run killed
     # half way must not leave a file whose lines have shifted by one.
     printf '%s\n' "$now_ts" "$wan_path_json" "$sqm_enabled" "$sqm_download_kbps" \
         "$sqm_upload_kbps" "$sqm_dropped" "end" \
         > "$BK_WAN_PATH_CACHE.tmp" 2>/dev/null && mv "$BK_WAN_PATH_CACHE.tmp" "$BK_WAN_PATH_CACHE" 2>/dev/null
-    log_debug "WAN cesta: flow=$wp_flow flowtable=$wp_flowtable steering=$wp_steering/$wp_steer_active ring=$wp_ring sqm=$sqm_enabled"
+    log_debug "WAN cesta: flow=$wp_flow flowtable=$wp_flowtable steering=$wp_steering/$wp_steer_active ring=$wp_ring crc=$wp_crc overrun=$wp_overrun sfp=$wp_sfp_temp/$wp_sfp_phy sqm=$sqm_enabled"
 fi
 
 # --- LTE/WWAN pripojeni pres ubus -----------------------------------------
