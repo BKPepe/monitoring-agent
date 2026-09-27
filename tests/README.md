@@ -13,6 +13,7 @@ second, parsers reading the right columns.
 | `run_windows_e2e.sh` | `agent.ps1` in PowerShell 7 (Linux container, `windows/`): parser, UTF-8 BOM, end line, PSScriptAnalyzer's Windows PowerShell 5.1 compatibility rules, unit tests of functions cut out of the agent's own syntax tree, then 40-odd agent runs against `windows/mock_api.ps1` - dry run, `-SelfCheck`, remote-action gates, self-update refusals, swap, probation and rollback | docker |
 | `run_openwrt_real.sh [24.10\|master\|all]` | `agent_openwrt.sh` with a plain `--dry-run`, twice, in the official `openwrt/rootfs` x86_64 images (24.10.8 pinned, master floating) with ubus, procd, logd, netifd, fw4 and dnsmasq up (`openwrt-real/boot.sh`), asserted by `assert_real_payload.py` | docker, python3 |
 | `run_linux_distros.sh [ubuntu\|alpine\|rocky\|all]` | `agent.sh` and `agent.py` with a plain `--dry-run`, twice each, on Ubuntu 24.04, Alpine 3.24 (busybox `ps`/`awk`/`df`) and Rocky 9 (Python 3.9), each with only what the agents need installed (`linux-distros/*/Dockerfile`, base images pinned by digest); the same assertions | docker, python3 |
+| `hw_smoke_selftest.sh` | `hw_smoke.sh` (below) against the OpenWrt 24.10.8 image standing in for a router over ssh on 127.0.0.1: a fresh router, a broken agent, a router that runs the agent, not OpenWrt. `hw_smoke.sh root@HOST` itself is for a real router and is never run by CI | docker, ssh, ssh-keygen, python3 |
 
 All of them end through `e2e_cleanup.sh`. The Linux and OpenWrt containers run
 as root, so on a Linux host whose user is not root (CI's runner) what they
@@ -404,6 +405,77 @@ key, stale when the CORE check passes. There is one:
   should be null or be read from `/proc`; that is an open finding for the
   agent, not something this harness hides.
 
+### A real router: `hw_smoke.sh`
+
+CI has containers; the owner has routers. `tests/hw_smoke.sh root@HOST`
+checks the agent of this checkout on one of them without installing
+anything, and says what it measured there:
+
+```
+tests/hw_smoke.sh [-p PORT] [-i KEY] [-o SSH_OPTION]... [--agent FILE]
+                  [--interval SECONDS] [--coexist] [--keep DIR] root@HOST
+```
+
+1. **Preflight** over ssh (`BatchMode`, 5 s connect timeout, keep-alives):
+   `/etc/openwrt_release`, `ubus`, `jshn.sh`, 1 MB free in `/tmp`. Not
+   OpenWrt is exit 3.
+2. **What is there already:** every agent path (`/tmp/status-agent-*`,
+   `/var/run/status-agent-openwrt`) with its checksum, and the crontab lines
+   naming the agent. Anything there without `--coexist` is exit 3: a dry run
+   shares that state.
+3. **Upload** to `mktemp -d /tmp/bk-hwsmoke.XXXXXX` with `ssh 'cat > ...'` -
+   the OpenWrt root file system has no `sftp-server` and today's `scp` speaks
+   SFTP - and the checksum compared on both sides (`sha256sum`, or `md5sum`
+   where busybox has no other).
+4. **Run** `--dry-run` twice, `--interval` seconds apart (11 by default, 0 =
+   once), each under a 120 s watchdog on the router (busybox 24.10 and macOS
+   have no `timeout`), and every ssh call under one on this host. The agent's
+   stderr is a file on the router, fetched on its own: ssh's own warnings
+   never reach the stderr check.
+5. **Clean up before validating:** the work directory and every agent path
+   the runs created are removed, and the router is listed again - anything
+   that differs from step 2 is exit 4. No `opkg`/`apk`, no cron edit, nothing
+   outside `/tmp`.
+6. **Validate** on this host: `assert_real_payload.py hw` (the per-run checks
+   of the real images and the CORE set of a router: numbers, identity
+   including `model` and `board_name`, packages, interfaces, filesystems -
+   types, not the container's values; not the every-key rule, since a router
+   measures what it has) and `golden.py check openwrt`.
+7. **Summary:** release and model, agent version, run times and exit codes,
+   keys measured and null, the keys the router measures that no CI run pins
+   (golden null), stderr lines, CPU/RAM/disk, WAN, radios, disks, package
+   manager, the clean-up, `PASS`.
+
+Exit: 0 passed, 1 validation failed, 2 usage or ssh error, 3 refused, 4
+clean-up not verified. The host side runs under macOS's `/bin/bash` 3.2 and
+the host's `python3` (3.9 on macOS).
+
+**`--coexist`, a router that runs the agent.** A dry run writes what the
+installed agent reads: the rate state, the CPU cost of the last cron run
+(`run.cpu`/`run.total`), the caches and `last-payload.json` in its private
+directory, the version stamp (another version wipes every cache, SMART
+included) and the run lock. With `--coexist` the installed agent (the file its
+crontab line names) must be the tested version, or it is exit 3; the run is
+one (its deltas come from the installed agent's state) with
+`STATUS_TEST_TTY=1`, so the cron run's cost stays; it starts between seconds 5
+and 35 of a minute with no run lock held; `last-payload.json` is put back;
+and only the paths it created are removed. The crontab, the version stamp,
+`run.cpu`/`run.total` and `last-payload.json` must be as they were, and no
+path may be more or less (exit 4 otherwise). What stays: the rate and cache
+files the dry run refreshed, so the installed agent's next report measures
+its rates over a shorter window.
+
+`hw_smoke_selftest.sh` runs it against the 24.10.8 image standing in for a
+router (`openwrt-real/router.sh`: `boot.sh`, one fw4 rule that lets ssh in on
+its WAN, the model and board name a router's preinit writes to `/tmp/sysinfo`,
+dropbear with a throwaway key, ssh published on 127.0.0.1 only): a fresh
+router (exit 0, nothing left), an agent that prints `sh: foo: not found` and
+one with a JSON typo (exit 1, cleaned up anyway), a router running the agent
+(exit 3 and untouched without `--coexist`, exit 0 with it, a different
+installed version exit 3) and one without `/etc/openwrt_release` (exit 3). It
+never touches a real router. It runs `hw_smoke.sh` under `/bin/bash`, which on
+macOS holds it to bash 3.2.
+
 ### Golden payloads
 
 `golden/openwrt.json`, `golden/linux-bash.json` and `golden/linux-python.json`
@@ -431,8 +503,8 @@ shows there as well. `golden.py` does the work:
   is no glob: `out/` holds kept copies and planted files too, and a listed
   payload that does not parse fails.
 - It runs at the end of `run_openwrt_e2e.sh`, `run_linux_e2e.sh`,
-  `run_openwrt_real.sh` and `run_linux_distros.sh`; `golden.py selftest`
-  (the rules on their own samples) runs in `lint`.
+  `run_openwrt_real.sh` and `run_linux_distros.sh`, and in `hw_smoke.sh`;
+  `golden.py selftest` (the rules on their own samples) runs in `lint`.
 
 The shape check and the real-image checks catch different things: a
 collector that silently goes null passes the shape (null is allowed) and fails
@@ -485,8 +557,9 @@ a commit on `main` that passed this workflow. Four jobs:
   `agent.ps1` still starts with a UTF-8 BOM; `node --test tests/*.test.mjs`.
 - `e2e`: the three harnesses above, one after another in one job - the
   account's 20 concurrent jobs are shared with the OpenWrt builds.
-- `real`: `run_openwrt_real.sh all` and `run_linux_distros.sh all` (the real
-  images above), beside `e2e`, so the workflow takes no longer.
+- `real`: `run_openwrt_real.sh all`, `hw_smoke_selftest.sh` and
+  `run_linux_distros.sh all` (the real images above), beside `e2e`, so the
+  workflow takes no longer.
 - `windows-ps51`: `agent.ps1 -SelfCheck` and `-DryRun` on `windows-latest`
   under Windows PowerShell 5.1, the engine the scheduled task runs.
 

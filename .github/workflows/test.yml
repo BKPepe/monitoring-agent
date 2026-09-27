@@ -126,8 +126,8 @@ jobs:
   # The agents in the images they really run on, not against stubs: the
   # official OpenWrt rootfs with its services up (24.10 pinned by digest,
   # master floating on purpose) and three more Linux distributions, each
-  # agent with a plain --dry-run. Beside e2e, so the workflow takes no
-  # longer.
+  # agent with a plain --dry-run, and the router smoke test against a router
+  # container. Beside e2e, so the workflow takes no longer.
   real:
     name: Real images
     runs-on: ubuntu-latest
@@ -136,6 +136,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: agent_openwrt.sh in openwrt/rootfs 24.10.8 and master
         run: bash tests/run_openwrt_real.sh all
+      # hw_smoke.sh is for the owner's routers; here it meets a container
+      # standing in for one, ssh on 127.0.0.1 only.
+      - name: hw_smoke.sh against a router container
+        run: bash tests/hw_smoke_selftest.sh
       - name: agent.sh + agent.py on Ubuntu, Alpine and Rocky
         run: bash tests/run_linux_distros.sh all
 
