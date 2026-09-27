@@ -1,0 +1,97 @@
+{
+  "agent_key": "",
+  "agent_type": "python",
+  "version": "0.1.3",
+  "heavy_op_interval_hours": 24,
+  "os": "Debian GNU/Linux 12 (bookworm)",
+  "cpu": 97.1,
+  "cpu_steal": 0.0,
+  "iowait": 0.2,
+  "ram": 28.5,
+  "swap": 0.3,
+  "hdd": 12.1,
+  "inode_usage": 1.9,
+  "load1": 24.18,
+  "load5": 23.85,
+  "load15": 17.56,
+  "disk_io_read": 30.3,
+  "disk_io_write": 18.2,
+  "net": 0.2,
+  "net_errors": 0,
+  "fork_rate": 545,
+  "temperature": null,
+  "uptime": 36085,
+  "smart": "N/A (smartctl chybí)",
+  "ports": [
+    10011
+  ],
+  "processes": [
+    "bash",
+    "python3",
+    "yes"
+  ],
+  "teamspeak_servers": [
+    {
+      "port": 9987,
+      "clients_online": 7,
+      "clients_max": 32,
+      "name": "Blood Kings"
+    }
+  ],
+  "ts3_process": null,
+  "zombie_count": 0,
+  "top_cpu_processes": [],
+  "top_ram_processes": [
+    {
+      "name": "python3",
+      "ram_mb": 8.8
+    },
+    {
+      "name": "bash",
+      "ram_mb": 2.6
+    },
+    {
+      "name": "yes",
+      "ram_mb": 0.9
+    }
+  ],
+  "hostname": "golden-linux",
+  "kernel": "6.6.0",
+  "timezone": "Etc/UTC",
+  "reboot_required": false,
+  "cloud_provider": null,
+  "virtualization": null,
+  "ram_total_mb": 7936,
+  "ram_used_mb": 2271,
+  "ram_available_mb": 5665,
+  "ram_free_mb": 2906,
+  "tcp_retrans": 0,
+  "conntrack_count": 0,
+  "auto_update": 0,
+  "oom_kills": 0,
+  "tailscale_up": null,
+  "tailscale_peers": null,
+  "zerotier_networks": 1,
+  "ups_status": null,
+  "ups_battery_pct": null,
+  "boot_time": 1789990000,
+  "dns_latency_ms": 25.1,
+  "openvpn_tunnels": 0,
+  "usb_devices": 0,
+  "discovered_services": [
+    {
+      "name": "TeamSpeak",
+      "type": "teamspeak",
+      "port": 10011,
+      "confidence": 44,
+      "evidence": [
+        "port",
+        "active_verify"
+      ],
+      "missing": [
+        "process",
+        "config"
+      ]
+    }
+  ]
+}

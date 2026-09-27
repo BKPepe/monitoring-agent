@@ -63,8 +63,14 @@ export STATUS_TEST_ROOT=/tmp/fakeroot
 # The stubs first: a wrong stub makes every parser check on it wrong too.
 sh /work/stubs/selftest.sh
 cd /root/agent
+# The golden check (../golden.py) takes the payloads from this list, never
+# from a glob of out/, which holds kept copies and planted files too:
+# `pl TAG` before a run whose TAG.json is a payload, `pl -TAG` before one that
+# must print nothing (a lock held, a rollback). Runs to /dev/null are not in it.
+pl() { echo "openwrt $1" >> "$OUT/payload_runs.txt"; }
 # run TAG: one dry run; afterwards the disk caches as that run left them.
 run() {
+    pl "$1"
     sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/e${1#r}.txt"
     for _f in smart.cache disks.static; do
         cp "$PRIV/$_f" "$OUT/$1_$_f" 2>/dev/null || true
@@ -197,6 +203,7 @@ done
 # which is what a rate read off the port instead of the l3 device would show.
 mkdir -p "$PRIV"
 printf '100000|pppoe-wan|39669766851|2433851191\n' > "$PRIV/wan-rate.state"
+pl wpppoe
 BK_STUB_WAN=pppoe sh agent_openwrt.sh --dry-run > $OUT/wpppoe.json 2> $OUT/wpppoe.err
 rm -rf "$PRIV" /tmp/status-agent-openwrt-private
 
@@ -217,6 +224,7 @@ cp /tmp/fakeroot/proc/net/stat/nf_conntrack.other /tmp/fakeroot/proc/net/stat/nf
 for _w in "wwalk1 eth2" "wwalk2 brwan" "wwalk3 brwan2" "wwalk4 ppp0" "wwalk5 dsa"; do
     # shellcheck disable=SC2086
     set -- $_w
+    pl "$1"
     BK_STUB_WAN="$2" sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err"
     rm -rf "$PRIV" /tmp/status-agent-openwrt-private
     mkdir -p "$PRIV"
@@ -238,8 +246,10 @@ printf 'S|sdb|1953525168|%s|%s|0|ok|5400|"exit_bits":0,"passed":true,"in_drivedb
 # The disk-rate state is planted too, with counters far below the current
 # ones: that is what "this disk is working" looks like to the agent.
 { date +%s; echo "sdb|1|1"; } > /tmp/status-agent-openwrt-diskdev.state
+pl wsmart
 sh agent_openwrt.sh --dry-run > $OUT/wsmart.json 2> $OUT/wsmart.err
 cp "$PRIV/smart.cache" $OUT/wsmart_smart.cache
+pl wsmart2
 sh agent_openwrt.sh --dry-run > $OUT/wsmart2.json 2> $OUT/wsmart2.err
 rm -rf "$PRIV" /tmp/status-agent-openwrt-private
 
@@ -254,6 +264,7 @@ _busy=$!
 mkdir -p "$PRIV/smart.lock"
 echo "$_busy" > "$PRIV/smart.lock/pid"; echo sda > "$PRIV/smart.lock/dev"; date +%s > "$PRIV/smart.lock/since"
 wc -l < $OUT/smartctl_calls.log | tr -cd "0-9" > $OUT/wlock_before.txt
+pl wlock
 sh agent_openwrt.sh --dry-run > $OUT/wlock.json 2> $OUT/wlock.err
 wc -l < $OUT/smartctl_calls.log | tr -cd "0-9" > $OUT/wlock_after.txt
 if [ -d "$PRIV/smart.lock" ]; then echo yes; else echo no; fi > $OUT/wlock_lock.txt
@@ -265,8 +276,10 @@ fresh() { rm -rf "$PRIV" /tmp/status-agent-openwrt-private; mkdir -p "$PRIV"; }
 fresh
 # Without the uci option the agent has to look in the hard-coded default, and
 # only there: the file waiting in /tmp/librespeed-data belongs to no other run.
+pl wspeedfb
 BK_STUB_LIBRESPEED=off sh agent_openwrt.sh --dry-run > $OUT/wspeedfb.json 2> $OUT/wspeedfb.err
 fresh
+pl wspeed60
 BK_STUB_SPEED_DIR=/srv/speed60 sh agent_openwrt.sh --dry-run > $OUT/wspeed60.json 2> $OUT/wspeed60.err
 fresh
 # W01 repair. 0.1.6 kept the newest sent name in /tmp and never offered the
@@ -275,6 +288,7 @@ fresh
 # thing to do would switch the repair off and no payload would look wrong.
 echo "0.1.6" > /tmp/status-agent-openwrt-version.stamp
 printf '2026-09-20T06:02:00+02:00\n' > /tmp/status-agent-librespeed.state
+pl wspeedold
 sh agent_openwrt.sh --dry-run > $OUT/wspeedold.json 2> $OUT/wspeedold.err
 if [ -f /tmp/status-agent-librespeed.state ]; then echo yes; else echo no; fi > $OUT/wspeedold_state.txt
 
@@ -288,22 +302,29 @@ fresh
 resp 000 ''
 # The agent exits non-zero when the report did not arrive, which is the point
 # of this run - `set -e` must not take it for a broken harness.
+pl wack1
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wack1.json 2> $OUT/wack1.err || true
 if [ -f "$PRIV/pending.state" ]; then echo yes; else echo no; fi > $OUT/wack1_pending.txt
 # A bare 200 with no ack key at all: everything is offered again.
 resp 200 '{"status":"ok"}'
+pl wack2
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wack2.json 2> $OUT/wack2.err
 # An ack naming the SECOND of the three items: only the third may be left.
 resp 200 '{"status":"ok","speedtests_acked":"2026-09-20T05:41:02+02:00"}'
+pl wack3
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wack3.json 2> $OUT/wack3.err
 # ... and an ack for a timestamp this report never sent is no answer to it.
 resp 200 '{"status":"ok","speedtests_acked":"2027-01-01T00:00:00+01:00"}'
+pl wack4
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wack4.json 2> $OUT/wack4.err
 resp 200 '{"status":"ok","speedtests_acked":"2026-09-20T06:02:00+02:00"}'
+pl wack5
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wack5.json 2> $OUT/wack5.err
 if [ -f "$PRIV/sent.state" ]; then echo yes; else echo no; fi > $OUT/wack5_sent.txt
+pl wack6
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wack6.json 2> $OUT/wack6.err
 # A test running right now writes no file yet: only pidof can see it.
+pl wactive
 BK_STUB_TEST_RUNNING=1 sh agent_openwrt.sh --dry-run > $OUT/wactive.json 2> $OUT/wactive.err
 
 # --- wupl1..wupl7: which uplink carried a speedtest (0.1.11) ----------------
@@ -314,6 +335,7 @@ BK_STUB_TEST_RUNNING=1 sh agent_openwrt.sh --dry-run > $OUT/wactive.json 2> $OUT
 # runs move it by hand; the counters move by what each "test" would add.
 uplrun() {
     echo "$2.00 1500.00" > /tmp/fakeroot/proc/uptime
+    pl "$1"
     BK_STUB_SPEED_DIR=/srv/speedup BK_STUB_LTE_DEV=eth3 sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err"
 }
 ctr() { echo "$3" > "/tmp/fakeroot/sys/class/net/$1/statistics/$2"; }
@@ -368,37 +390,45 @@ done; done
 # for an hour and a second run would only read the cache back.
 stub_on ethtool
 fresh
+pl wpath1
 BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath1.json 2> $OUT/wpath1.err
 fresh
 # A driver whose MIB carries neither counter name: null, never 0.
+pl wpath2
 BK_STUB_WAN=eth2 BK_STUB_ETHTOOL=other sh agent_openwrt.sh --dry-run > $OUT/wpath2.json 2> $OUT/wpath2.err
 fresh
 # Offloading configured off and really not in the kernel, and the uci label
 # that says "0" instead of being absent.
+pl wpath3
 BK_STUB_WAN=eth2 BK_STUB_UCI_FLOW=off BK_STUB_NFT=noflow BK_STUB_UCI_STEERING=0 \
     sh agent_openwrt.sh --dry-run > $OUT/wpath3.json 2> $OUT/wpath3.err
 fresh
 # Nothing installed: no nft, no tc, no ethtool. Every one of them is a null.
 stub_off nft tc ethtool
+pl wpath4
 BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath4.json 2> $OUT/wpath4.err
 stub_on nft tc
 fresh
 # A router with no SQM configuration at all: "not installed" is not "off".
 mv /etc/config/sqm /etc/config/sqm.off
+pl wpath5
 BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath5.json 2> $OUT/wpath5.err
 mv /etc/config/sqm.off /etc/config/sqm
 fresh
 # No ubus answer at all: the LAN side is unknown, not empty.
+pl wpath6
 ( export BK_STUB_NO_WAN=1; sh agent_openwrt.sh --dry-run > $OUT/wpath6.json 2> $OUT/wpath6.err )
 fresh
 # Both gigabit cables are out: the fastest port LINKED is lan1 at 100, and
 # every port still supports 1000. A cap read off a negotiated rate cannot tell
 # the two apart.
+pl wpath7
 BK_STUB_WAN=eth2 BK_STUB_UBUS_DEV=lan1only sh agent_openwrt.sh --dry-run > $OUT/wpath7.json 2> $OUT/wpath7.err
 fresh
 # The owner's file with its WAN queue switched off as well: a section that
 # names the very port the traffic takes, and is disabled. "Configured once"
 # is not "shaping now", so nothing may be reported for it.
+pl wpath8
 BK_STUB_WAN=eth2 BK_STUB_SQM=off sh agent_openwrt.sh --dry-run > $OUT/wpath8.json 2> $OUT/wpath8.err
 fresh
 
@@ -414,12 +444,15 @@ fresh
 #           would say "no devices anywhere", which is a different claim.
 #   wport3  ubus answers nothing at all: null again, and lan_port_cap too.
 fresh
+pl wport1
 BK_STUB_FDB=empty sh agent_openwrt.sh --dry-run > $OUT/wport1.json 2> $OUT/wport1.err
 fresh
 stub_off bridge
+pl wport2
 sh agent_openwrt.sh --dry-run > $OUT/wport2.json 2> $OUT/wport2.err
 stub_on bridge
 fresh
+pl wport3
 ( export BK_STUB_NO_WAN=1; sh agent_openwrt.sh --dry-run > $OUT/wport3.json 2> $OUT/wport3.err )
 fresh
 
@@ -429,13 +462,16 @@ fresh
 # are three different answers, and not one of them may come from
 # /etc/init.d/firewall - which says the service MAY start and answers
 # "enabled" in all three.
+pl wfw1
 BK_STUB_NFT=foreign sh agent_openwrt.sh --dry-run > $OUT/wfw1.json 2> $OUT/wfw1.err
 fresh
+pl wfw2
 BK_STUB_NFT=empty sh agent_openwrt.sh --dry-run > $OUT/wfw2.json 2> $OUT/wfw2.err
 fresh
 # Neither nft nor iptables: unknown, not "off". The image has no iptables
 # applet at all, which is what a router without the compat layer looks like.
 stub_off nft
+pl wfw3
 sh agent_openwrt.sh --dry-run > $OUT/wfw3.json 2> $OUT/wfw3.err
 stub_on nft
 fresh
@@ -446,10 +482,12 @@ fresh
 # a latency - and then there is no resolver client at all.
 # wdns1 also has an nft too old for -t: the agent lists the ruleset again
 # without it, and the firewall answers must be the payload runs' answers.
+pl wdns1
 BK_STUB_DNS=fail BK_STUB_NFT_NOTERSE=1 sh agent_openwrt.sh --dry-run > $OUT/wdns1.json 2> $OUT/wdns1.err
 fresh
 stub_off nslookup
 mv /bin/nslookup /bin/nslookup.off
+pl wdns3
 sh agent_openwrt.sh --dry-run > $OUT/wdns3.json 2> $OUT/wdns3.err
 mv /bin/nslookup.off /bin/nslookup
 stub_on nslookup
@@ -462,28 +500,35 @@ sleep 300 &
 _busy=$!
 mkdir -p "$PRIV/run.lock"
 echo "$_busy" > "$PRIV/run.lock/pid"
+pl -wrun1
 sh agent_openwrt.sh --dry-run > $OUT/wrun1.json 2> $OUT/wrun1.err
 kill "$_busy" 2>/dev/null || true
 rm -rf "$PRIV/run.lock"
 # A POST that never arrives (line 1 of the canned answer is 000); the agent
 # exits non-zero, which is correct here and must not stop the harness.
 resp 000 ''
+pl wrun2
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wrun2.json 2> $OUT/wrun2.err || true
 # The report the server takes carries both counters - and afterwards they are
 # dealt with, so the next one is back to a measured zero.
 resp 200 '{"status":"ok"}'
+pl wrun3
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wrun3.json 2> $OUT/wrun3.err
+pl wrun4
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wrun4.json 2> $OUT/wrun4.err
 fresh
 # The run's own length. logread (one call per run, between the two uptime
 # reads) moves the fake router's uptime 4.20 s forward, so the answer is
 # exactly 4200 ms; the run after it reports the same number as the PREVIOUS
 # run's total, which the EXIT trap wrote after the POST.
+pl wrun5
 BK_STUB_UPTIME_BUMP=1 sh agent_openwrt.sh --dry-run > $OUT/wrun5.json 2> $OUT/wrun5.err
+pl wrun6
 sh agent_openwrt.sh --dry-run > $OUT/wrun6.json 2> $OUT/wrun6.err
 fresh
 # No uptime to read: the run cannot time itself and says so.
 mv /tmp/fakeroot/proc/uptime /tmp/fakeroot/proc/uptime.off
+pl wrun7
 sh agent_openwrt.sh --dry-run > $OUT/wrun7.json 2> $OUT/wrun7.err
 mv /tmp/fakeroot/proc/uptime.off /tmp/fakeroot/proc/uptime
 fresh
@@ -535,24 +580,30 @@ mkholder() { # -> H (a shell that execs sleep) and C, its child
 fresh
 mkholder
 set -- $(pstat "$H"); plant "$H" "$2" 400
+pl wtake1
 sh agent_openwrt.sh --dry-run > $OUT/wtake1.json 2> $OUT/wtake1.err
 echo "holder=$(pstat "$H") child=$(pstat "$C")" > $OUT/wtake1_procs.txt
 if [ -d "$PRIV/run.lock" ]; then echo yes; else echo no; fi > $OUT/wtake1_lock.txt
 kill -9 "$H" "$C" 2>/dev/null || true
 resp 200 '{"status":"ok"}'
+pl wtake1b
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wtake1b.json 2> $OUT/wtake1b.err
+pl wtake1c
 sh agent_openwrt.sh --dry-run > $OUT/wtake1c.json 2> $OUT/wtake1c.err
 fresh
 mkholder
 set -- $(pstat "$H"); plant "$H" "$2" 30
+pl -wtake2
 sh agent_openwrt.sh --dry-run > $OUT/wtake2.json 2> $OUT/wtake2.err
 echo "holder=$(pstat "$H" | cut -c1) child=$(pstat "$C" | cut -c1)" > $OUT/wtake2_procs.txt
 kill -9 "$H" "$C" 2>/dev/null || true
 rm -rf "$PRIV/run.lock"
+pl wtake2b
 sh agent_openwrt.sh --dry-run > $OUT/wtake2b.json 2> $OUT/wtake2b.err
 fresh
 mkholder
 set -- $(pstat "$H"); plant "$H" "$(( $2 + 7 ))" 400
+pl wtake3
 sh agent_openwrt.sh --dry-run > $OUT/wtake3.json 2> $OUT/wtake3.err
 echo "holder=$(pstat "$H" | cut -c1) child=$(pstat "$C" | cut -c1)" > $OUT/wtake3_procs.txt
 kill -9 "$H" "$C" 2>/dev/null || true
@@ -563,11 +614,13 @@ sh -c 'sleep 0.1 & exec sleep 1002' &
 ZP=$!; Z=""; _n=0; _cp=$ZP; _cst=Z
 while [ -z "$Z" ] && [ $_n -lt 50 ]; do sleep 0.1; Z=$(child_of); _n=$((_n + 1)); done
 set -- $(pstat "$Z"); plant "$Z" "$2" 400
+pl wtake4
 sh agent_openwrt.sh --dry-run > $OUT/wtake4.json 2> $OUT/wtake4.err
 echo "zombie=$(pstat "$Z" | cut -c1)" > $OUT/wtake4_procs.txt
 kill -9 "$ZP" 2>/dev/null || true
 fresh
 set -- $(pstat 1); plant 1 "$2" 400
+pl -wtake5
 sh agent_openwrt.sh --dry-run > $OUT/wtake5.json 2> $OUT/wtake5.err
 { cat "$PRIV/run.lock/pid"; cat "$PRIV/skipped"; } > $OUT/wtake5_lock.txt 2>/dev/null || true
 if [ -e "$PRIV/run.lock/killed" ]; then echo yes; else echo no; fi > $OUT/wtake5_killed.txt
@@ -593,6 +646,7 @@ held() { # until the held run has reached its df
     _n=0; while [ -f /tmp/df.hold ] && [ $_n -lt 600 ]; do sleep 0.1; _n=$((_n + 1)); done
 }
 fresh
+pl wtake6a
 sh agent_openwrt.sh --dry-run > $OUT/wtake6a.json 2> $OUT/wtake6a.err
 { cat "$PRIV/run.total"; cat "$PRIV/run.cpu"; } > $OUT/wtake6a_files.txt 2>/dev/null || true
 touch /tmp/df.hold
@@ -601,11 +655,13 @@ W=$!
 held
 read -r _ws _wst < "$PRIV/run.lock/info" || true
 echo "$(( $(upcs) - 40000 )) $_wst" > "$PRIV/run.lock/info"
+pl wtake6
 sh agent_openwrt.sh --dry-run > $OUT/wtake6.json 2> $OUT/wtake6.err
 wait "$W" 2>/dev/null || true
 echo "wedged=$(pstat "$W")" > $OUT/wtake6_procs.txt
 fresh
 touch /tmp/df.hold
+pl wtake7
 BK_STUB_DF_HOLD=/tmp/df.hold BK_STUB_DF_HOLD_S=5 sh agent_openwrt.sh --dry-run > $OUT/wtake7.json 2> $OUT/wtake7.err &
 W=$!
 held
@@ -622,6 +678,7 @@ D8=$!
 wait "$D8" || true
 plant "$D8" 1 400
 : > "$PRIV/run.lock/killed"
+pl wtake8
 sh agent_openwrt.sh --dry-run > $OUT/wtake8.json 2> $OUT/wtake8.err
 if [ -d "$PRIV/run.lock" ]; then echo yes; else echo no; fi > $OUT/wtake8_lock.txt
 fresh
@@ -638,6 +695,7 @@ awk 'BEGIN { for (i = 0; i < 25000; i++) print "l" }' > "$PRIV/skipped"
 ( _i=0; while [ $_i -lt 200 ]; do printf 'l\n' >> "$PRIV/skipped"; _i=$((_i + 1)); done ) &
 _app=$!
 resp 000 ''
+pl wskip1
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wskip1.json 2> $OUT/wskip1.err || true
 wait "$_app" || true
 cat "$PRIV/skipped.total" > $OUT/wskip1_total.txt 2>/dev/null || true
@@ -646,9 +704,12 @@ if [ -s "$PRIV/skipped.fold" ]; then echo yes; else echo no; fi > $OUT/wskip1_fo
 fresh
 printf '99999 100000 7\n' > "$PRIV/skipped.total"
 printf 'l\nl\nl\np\n' > "$PRIV/skipped"
+pl wskip2
 sh agent_openwrt.sh --dry-run > $OUT/wskip2.json 2> $OUT/wskip2.err
 resp 200 '{"status":"ok"}'
+pl wskip2b
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wskip2b.json 2> $OUT/wskip2b.err
+pl wskip2c
 sh agent_openwrt.sh --dry-run > $OUT/wskip2c.json 2> $OUT/wskip2c.err
 fresh
 
@@ -658,13 +719,16 @@ fresh
 # (wlp1), an accepted one removes it (wlp2), and the owner's flag file keeps
 # it on every run (wlp3).
 resp 000 ''
+pl wlp1
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlp1.json 2> $OUT/wlp1.err || true
 ls -l "$PRIV/last-payload.json" 2>/dev/null | cut -c1-10 > $OUT/wlp1_mode.txt
 cp "$PRIV/last-payload.json" $OUT/wlp1_last.json 2>/dev/null || true
 resp 200 '{"status":"ok"}'
+pl wlp2
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlp2.json 2> $OUT/wlp2.err
 if [ -e "$PRIV/last-payload.json" ]; then echo yes; else echo no; fi > $OUT/wlp2_file.txt
 touch "$PRIV/last-payload.on"
+pl wlp3
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlp3.json 2> $OUT/wlp3.err
 cp "$PRIV/last-payload.json" $OUT/wlp3_last.json 2>/dev/null || true
 fresh
@@ -676,8 +740,11 @@ fresh
 # reaches its POST 0, 40 and 50 s late. The seam stands in for the POST, and
 # the answer asks for one service check.
 resp 200 '{"status":"ok","service_checks":[{"monitor_id":7,"process":"dnsmasq","port":53}]}'
+pl wdl0
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl0.json 2> $OUT/wdl0.err
+pl wdl1
 BK_STUB_UPTIME_ADD=40 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl1.json 2> $OUT/wdl1.err
+pl wdl2
 BK_STUB_UPTIME_ADD=50 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl2.json 2> $OUT/wdl2.err
 fresh
 
@@ -812,9 +879,11 @@ reset_upd() {
     cp agent_openwrt.sh "$UPD/agent_openwrt.sh"
     echo "AUTO_UPDATE=1" > "$UPD/agent_openwrt.cfg"
 }
-urun() { # TAG: one cron-like run of the copy; what it left is filed under TAG
+urun() { # TAG [-]: one cron-like run of the copy; what it left is filed under TAG
+    # (-: a run that rolls back and prints no payload)
     echo "# $1" >> $OUT/upd_curl.log
     _rc=0
+    pl "${2:+-}$1"
     ( cd "$UPD" && PATH="/tmp/curlbin:$PATH" STATUS_TEST_RESPONSE=/tmp/upd-resp.json STATUS_TEST_UPDATE=1 \
         sh "$UPD/agent_openwrt.sh" --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err" ) || _rc=$?
     echo "$_rc" > "$OUT/$1_rc.txt"
@@ -882,7 +951,8 @@ printf '000\n\n' > /tmp/upd-resp.json
 urun wprob1
 urun wprob2
 printf '400\n{"error":"Invalid JSON"}\n' > /tmp/upd-resp.json
-for _i in 3 4 5 6; do urun "wprob$_i"; done
+for _i in 3 4 5; do urun "wprob$_i"; done
+urun wprob6 -
 fresh
 offer good "$(usha good)" 9.9.9
 urun wprob7
@@ -928,7 +998,7 @@ offer good "$(usha good)" 9.9.9
 urun wlim0
 printf '9.9.9 %s 30 0\n' "$(usha good)" > "$PRIV/update.probation"
 printf '000\n\n' > /tmp/upd-resp.json
-urun wlim1
+urun wlim1 -
 fresh
 reset_upd
 offer good "$(usha good)" 9.9.9
@@ -936,7 +1006,8 @@ urun wreb0
 printf '400\n{"error":"Invalid JSON"}\n' > /tmp/upd-resp.json
 urun wreb1
 fresh
-for _i in 2 3 4 5; do urun "wreb$_i"; done
+for _i in 2 3 4; do urun "wreb$_i"; done
+urun wreb5 -
 rm -rf "$UPD" /srv/upd /tmp/curlbin /tmp/upd-resp.json
 fresh
 
@@ -948,10 +1019,12 @@ fresh
 # does not name that directory. The switch ports must still be the same as a
 # run with the full PATH (wcron0).
 fresh
+pl wcron0
 sh agent_openwrt.sh --dry-run > $OUT/wcron0.json 2> $OUT/wcron0.err
 fresh
 stub_off bridge
 cp /work/stubs/bridge.off /usr/sbin/bridge
+pl wcron
 PATH="/work/stubs/bin:/bin" sh agent_openwrt.sh --dry-run > $OUT/wcron.json 2> $OUT/wcron.err
 rm -f /usr/sbin/bridge
 stub_on bridge
@@ -987,6 +1060,7 @@ settle() {
 # (env execs it, no fork). A delta that went down wrapped at pid_max: "wrap",
 # and the check reads the other warm run.
 bud() {
+    pl "$1"
     read -r _x _x _x _x _bp0 < /proc/loadavg
     time -f '%U %S %M' -o $OUT/$1_time.txt env STATUS_TEST_RESPONSE=/tmp/wack-resp.json \
         sh agent_openwrt.sh --dry-run > $OUT/$1.json 2> $OUT/$1.err
@@ -996,6 +1070,7 @@ bud() {
 # busybox `time` prints %M as ru_maxrss * page size / 1024, and ru_maxrss is
 # in kB already: the checks divide by the page size in kB, read here.
 awk '/^KernelPageSize:/ { print $2; exit }' /proc/self/smaps > $OUT/wbud_pagekb.txt
+pl wbud0
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud0.json 2> $OUT/wbud0.err
 settle
 bud wbud1
@@ -1011,6 +1086,7 @@ done > $OUT/wbud_priv.txt
 # it does not carry the busybox text, whose size depends on the CPU the image
 # was built for. A sample misses a peak shorter than 20 ms, so this is a
 # floor of the real peak: it can let a spike through, never fail a good run.
+pl wbud6
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud6.json 2> $OUT/wbud6.err &
 _bud=$!
 _ban=0; _bhwm=""; _bn=0
@@ -1030,6 +1106,7 @@ mkdir -p /tmp/hangbin
 printf '#!/bin/sh\necho $$ > /tmp/hang.pid\nexec sleep 60\n' > /tmp/hangbin/wg
 chmod +x /tmp/hangbin/wg
 rm -f /tmp/hang.pid
+pl -wbud3
 PATH="/tmp/hangbin:$PATH" STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud3.json 2> $OUT/wbud3.err &
 _bud=$!
 _st=0
@@ -1040,10 +1117,12 @@ kill -9 "$_bud" 2>/dev/null || true
 kill "$(cat /tmp/hang.pid 2>/dev/null)" 2>/dev/null || true
 wait "$_bud" 2>/dev/null || true
 rm -rf /tmp/hangbin /tmp/hang.pid
+pl wbud4
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud4.json 2> $OUT/wbud4.err
 # wbud4 left its CPU in run.cpu; an older version is what the stamp says now.
 cp "$PRIV/run.cpu" $OUT/wbud4_runcpu.txt 2>/dev/null || true
 echo "0.0.0-old" > /tmp/status-agent-openwrt-version.stamp
+pl wbud5
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wbud5.json 2> $OUT/wbud5.err
 fresh
 
@@ -1070,35 +1149,44 @@ BK_LOG_OFF=/root/agent/agent_openwrt.loglines-off
 rm -f "$BK_LOG_OFF" $OUT/logread_now.log
 fresh
 # The stub notes its clock in logread_now.log; each run's note is kept.
+pl wlog1
 BK_STUB_LOG=pii sh agent_openwrt.sh --dry-run > $OUT/wlog1.json 2> $OUT/wlog1.err
 mv $OUT/logread_now.log $OUT/wlog1_now.txt
 cp "$PRIV/last-payload.json" $OUT/wlog1_last.json 2>/dev/null || true
 fresh
+pl wlog2
 TZ=CET-1CEST,M3.5.0,M10.5.0/3 BK_STUB_LOG=formats sh agent_openwrt.sh --dry-run > $OUT/wlog2.json 2> $OUT/wlog2.err
 mv $OUT/logread_now.log $OUT/wlog2_now.txt
 fresh
 echo "LOG_LINES_ENABLED=0" > /root/agent/agent_openwrt.cfg
+pl wlog3
 BK_STUB_LOG=pii sh agent_openwrt.sh --dry-run > $OUT/wlog3.json 2> $OUT/wlog3.err
 rm -f /root/agent/agent_openwrt.cfg
 fresh
 resp 200 '{"status":"ok","log_lines":false}'
+pl wlog4
 BK_STUB_LOG=pii STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlog4.json 2> $OUT/wlog4.err
 if [ -f "$BK_LOG_OFF" ]; then echo yes; else echo no; fi > $OUT/wlog4_flag.txt
 fresh
 resp 200 '{"status":"ok"}'
+pl wlog5
 BK_STUB_LOG=pii STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlog5.json 2> $OUT/wlog5.err
 if [ -f "$BK_LOG_OFF" ]; then echo yes; else echo no; fi > $OUT/wlog5_flag.txt
 resp 200 '{"status":"ok", "log_lines": true}'
+pl wlog6
 BK_STUB_LOG=pii STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlog6.json 2> $OUT/wlog6.err
 if [ -f "$BK_LOG_OFF" ]; then echo yes; else echo no; fi > $OUT/wlog6_flag.txt
+pl wlog7
 BK_STUB_LOG=pii sh agent_openwrt.sh --dry-run > $OUT/wlog7.json 2> $OUT/wlog7.err
 fresh
 # busybox's own logread applet answers nothing without its syslogd.
 stub_off logread
+pl wlog8
 sh agent_openwrt.sh --dry-run > $OUT/wlog8.json 2> $OUT/wlog8.err
 stub_on logread
 fresh
 rm -f $OUT/logread_now.log
+pl wlog9
 BK_STUB_LOG=cut sh agent_openwrt.sh --dry-run > $OUT/wlog9.json 2> $OUT/wlog9.err
 mv $OUT/logread_now.log $OUT/wlog9_now.txt
 rm -f "$BK_LOG_OFF" $OUT/logread_now.log
@@ -1110,6 +1198,7 @@ fresh
 # still be there for the next real report, and nothing of its own written.
 fresh
 echo 1234 > "$PRIV/run.cpu"; echo 5678 > "$PRIV/run.total"
+pl wdry
 STATUS_TEST_TTY=1 sh agent_openwrt.sh --dry-run > $OUT/wdry.json 2> $OUT/wdry.err
 { cat "$PRIV/run.cpu"; cat "$PRIV/run.total"; } > $OUT/wdry_cost.txt 2>/dev/null
 [ -d "$PRIV/run.lock" ] && echo yes > $OUT/wdry_lock.txt || echo no > $OUT/wdry_lock.txt
