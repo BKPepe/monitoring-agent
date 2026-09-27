@@ -106,7 +106,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.3"
+AGENT_VERSION="0.1.4"
 LOG_FILE="$ScriptPath/agent.log"
 # One state file for every between-run delta (CPU, disk I/O, network, forks,
 # TS3 CPU), written once per run next to the script. It used to be four files,
@@ -1785,4 +1785,4 @@ if [ "$AUTO_UPDATE" = "1" ]; then
 fi
 
 log_message "Hotovo."
-# bk-agent-end 0.1.3
+# bk-agent-end 0.1.4

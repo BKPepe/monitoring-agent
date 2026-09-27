@@ -99,7 +99,7 @@ if os.path.exists(cfg_path):
     except Exception:
         pass
 
-AGENT_VERSION = "0.1.2"
+AGENT_VERSION = "0.1.3"
 
 # --selfcheck: the updater runs a freshly downloaded copy this way before it
 # replaces the running agent (see self_update). It is the whole collection of
@@ -2149,4 +2149,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# bk-agent-end 0.1.2
+# bk-agent-end 0.1.3

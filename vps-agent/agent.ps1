@@ -9,7 +9,7 @@ param(
     [switch]$SelfCheck
 )
 
-$AGENT_VERSION = "0.1.0"
+$AGENT_VERSION = "0.1.1"
 
 # -SelfCheck is the self-update's behaviour gate: before a downloaded copy may
 # replace this file, the updater runs it with -SelfCheck, and it has to collect,
@@ -1118,4 +1118,4 @@ if ($AUTO_UPDATE -eq "1" -and $response -and $response.update_available -eq $tru
 Write-AgentLog "Hotovo."
 # The updater requires this to be the file's last line (Test-AgentSentinel).
 # It carries the same version as $AGENT_VERSION; bump both together.
-# bk-agent-end 0.1.0
+# bk-agent-end 0.1.1
