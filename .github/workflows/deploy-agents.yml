@@ -26,7 +26,14 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The same checks a pull request gets (test.yml). A file that does not
+  # parse, fails its harness or ends without its sentinel line is never
+  # uploaded: every self-updating agent would fetch it within the hour.
+  test:
+    uses: ./.github/workflows/test.yml
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

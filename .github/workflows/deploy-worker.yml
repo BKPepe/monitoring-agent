@@ -17,8 +17,14 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The repo's whole test gate (test.yml), not only the Worker's units below:
+  # this deploy runs on every push to main.
+  test:
+    uses: ./.github/workflows/test.yml
+
   deploy:
     name: Deploy Worker
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 5
 

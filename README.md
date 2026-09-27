@@ -57,6 +57,91 @@ admin panel. See `apps/status/README.md` for full installation instructions for
 each variant, and the "Self-Updates" section for how the opt-in auto-update flow
 (checksum-verified, atomic replace) works across all four.
 
+### Self-update and remote actions: the rules all four agents share
+
+A release reaches every self-updating agent within minutes, so the updater
+checks the file itself, not only how it arrived, before it replaces anything.
+In this order:
+
+1. **Forward only.** The offered `latest_version` must be plain dotted digits
+   and strictly newer than the running `AGENT_VERSION`. Anything else is
+   skipped quietly: a reverted or duplicate deploy no longer downgrades the
+   fleet. A rollback on purpose is a new, higher version.
+2. **sha256** of the download equals the server's `update_sha256`, as before.
+3. **End line.** The last line of the file must be exactly
+   `# bk-agent-end <offered version>`. A download cut short can still parse
+   (a truncated OpenWrt agent did, and installed itself), but it cannot end
+   with this line.
+4. **Parse:** `bash -n`, `sh -n`, `py_compile`, PowerShell's parser.
+5. **Self-check.** The download is run with `--selfcheck` (`-SelfCheck` in
+   PowerShell) and `BK_UPDATE_SELFCHECK=1`, under a time limit. It must exit 0
+   and print one JSON object whose `agent_type` is this agent's and whose
+   `agent_version` is the offered version. Without the variable the flag
+   exits 2 and does nothing else, so it cannot turn an installed agent into
+   one that quietly stopped reporting. `agent.sh`, `agent.py` and `agent.ps1`
+   collect and build their payload in it (state writes off, nothing sent;
+   `agent.ps1` allows 60 s for Windows PowerShell and CIM; `agent.sh` hands
+   it a copy of its SMART/discovery cache, so slow disks cannot use up the
+   minute); the OpenWrt agent answers with its identity only, because a full
+   collection needs its run lock.
+6. **Room, flush, swap.** The new file is written in the script's own
+   directory (free space checked first; `agent.ps1` wants twice its own
+   size) and flushed to disk. The old file is kept as `<script>.prev`, and a rename in the same
+   directory puts the new one in place. On Windows this is `ReplaceFile`,
+   which also keeps the old file's ACL on the new one.
+
+A refusal at any step leaves the running script byte-identical. A file
+refused for what its bytes are (end line, parse, self-check) is not fetched
+again for 24 hours. A sha mismatch is retried on the next run.
+
+**Probation and rollback.** The updater writes a probation marker just before
+the swap. Every run of the new version counts. Its first report the server
+accepts (HTTP 2xx) writes the last-ok stamp (`<version> <unix time>`) and
+ends the probation. If the server refused (HTTP 4xx) three of the new
+version's reports, or 30 runs passed without one accepted, the next run puts
+`.prev` back and exits. That file is not taken again for 24 hours; a fixed
+file published under the same version has another sha256 and is taken at
+once. A network outage alone does not roll back after a few minutes. A
+marker naming another version than the running one (a swap undone by hand) is
+dropped. `agent.ps1` keeps this state next to itself as `agent.ps1.prev`,
+`.probation` (JSON), `.last-ok`, `.rejected` and `.nonces`; `agent.sh` and
+`agent.py` keep similar files next to the script (their header comments list
+them), and the OpenWrt agent keeps them in its private directory (tmpfs),
+plus a one-line `agent_openwrt.sh.probation` next to `.prev` on the flash:
+a reboot inside the probation restarts the count instead of ending it.
+
+**Remote actions**, whatever the agent:
+
+- `action_id` and `timestamp` must be 1 to 18 ASCII digits before either is
+  used. Anything else is ignored and not answered, and the rest of the run
+  goes on. In `agent.sh` the timestamp reached shell arithmetic before the
+  signature was checked, where it could run a command (SEC-01). A leading
+  zero is no number the server writes: the OpenWrt agent refuses it (ash
+  reads `089` as a broken octal number and ended the run), `agent.sh` reads
+  it as decimal.
+- Then the 30 s time window, then the HMAC. Only a correctly signed action is
+  checked further, so an unsigned answer learns nothing about the allow-list.
+- Single use: the nonce is remembered for 60 s, the whole time a timestamp
+  can be valid, and is stored before the action runs. An action whose nonce
+  cannot be stored is refused.
+- `ALLOWED_ACTIONS` is enforced, then the service name of `restart_service`
+  must match `^[A-Za-z0-9_][A-Za-z0-9_.@$-]{0,127}$`: a letter, digit or `_`
+  first (no option injection, no `..`), no path separator, no space and none
+  of `* ? [ ]` (`Restart-Service -Name *` restarts everything); `$` is there
+  for Windows instance names such as `MSSQL$SQLEXPRESS`, `@` for systemd
+  templates. `agent.ps1` used to accept a space, which this rule refuses.
+  `agent.sh` and `agent.py` also refuse a systemd unit of another type
+  (`.target`, `.mount`, `.socket`, `.timer` and the like): `restart_service`
+  restarts a service, and `poweroff.target` is not one.
+
+A refused action is reported to the dashboard as failed, with the reason.
+
+**Releasing.** Bump `AGENT_VERSION` and the file's last line together; CI
+(`test.yml`) fails a push where they differ. The first release built from
+this code is the first one carrying the end line: agents already in the field
+do not look for it and take that release like any other, and from then on
+every agent accepts only files that have it.
+
 ### Optional packages on OpenWrt, and what each one unlocks
 
 The OpenWrt agent runs on a stock image and asks for nothing. Three packages
@@ -673,8 +758,9 @@ a refused one is reported to the dashboard as failed, with the reason:
   `ALLOWED_ACTIONS=restart_wan,renew_dhcp`.
 - A signed answer is single-use: its nonce is remembered for 60 s, the whole
   time its timestamp can be valid.
-- `restart_service` takes a plain init script name (`[A-Za-z0-9_.-]`, no
-  leading dot), never a path.
+- `restart_service` takes a plain init script name under the service-name
+  rule all agents share (see "Self-update and remote actions" above), never
+  a path.
 
 ### Deployment (self-deploy to the dashboard hosting)
 
@@ -690,6 +776,11 @@ secrets the `monitoring` repo uses under **Settings â†’ Secrets and variables â†
 Actions**. The workflow fails loudly when they're missing instead of
 pretending it deployed.
 
+Both deploys from this repo, `deploy-agents.yml` and `deploy-worker.yml`, first
+call `.github/workflows/test.yml` and upload nothing unless it passed
+(`needs: test`). Pull requests and pushes to other branches run the same
+workflow on their own. See "Testing" below.
+
 ## Testing
 
 `tests/` runs every agent for real, not just through a parser: `agent.sh` and
@@ -702,7 +793,15 @@ parsers reading the right columns. Needs docker and python3:
 ```bash
 bash tests/run_linux_e2e.sh
 bash tests/run_openwrt_e2e.sh
+bash tests/run_windows_e2e.sh   # agent.ps1 in PowerShell 7 against a mock API
 ```
+
+The same three run in CI (`.github/workflows/test.yml`), next to the syntax
+of all four agents, ShellCheck on the two shell agents, the end-line check,
+the Worker's unit tests, and a `windows-latest` job that runs `agent.ps1
+-SelfCheck` and `-DryRun` under Windows PowerShell 5.1, the engine the
+scheduled task uses. `tests/README.md` lists what each harness covers and
+what it cannot.
 
 Every agent also supports `--dry-run` (PowerShell: `-DryRun`): it collects
 everything and prints the payload instead of sending it, no key needed - the

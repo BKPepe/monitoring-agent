@@ -1,0 +1,156 @@
+# The gate in front of every deploy from this repo (TST-01).
+#
+# Until now nothing in this repo ran before an upload: a push to main went
+# straight to the hosting, and every self-updating agent in the field fetched
+# whatever had just been uploaded - a file that did not parse, sent a payload
+# the server refused or stopped half way would have reached the whole fleet.
+# deploy-agents.yml and deploy-worker.yml call this workflow and `needs:` it,
+# so a red run here stops the upload. Pull requests and pushes to other
+# branches run it on their own.
+#
+# On main it runs once per calling deploy: a push that changes an agent runs
+# it twice (deploy-agents and deploy-worker each call it). That is the price
+# of each deploy carrying its own gate.
+name: Test agents
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Seconds, no Docker: syntax of all four agents, ShellCheck, the end-of-file
+  # sentinel, the Worker's unit tests.
+  lint:
+    name: Syntax, ShellCheck, sentinel, Worker units
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Each agent under the parser that matters for it: bash for agent.sh,
+      # dash (POSIX, close to busybox ash) for the OpenWrt agent, the Python
+      # compiler, and PowerShell's own parser.
+      - name: Syntax of all four agents
+        run: |
+          set -e
+          bash -n vps-agent/agent.sh
+          dash -n vps-agent/agent_openwrt.sh
+          python3 -m py_compile vps-agent/agent.py
+      - name: Syntax of agent.ps1 (PowerShell parser)
+        shell: pwsh
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path vps-agent/agent.ps1), [ref]$null, [ref]$errs)
+          if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Host "::error::agent.ps1: $_" }; exit 1 }
+
+      # A real run: the two shell agents by name, and a list that ever
+      # matches fewer files fails instead of passing on nothing (TST-02 - the
+      # monitoring repo's ShellCheck step checked no file at all). Pinned by
+      # digest: the runner image's own shellcheck changes with the image and
+      # could turn this red without a change here. Both agents are clean at
+      # warning level with 0.11.0.
+      - name: ShellCheck the shell agents
+        run: |
+          set -e
+          files=(vps-agent/agent.sh vps-agent/agent_openwrt.sh)
+          n=0
+          for f in "${files[@]}"; do
+            test -s "$f" || { echo "::error::$f is missing or empty"; exit 1; }
+            n=$((n + 1))
+          done
+          test "$n" -eq 2
+          img="koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d"
+          docker run --rm -v "$PWD:/mnt:ro" "$img" --version
+          docker run --rm -v "$PWD:/mnt:ro" "$img" -S warning "${files[@]}"
+
+      # The self-update of every agent refuses a download whose last line is
+      # not "# bk-agent-end <offered version>" (W1-B). A release whose
+      # sentinel and AGENT_VERSION disagree would be refused by the whole
+      # fleet, so they are compared here, before it is uploaded.
+      - name: Sentinel matches AGENT_VERSION
+        run: |
+          set -e
+          fail=0
+          for f in agent.sh agent.py agent.ps1 agent_openwrt.sh; do
+            p="vps-agent/$f"
+            v=$(sed -n 's/^\$\{0,1\}AGENT_VERSION *= *"\([^"]*\)".*/\1/p' "$p" | head -n 1)
+            last=$(tail -n 1 "$p" | tr -d '\r')
+            if [ -z "$v" ] || [ "$last" != "# bk-agent-end $v" ]; then
+              echo "::error file=$p::last line must be '# bk-agent-end $v', is '$last'"
+              fail=1
+            else
+              echo "$f: $v"
+            fi
+          done
+          exit $fail
+
+      # Windows PowerShell 5.1 reads a BOM-less script as ANSI and garbles
+      # every Czech message the agent sends.
+      - name: agent.ps1 keeps its UTF-8 BOM
+        run: test "$(head -c 3 vps-agent/agent.ps1 | od -An -tx1 | tr -d ' \n')" = "efbbbf"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Worker unit tests
+        run: node --test tests/*.test.mjs
+
+  # The agents run for real in containers, each against its harness. One job,
+  # three steps: the account shares 20 concurrent jobs with the OpenWrt
+  # builds, and these are minutes, not hours.
+  e2e:
+    name: End to end (Linux, OpenWrt, PowerShell)
+    runs-on: ubuntu-latest
+    # About 20 minutes on a laptop (the OpenWrt harness alone is ~9).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: agent.sh + agent.py (Debian)
+        run: bash tests/run_linux_e2e.sh
+      - name: agent_openwrt.sh (busybox, stubbed router)
+        run: bash tests/run_openwrt_e2e.sh
+      - name: agent.ps1 (PowerShell 7, mock API)
+        run: bash tests/run_windows_e2e.sh
+
+  # The engine the scheduled task actually runs. The container job above is
+  # pwsh 7 on Linux; this one runs agent.ps1 under Windows PowerShell 5.1 with
+  # real CIM: its -SelfCheck (the whole collection plus the payload, what the
+  # updater requires of a new file) and a -DryRun.
+  windows-ps51:
+    name: agent.ps1 under Windows PowerShell 5.1
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse, -SelfCheck and -DryRun
+        shell: powershell
+        run: |
+          # The runner starts this step with 'Stop'; under 5.1 a single line a
+          # child writes to stderr would then end the step even with exit 0.
+          # Every outcome below is checked by exit code and output instead.
+          $ErrorActionPreference = "Continue"
+          $PSVersionTable.PSVersion.ToString()
+          $agent = Join-Path $PWD "vps-agent\agent.ps1"
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile($agent, [ref]$null, [ref]$errs)
+          if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Host "::error::agent.ps1: $_" }; exit 1 }
+
+          $env:BK_UPDATE_SELFCHECK = "1"
+          $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $agent -SelfCheck
+          $code = $LASTEXITCODE
+          Remove-Item Env:BK_UPDATE_SELFCHECK
+          $text = ($out | Out-String).Trim()
+          Write-Host "self-check (exit $code): $text"
+          if ($code -ne 0) { exit 1 }
+          $j = $text | ConvertFrom-Json
+          $v = [regex]::Match((Get-Content -Raw $agent), '(?m)^\$AGENT_VERSION = "([^"]+)"').Groups[1].Value
+          if ($j.agent_type -ne "powershell" -or $j.agent_version -ne $v) { Write-Host "::error::self-check did not name powershell $v"; exit 1 }
+
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $agent -DryRun
+          if ($LASTEXITCODE -ne 0) { exit 1 }

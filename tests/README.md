@@ -7,9 +7,10 @@ second, parsers reading the right columns.
 
 | Script | What runs | Needs |
 | --- | --- | --- |
-| `run_linux_e2e.sh` | `agent.sh` and `agent.py` in Debian (real `/proc`, real `ps`), twice, the second run under load, against a stand-in TeamSpeak ServerQuery on 10011 (`linux/fake_ts3.py`) - and once more with `python3` made unusable, so the bash agent's `nc` transport is exercised too | docker, python3 |
+| `run_linux_e2e.sh` | `agent.sh` and `agent.py` in Debian (real `/proc`, real `ps`), twice, the second run under load, against a stand-in TeamSpeak ServerQuery on 10011 (`linux/fake_ts3.py`) - and once more with `python3` made unusable, so the bash agent's `nc` transport is exercised too; a first run in cron's bare environment (`env -i PATH=/usr/bin:/bin`, a stub `/usr/sbin/zerotier-cli`) that must measure what an ordinary run measures; `agent.py`'s unit tests (`test_agent_py.py`); and the security cases (`linux/run-security-cases.sh` against `linux/fake_api.py`, asserted by `linux/assert_security.py`): non-numeric and leading-zero timestamps, bad service names and a systemd target, replayed and unstorable nonces, a bad signature, the `--selfcheck` gate, update refusals (sha, missing end line, truncated, failing self-check, older, same, no room) with the agent byte-identical, an update on a host whose disks hang (the self-check must use the warm SMART cache), a good update and the end of its probation, rollback after three refusals and after 30 silent runs | docker, python3 |
 | `cloudflare-agent.test.mjs` (`node --test tests/*.test.mjs`) | the Worker's cron and `/run` handlers against a stubbed `fetch`: the location it posts takes city and country from the colo, never from the trace's `loc` or the `/run` caller; runs before every Worker deploy | node 22+ |
-| `run_openwrt_e2e.sh` | `agent_openwrt.sh` in busybox (ash, busybox awk/sed) with canned `wg`, `mwan3`, `tc`, `uci`, `logread`, `iwinfo`, `hostapd_cli`, `iw`, `smartctl`, `df`, `nft`, `ubus`, `ping`, `openssl` from `openwrt-stubs/bin` and a fake `/sys` + `/proc` from `openwrt-stubs/mkroot.sh`; six payload runs, then the scenario and hardening runs on canned server answers | docker, python3 |
+| `run_openwrt_e2e.sh` | `agent_openwrt.sh` in busybox (ash, busybox awk/sed) with canned `wg`, `mwan3`, `tc`, `uci`, `logread`, `iwinfo`, `hostapd_cli`, `iw`, `smartctl`, `df`, `nft`, `ubus`, `ping`, `openssl` from `openwrt-stubs/bin` and a fake `/sys` + `/proc` from `openwrt-stubs/mkroot.sh`; six payload runs, then the scenario and hardening runs on canned server answers, including the self-update (end line, self-check, direction, swap, probation, rollback, a reboot inside the probation) and the remote-action gates | docker, python3 |
+| `run_windows_e2e.sh` | `agent.ps1` in PowerShell 7 (Linux container, `windows/`): parser, UTF-8 BOM, end line, PSScriptAnalyzer's Windows PowerShell 5.1 compatibility rules, unit tests of functions cut out of the agent's own syntax tree, then 40-odd agent runs against `windows/mock_api.ps1` - dry run, `-SelfCheck`, remote-action gates, self-update refusals, swap, probation and rollback | docker |
 
 The stub outputs are what the real tools print (`wg show all dump`,
 `mwan3 status`, `tc -s qdisc`, ...); when a tool changes its format, update the
@@ -243,8 +244,70 @@ targets (`/sbin/ifdown`, `/sbin/reboot`, `/etc/init.d/dnsmasq`, ...) are
 copies of `openwrt-stubs/action-target.sh` that only log the call. Without
 `--dry-run` the variable is ignored; one assertion greps the agent for that.
 
-`agent.ps1` has no runtime here - the monitoring repository's quality gate
-parses it with `pwsh`.
+### The PowerShell harness
+
+`run_windows_e2e.sh` builds a PowerShell 7 image with PSScriptAnalyzer
+(`windows/Dockerfile`; Ubuntu on x86_64, Azure Linux on arm64, where the
+Ubuntu image does not exist) and runs `windows/agent_ps1_tests.ps1` against a
+copy of `agent.ps1`. There is no seam in the agent: every run goes over real
+HTTP to `windows/mock_api.ps1` on 127.0.0.1, which answers reports with
+`response.txt` (line 1 = HTTP code, the rest = body), answers action results
+with `{}`, serves update files from `files/`, and logs every POST body and
+every download, so a test sees what the agent sent and whether it fetched
+anything at all. Each case runs in its own sandbox directory with its own
+`agent.cfg`.
+
+- **Remote actions.** `action_id` / `timestamp` that are not plain digits (a
+  command substitution, hex, an exponent, a trailing newline, letters, a minus)
+  get no answer and run nothing, and the run completes; bad service names
+  (`*`, a space, `-rf`, `..`, a newline) are refused, good ones (`MSSQL$SQLEXPRESS`,
+  `getty@tty1`) are restarted; the same signed answer twice restarts the
+  service once; a nonce store that cannot be written, a missing nonce, a bad
+  signature (no nonce burnt), an expired timestamp and an action off the list
+  are each refused. Linux pwsh has no `Get-Service`, so
+  `windows/stubs/BkWindowsStubs` stands in for `Get-Service` and
+  `Restart-Service` through module auto-loading and logs every restart:
+  that log is how "executed once" is counted. `reboot_server` is never
+  allowed in a test - `Restart-Computer` exists on Linux pwsh.
+- **Self-update.** Update files are made from the agent under test with
+  another version. Refused, each with the script byte-identical and no
+  `.prev`, marker or download left: a sha mismatch (retried next run), no end
+  line (not fetched again), a file cut in half that still parses, an end line
+  of another version, a self-check that throws, prints more than one object,
+  reports another version or hangs (killed at 60 s), exits but leaves a
+  process holding its stdout (refused after 5 s, not waited for), a file without
+  `-SelfCheck` (today's release), and an offered version that is older, equal
+  or not a version (never downloaded). Applied: the good file with LF and
+  with CRLF line ends, the old one kept as `.prev`, the marker written; the
+  first accepted report ends the probation. Rolled back: after three 4xx
+  answers, and at run 31 without an accepted report; the same sha is then
+  not taken again, a fixed file of the same version is.
+- **Not covered here:** Windows PowerShell 5.1 at run time (the CI job
+  `windows-ps51` runs `-SelfCheck` and `-DryRun` under it, nothing more), the
+  CIM/WMI metrics (null on Linux), NTFS ACLs of `C:\bloodkings` and what
+  `ReplaceFile` does on NTFS (.NET maps `File.Replace` to a rename on Linux),
+  and the free-space refusal (no way to fill a volume from the test).
+
+### CI
+
+`.github/workflows/test.yml` runs on pull requests, on pushes to branches
+other than `main`, and as the first job of both deploys (`needs: test` in
+`deploy-agents.yml` and `deploy-worker.yml`), so nothing is uploaded from a
+red run. Three jobs:
+
+- `lint`: `bash -n agent.sh`, `dash -n agent_openwrt.sh`, `py_compile
+  agent.py`, PowerShell's parser on `agent.ps1`; ShellCheck 0.11.0 (pinned
+  image) at warning level on exactly the two shell agents, both clean today
+  (fewer files found fails the step instead of passing on nothing); every
+  agent's last line equals `# bk-agent-end <AGENT_VERSION>`;
+  `agent.ps1` still starts with a UTF-8 BOM; `node --test tests/*.test.mjs`.
+- `e2e`: the three harnesses above, one after another in one job - the
+  account's 20 concurrent jobs are shared with the OpenWrt builds.
+- `windows-ps51`: `agent.ps1 -SelfCheck` and `-DryRun` on `windows-latest`
+  under Windows PowerShell 5.1, the engine the scheduled task runs.
+
+A push to `main` that changes an agent runs the workflow twice, once per
+deploy that calls it.
 
 The TeamSpeak stub earns its keep: that query had never been run by any test.
 The first run of it showed the bash agent asking over bash's socket redirection
