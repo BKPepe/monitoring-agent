@@ -121,7 +121,7 @@ wk1, wk2, wk3, wk4, wk5 = (payload(f"wwalk{n}") for n in range(1, 6))
 wack = [payload(f"wack{n}") for n in range(1, 7)]
 wactive = payload("wactive")
 wspeedfb, wspeed60, wspeedold = (payload(n) for n in ("wspeedfb", "wspeed60", "wspeedold"))
-wpath = [payload(f"wpath{n}") for n in range(1, 9)]
+wpath = [payload(f"wpath{n}") for n in range(1, 13)]
 wupl = {n: payload(f"wupl{n}") for n in (1, 3, 4, 6, 7)}
 # The gap runs of INDEX 5.1 step 7: what "the firewall is up" is read from
 # (G20), the DNS probe's exit status (G41), and the run's own clock together
@@ -199,6 +199,12 @@ def wan_keys(p, *keys):
 # WAN e2e #14: everything 0.1.7 adds to the minute report at the top level.
 # The softnet keys are LATER (X3), `cpu_core_max_system_pct` has no consumer
 # (X9), and the probe's own state and items are wave 2.
+# The port's MIB split and the SFP module in wan_path (0.1.13), in the order
+# the checks compare them.
+SPLIT_KEYS = ("rx_overrun", "rx_discard", "bad_crc_event", "mac_receive_error",
+              "refill_errors", "oversize_received")
+SFP_KEYS = ("sfp_temp_mc", "sfp_temp_max_mc", "sfp_temp_crit_mc", "sfp_rx_power_uw",
+            "sfp_rx_power_min_uw", "sfp_rx_power_lcrit_uw", "sfp_phy_hwmon")
 WAN_NEW_KEYS = (
     "cpu_cores", "cpu_core_max_pct", "cpu_core_max_index", "cpu_core_max_softirq_pct",
     "wan_link_dev", "wan_link_mbit", "wan_carrier_down_count", "wan_rx_mbps", "wan_tx_mbps",
@@ -473,7 +479,7 @@ checks = {
         '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_UPDATE" ] && BK_TEST_UPDATE="$STATUS_TEST_UPDATE"'],
     "wifi: every iwinfo call carries exactly one command": len(iwinfo_calls) > 0 and all(len(c.split()) <= 2 for c in iwinfo_calls),
     "wifi: iwinfo was never asked to scan": log_lines("iwinfo_scan.log") == [],
-    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 86 checks)": len(selftest) == 86 and all(l.startswith("ok ") for l in selftest),
+    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 92 checks)": len(selftest) == 92 and all(l.startswith("ok ") for l in selftest),
     "harness: all six payload runs produced a payload of this version": all(x.get("version") == d["version"] for x in (d1, d2b, d3, d4, d5)),
     "wan: PPPoE over a VLAN (the owner's line) - the l3 device is the ppp netdev": (wpppoe["wan_proto"], wpppoe["wan_l3_device"], wpppoe["wan_up"]) == ("pppoe", "pppoe-wan", True),
     # --- W-A2 the WAN device walk (WAN 3.1.1; WAN e2e #5) ---
@@ -607,6 +613,38 @@ checks = {
         and path_of(wpath[1], "wan_rx_ring_drops") is None
         and path_of(wpath[3], "wan_rx_ring_drops") is None and wpath[3]["agent_tools"]["ethtool"] is False
         and path_of(d1, "wan_rx_ring_drops") is None and d1["agent_tools"]["ethtool"] is False,
+    # --- the port's MIB split and the SFP module (0.1.13) ---
+    "wan: the port's own counters, each on its own - overrun 2, discard 5, CRC 3, MAC receive 1, refill 4, oversize a measured 0 - and the ring still their sum (wpath1)":
+        [path_of(wpath[0], k) for k in SPLIT_KEYS] == [2, 5, 3, 1, 4, 0]
+        and path_of(wpath[0], "wan_rx_ring_drops") == 7,
+    "wan: no ethtool, or a driver without the names, answers null for every one of the six, never 0 (wpath2, wpath4, d1)":
+        all(path_of(p, k) is None for p in (wpath[1], wpath[3], d1) for k in SPLIT_KEYS)
+        and all(isinstance(p.get("wan_path"), dict) and set(SPLIT_KEYS) <= set(p["wan_path"]) for p in (wpath[1], wpath[3], d1)),
+    "wan: a driver with only the ring names - those two are numbers, the other four null, the ring the same 7 (wpath9)":
+        [path_of(wpath[8], k) for k in SPLIT_KEYS] == [2, 5, None, None, None, None]
+        and path_of(wpath[8], "wan_rx_ring_drops") == 7,
+    "wan: wherever both are measured, rx_discard + rx_overrun is exactly the ring":
+        all(path_of(p, "rx_discard") + path_of(p, "rx_overrun") == path_of(p, "wan_rx_ring_drops")
+            for p in wpath if isinstance(path_of(p, "rx_discard"), int) and isinstance(path_of(p, "rx_overrun"), int)),
+    "wan: skb_alloc_errors is not sent - with hardware buffer management it never moves":
+        all(isinstance(p.get("wan_path"), dict) and "skb_alloc_errors" not in p["wan_path"] for p in wpath[:3] + wpath[8:]),
+    "wan: the split costs no second ethtool call - one `-S eth2` per hourly read with ethtool present (wpath1-3, wpath9-12)":
+        log_lines("ethtool_calls.log") == ["-S eth2"] * 7,
+    "sfp: the module's own sensor against its own limits, no RX power on a copper module, the PHY inside it seen (wpath1, d1)":
+        all([path_of(p, k) for k in SFP_KEYS] == [49000, 70000, 75000, None, None, None, True] for p in (wpath[0], d1)),
+    "sfp: the PHY's die temperature (49.5 C) is not the module's and is never sent":
+        not any(v == 49500 for p in wpath + [d1, d] for v in (p.get("wan_path") or {}).values()),
+    "sfp: an optical-like module - RX power 350 uW against its own 50 / 20, and no PHY hwmon is false, not 'optical' (wpath10)":
+        [path_of(wpath[9], k) for k in SFP_KEYS] == [49000, 70000, 75000, 350, 50, 20, False],
+    "sfp: no module hwmon at all - every module value null, and a PHY not seen is false (wpath11)":
+        [path_of(wpath[10], k) for k in SFP_KEYS] == [None] * 6 + [False],
+    "sfp: two cages - nothing says which module is the WAN's, so every module value and the PHY flag are null (wpath12)":
+        [path_of(wpath[11], k) for k in SFP_KEYS] == [None] * 7,
+    "sfp: the module is read without ethtool too - it is sysfs, not the MIB (wpath4)":
+        [path_of(wpath[3], k) for k in SFP_KEYS] == [49000, 70000, 75000, None, None, None, True],
+    "sfp: nothing that names a module leaves the router - no serial, vendor, part or EEPROM key in the path object":
+        not any(re.search(r"serial|vendor|part|eeprom|_sn$|^sn_", k)
+                for p in wpath + [d1, d] for k in (p.get("wan_path") or {})),
     "wan: flow offloading is configuration and the flowtable is the kernel - both are read, neither is assumed":
         [path_of(wpath[0], k) for k in ("flow_offloading", "flow_offloading_hw", "flowtable_active")] == [True, False, True]
         and [path_of(wpath[2], k) for k in ("flow_offloading", "flowtable_active")] == [False, False]
@@ -699,13 +737,22 @@ checks = {
         d2b.get("lan_ports") == d1.get("lan_ports") and d2b["wan_path"] == d1["wan_path"],
     "lan: one ubus device dump per payload run and never two, and no fdb read at all when there is no dump":
         (dev_dumps, fdb_reads) == (6, 5),
-    "wan: the whole path object stays under 600 B on the wire":
-        len(json.dumps(d1["wan_path"], separators=(",", ":"))) <= 600,
+    # 0.1.12 sent 329 B here (d1) and was held to 600. The MIB split and the
+    # module facts of 0.1.13 are 13 keys more, sent every minute from the
+    # hourly cache: 626 B in d1 and 698-714 B in the wpath runs, where they
+    # are numbers. The cap is held on every run, so a full router - counters
+    # of ten digits, not one - still has room under it, and a fourteenth key
+    # of that size does not.
+    "wan: the whole path object stays under 850 B on the wire, in every run that has one":
+        max(len(json.dumps(p["wan_path"], separators=(",", ":"))) for p in wpath + [d1]
+            if isinstance(p.get("wan_path"), dict)) <= 850,
     # WAN e2e #14, the minute half (a probe item is wave 2). Measured on the
     # run where every value is a real one, not a null: nulls are the cheap case.
-    "payload budget: the new top-level keys and wan_path stay under 1100 B for a full run":
+    # 845 B in 0.1.12 under a cap of 1100; wan_path's 297 B more in 0.1.13
+    # (1142 B) move the cap by the same 300.
+    "payload budget: the new top-level keys and wan_path stay under 1400 B for a full run":
         "MISSING" not in wan_keys(d, *WAN_NEW_KEYS)
-        and len(json.dumps({k: d[k] for k in WAN_NEW_KEYS}, separators=(",", ":"))) <= 1100,
+        and len(json.dumps({k: d[k] for k in WAN_NEW_KEYS}, separators=(",", ":"))) <= 1400,
     # G20, WAN e2e #13a: the firewall signal
     "gap: the firewall is the fw4 table in the kernel, not any ruleset - mwan3 alone is not a firewall":
         d1["firewall_enabled"] is True and wfw1["firewall_enabled"] is False,

@@ -416,9 +416,31 @@ option, a `tc` call per queue and an `ubus` dump of every netdev.
   the init script fills them all. No queue file, or no physical port, and it
   is null: unknown is not "switched off".
 - **Ring drops.** `wan_rx_ring_drops` is `rx_discard` + `rx_overrun` from
-  `ethtool -S` on the port. `ethtool` is not in every image (this router does
-  not have it), and other drivers name those counters differently; without
+  `ethtool -S` on the port. `ethtool` is not in every image (Turris OS ships
+  the small one), and other drivers name those counters differently; without
   both names the answer is null, never 0.
+- **The port's MIB, split (0.1.13).** The same `ethtool -S` output, read in
+  the same loop, also keeps six names on their own, because neither
+  `wan_rx_errors` nor the ring sum says why a frame was lost (mvneta, the
+  Omnia): `rx_overrun` (the receive FIFO was full: load), `rx_discard`
+  (address filtering or no room), `bad_crc_event` and `mac_receive_error`
+  (damaged frames from the line or the module), `oversize_received` (longer
+  than the port takes: an MTU mismatch) and `refill_errors` (a receive buffer
+  the driver could not refill). `skb_alloc_errors` is not sent: with hardware
+  buffer management it never moves. Totals since boot, which the server
+  steps; a name the driver does not print is null, a measured 0 stays 0.
+- **The SFP module (0.1.13).** From the hwmon the kernel's sfp driver
+  registers for a module with diagnostics (`sfp` on the Omnia), in kernel
+  units: `sfp_temp_mc` with the module's own `sfp_temp_max_mc` /
+  `sfp_temp_crit_mc`, and `sfp_rx_power_uw` with its own
+  `sfp_rx_power_min_uw` / `sfp_rx_power_lcrit_uw`. Sent only when exactly one
+  such hwmon exists, because nothing in sysfs says which cage is the WAN's:
+  this assumes one cage, which is the Omnia. `sfp_phy_hwmon` is true when a
+  PHY inside the module registered a hwmon (`i2csfp11`), which the kernel
+  does only for copper modules; false means none was seen, never "optical";
+  null with no hwmon at all or with more than one cage or PHY. The PHY's die
+  temperature is not the module's and is not read, and neither is anything
+  that identifies the module (EEPROM, serial number). No fork: `read` only.
 - **SQM.** Every ENABLED queue whose `interface` is a device of the WAN chain
   - the l3 device, every netdev the port walk passed, and the port itself -
   so a queue configured on `eth2` is found for a WAN that runs over
@@ -533,6 +555,23 @@ and what it counted:
   errors".
 - **Null, never an empty list**, when there is no readable log. `[]` means the
   log was read and holds no error line.
+
+### What 0.1.13 adds (OpenWrt)
+
+- **Why the WAN port lost frames.** `wan_path` carries the port's own MIB
+  names next to the ring sum (`rx_overrun`, `rx_discard`, `bad_crc_event`,
+  `mac_receive_error`, `refill_errors`, `oversize_received`), so a damaged
+  line, an MTU mismatch and a router that could not keep up are three
+  different answers instead of one `wan_rx_errors`. From the same
+  `ethtool -S` call as before.
+- **The SFP module's own readings.** Temperature and RX power with the
+  module's own limits, and whether a PHY inside it proves a copper module
+  (`sfp_phy_hwmon`); see "The path a packet takes through the router".
+- 13 keys more in `wan_path`, about 300 B on every report; no extra
+  process, no new file.
+
+Needs a server that knows the 13 keys: an older server keeps only the
+`wan_path` keys it knows and drops these without a word.
 
 ### What 0.1.12.1 changes (OpenWrt)
 

@@ -90,6 +90,9 @@ _x=unset; if read -r _x < $F/sys/class/net/pppoe-wan/speed; then _rd=ok; else _r
 t "root: reading the speed of a ppp netdev fails, as on a router" eq "$_rd" failed
 t "root: only the physical port has a device link" eq "$([ -e $F/sys/class/net/eth2/device ] && echo y)$([ -e $F/sys/class/net/eth2.848/device ] || echo n)$([ -e $F/sys/class/net/pppoe-wan/device ] || echo n)" ynn
 t "root: the WAN chain is pppoe-wan -> eth2.848 -> eth2" eq "$(ls $F/sys/class/net/pppoe-wan | grep lower_),$(ls $F/sys/class/net/eth2.848 | grep lower_)" "lower_eth2.848,lower_eth2"
+t "root: the hwmon names of the capture - one sfp, one PHY inside the module" eq "$(cat $F/sys/class/hwmon/hwmon*/name | grep -c '^sfp$'),$(cat $F/sys/class/hwmon/hwmon*/name | grep -c '^i2csfp11$')" "1,1"
+t "root: the module's sensor reads 49 C against its own 70 / 75, and has no RX power" eq "$(cat $F/sys/class/hwmon/hwmon7/name $F/sys/class/hwmon/hwmon7/temp1_input $F/sys/class/hwmon/hwmon7/temp1_max $F/sys/class/hwmon/hwmon7/temp1_crit | tr '\n' ' ')$(ls $F/sys/class/hwmon/hwmon7 | grep -c power)" "sfp 49000 70000 75000 0"
+t "root: the PHY inside the module reads 49.5 C of its own die, a number the module's must not be" eq "$(cat $F/sys/class/hwmon/hwmon9/name $F/sys/class/hwmon/hwmon9/temp1_input | tr '\n' ' ')" "i2csfp11 49500 "
 t "root: softnet_stat is the real capture (2 CPUs, 15 columns)" eq "$(awk 'NF == 15' $F/proc/net/softnet_stat | wc -l | tr -cd 0-9)" 2
 t "root: the branches of the WAN walk - a bridge over one port, one over two, a lone ppp" eq "$(ls $F/sys/class/net/br-wan | grep -c lower_),$(ls $F/sys/class/net/br-wan2 | grep -c lower_),$(ls $F/sys/class/net/ppp0 | grep -c lower_)" "1,2,0"
 t "root: the DSA port has a device link, answers -1 and sits above a conduit at 1000" eq "$([ -e $F/sys/class/net/wan/device ] && echo y),$(cat $F/sys/class/net/wan/speed),$(cat $F/sys/class/net/eth1/speed)" "y,-1,1000"
@@ -108,7 +111,7 @@ t "image: no jsonfilter - JSON is read with awk and read" eq "$_a" absent
 if [ -x /bin/tc ] || [ -x /usr/bin/tc ]; then _a=present; else _a=absent; fi
 t "image: no tc of its own - only the stub, so removing it really removes it" eq "$_a" absent
 if [ -x /bin/ethtool ] || [ -x /usr/bin/ethtool ]; then _a=present; else _a=absent; fi
-t "image: no ethtool of its own - the owner's router has none either" eq "$_a" absent
+t "image: no ethtool of its own - only the stub, so removing it really removes it" eq "$_a" absent
 
 # tc: egress and ingress are two qdiscs on two devices, and they must not
 # answer with the same number.
@@ -118,6 +121,12 @@ t "tc: SQM's ingress device is another qdisc with another number" eq "$(tc -s qd
 # among two dozen others; another driver has neither.
 t "ethtool: rx_discard and rx_overrun are in the MIB (5 and 2)" eq "$(ethtool -S eth2 | awk '/rx_discard:|rx_overrun:/ { s += $2 } END { print s }')" 7
 t "ethtool: another driver names neither counter" eq "$(BK_STUB_ETHTOOL=other ethtool -S eth2 | grep -c 'rx_discard:\|rx_overrun:')" 0
+# The split: every name its own number (overrun 2, discard 5, CRC 3, MAC
+# receive 1, refill 4, oversize a measured 0), each exactly once, with the
+# neighbours a parser could slip onto; a partial driver has the ring names only.
+t "ethtool: the six split names, each once, with their own numbers" eq "$(ethtool -S eth2 | awk '$1 ~ /^(rx_overrun|rx_discard|bad_crc_event|mac_receive_error|refill_errors|oversize_received):$/ { printf "%s%s ", $1, $2 }')" "oversize_received:0 mac_receive_error:1 bad_crc_event:3 rx_discard:5 rx_overrun:2 refill_errors:4 "
+t "ethtool: skb_alloc_errors, bad_frames_received and jabber_received sit beside them" eq "$(ethtool -S eth2 | grep -c 'skb_alloc_errors: 0\|bad_frames_received: 11\|jabber_received: 6')" 3
+t "ethtool: a partial driver has the two ring names and none of the other four" eq "$(BK_STUB_ETHTOOL=partial ethtool -S eth2 | grep -c 'rx_discard: 5\|rx_overrun: 2'),$(BK_STUB_ETHTOOL=partial ethtool -S eth2 | grep -c 'bad_crc_event\|mac_receive_error\|refill_errors\|oversize_received')" "2,0"
 # uci: an option that is not set exits 1 with no output, which is a different
 # answer from "no uci at all".
 uci -q get network.@globals[0].packet_steering > $T/o 2>&1; _rc=$?

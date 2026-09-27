@@ -19,13 +19,13 @@
 # Then, on a clean private directory, the scenario runs - wpppoe and wwalk1..5
 # (one branch of the WAN walk each), wsmart, wlock, wspeed*/wack* (where the
 # speedtest results come from and what a 200 really acknowledges), wupl1..7
-# (which uplink carried a speedtest), wpath1..8
-# (the path the packets take), wfw1..3 (what "the firewall is up" is read
-# from), wdns1/wdns3 (the DNS probe's exit status), wrun1..7 (the run's own
-# clock and the runs that produced no report) and wlog1..9 (the masked error
-# lines behind the log count, and who may switch them off), wupd1..11 with
-# wprob1..7, wconf0..2, wlim0..1 and wreb0..5 (the self-update: swap, end
-# mark, self-check, direction, probation, rollback, a reboot in the
+# (which uplink carried a speedtest), wpath1..12 (the path the packets take,
+# the port's MIB split and the SFP module), wfw1..3 (what "the firewall is up"
+# is read from), wdns1/wdns3 (the DNS probe's exit status), wrun1..7 (the
+# run's own clock and the runs that produced no report) and wlog1..9 (the
+# masked error lines behind the log count, and who may switch them off),
+# wupd1..11 with wprob1..7, wconf0..2, wlim0..1 and wreb0..5 (the self-update:
+# swap, end mark, self-check, direction, probation, rollback, a reboot in the
 # probation), wcron0/wcron (a cron PATH without sbin), wlte1..2 (LTE_API),
 # whl1..5, wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session,
 # what is cached of its answers), wst1..3 (the modem's answer changing, in
@@ -132,8 +132,10 @@ while [ $_i -le 60 ]; do
         "$_h" "$_m" "$_i" "$_i" > "/srv/speed60/2026-09/2026-09-19T0$_h:$_m:00+02:00.json"
     _i=$((_i + 1))
 done
-# ethtool is NOT in the owner's image (REAL_FACTS), so no payload run may see
-# it. The wpath runs below put it back to prove the ring-drop parser.
+# The payload runs leave ethtool out: "no ethtool" is the null path, and it
+# has to be pinned somewhere. The owner's router does have it (Turris OS
+# ships the small ethtool, and its ring drops reach the server), so the wpath
+# runs below put it back to prove the parser.
 stub_off ethtool
 
 run r1
@@ -435,6 +437,45 @@ fresh
 # is not "shaping now", so nothing may be reported for it.
 pl wpath8
 BK_STUB_WAN=eth2 BK_STUB_SQM=off sh agent_openwrt.sh --dry-run > $OUT/wpath8.json 2> $OUT/wpath8.err
+fresh
+
+# --- wpath9..wpath12: the port's MIB split and the SFP module (0.1.13) -----
+# wpath1 is the owner's line: the six counters, a module whose PHY registers
+# a hwmon (i2csfp11) and whose own sensor reads 49 C against its limits. What
+# the Omnia cannot show at the same time:
+#   wpath9   a driver with the two ring names and nothing else: those two are
+#            numbers, the other four are null, the ring is the same 7
+#   wpath10  an optical-like module: RX power with its own limits, and no PHY
+#            hwmon - which is "none seen", never "optical"
+#   wpath11  no module hwmon at all: nothing to read, and the PHY is not seen
+#   wpath12  a second cage: nothing says which module is the WAN's, so every
+#            module value is null
+# The fake root is put back after each of them: the later runs read it too.
+stub_on ethtool
+BK_STUB_WAN=eth2 BK_STUB_ETHTOOL=partial sh agent_openwrt.sh --dry-run > $OUT/wpath9.json 2> $OUT/wpath9.err
+fresh
+hwmon_of() {
+    for _h in /tmp/fakeroot/sys/class/hwmon/hwmon*; do
+        [ "$(cat "$_h/name")" = "$1" ] && { echo "$_h"; return 0; }
+    done
+    return 1
+}
+_sfp=$(hwmon_of sfp); _phy=$(hwmon_of i2csfp11)
+mv "$_phy" /tmp/hwmon-phy.off
+echo 350 > "$_sfp/power2_input"; echo 50 > "$_sfp/power2_min"; echo 20 > "$_sfp/power2_lcrit"
+BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath10.json 2> $OUT/wpath10.err
+rm -f "$_sfp/power2_input" "$_sfp/power2_min" "$_sfp/power2_lcrit"
+fresh
+mv "$_sfp" /tmp/hwmon-sfp.off
+BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath11.json 2> $OUT/wpath11.err
+mv /tmp/hwmon-sfp.off "$_sfp"; mv /tmp/hwmon-phy.off "$_phy"
+fresh
+mkdir /tmp/fakeroot/sys/class/hwmon/hwmon99
+echo sfp1 > /tmp/fakeroot/sys/class/hwmon/hwmon99/name
+echo 31000 > /tmp/fakeroot/sys/class/hwmon/hwmon99/temp1_input
+BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath12.json 2> $OUT/wpath12.err
+rm -rf /tmp/fakeroot/sys/class/hwmon/hwmon99
+stub_off ethtool
 fresh
 
 # --- wport1..wport3: the wired switch ports ---------------------------------
