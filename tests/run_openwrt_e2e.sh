@@ -6,7 +6,11 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 work="$(mktemp -d)"
 . "$here/e2e_cleanup.sh"
-trap 'bk_e2e_exit $? "$work" busybox:1.36 "${BK_E2E_NAME:-}"' EXIT
+# BK_E2E_KEEP=<dir>: keep the payloads, logs and call records there.
+keep_out() {
+    [ -z "${BK_E2E_KEEP:-}" ] || { mkdir -p "$BK_E2E_KEEP" && cp -R "$work/out/." "$BK_E2E_KEEP/"; }
+}
+trap 'bk_e2e_exit $? "$work" busybox:1.36 "${BK_E2E_NAME:-}" keep_out' EXIT
 mkdir -p "$work/agent" "$work/out"
 cp "$here/../vps-agent/agent_openwrt.sh" "$work/agent/"
 cp -r "$here/openwrt-stubs" "$work/stubs"

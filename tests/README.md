@@ -17,6 +17,9 @@ as root, so on a Linux host whose user is not root (CI's runner) what they
 leave in the work directory is root's; the same image hands it back before
 the directory is removed. The PowerShell container runs as the calling user.
 A cleanup problem is a warning: the exit code is the tests' result.
+`BK_E2E_KEEP=<dir>` makes `run_linux_e2e.sh` and `run_openwrt_e2e.sh` copy
+their `out/` (payloads, stderr, call logs) to `<dir>` before the work
+directory goes, whether the run passed or not.
 
 The stub outputs are what the real tools print (`wg show all dump`,
 `mwan3 status`, `tc -s qdisc`, ...); when a tool changes its format, update the
