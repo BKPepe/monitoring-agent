@@ -11,8 +11,9 @@ second, parsers reading the right columns.
 | `cloudflare-agent.test.mjs` (`node --test tests/*.test.mjs`) | the Worker's cron and `/run` handlers against a stubbed `fetch`: the location it posts takes city and country from the colo, never from the trace's `loc` or the `/run` caller; runs before every Worker deploy | node 22+ |
 | `run_openwrt_e2e.sh` | `agent_openwrt.sh` in busybox (ash, busybox awk/sed) with canned `wg`, `mwan3`, `tc`, `uci`, `logread`, `iwinfo`, `hostapd_cli`, `iw`, `smartctl`, `df`, `nft`, `ubus`, `ping`, `openssl` from `openwrt-stubs/bin` and a fake `/sys` + `/proc` from `openwrt-stubs/mkroot.sh`; six payload runs, then the scenario and hardening runs on canned server answers, including the self-update (end line, self-check, direction, swap, probation, rollback, a reboot inside the probation, the refused-file list on the flash: kept over a reboot, no expiry, a new sha of the same version taken, last 8) and the remote-action gates | docker, python3 |
 | `run_windows_e2e.sh` | `agent.ps1` in PowerShell 7 (Linux container, `windows/`): parser, UTF-8 BOM, end line, PSScriptAnalyzer's Windows PowerShell 5.1 compatibility rules, unit tests of functions cut out of the agent's own syntax tree, then 40-odd agent runs against `windows/mock_api.ps1` - dry run, `-SelfCheck`, remote-action gates, self-update refusals, swap, probation and rollback | docker |
+| `run_openwrt_real.sh [24.10\|master\|all]` | `agent_openwrt.sh` with a plain `--dry-run`, twice, in the official `openwrt/rootfs` x86_64 images (24.10.8 pinned, master floating) with ubus, procd, logd, netifd, fw4 and dnsmasq up (`openwrt-real/boot.sh`), asserted by `assert_real_payload.py` | docker, python3 |
 
-All three end through `e2e_cleanup.sh`. The Linux and OpenWrt containers run
+All of them end through `e2e_cleanup.sh`. The Linux and OpenWrt containers run
 as root, so on a Linux host whose user is not root (CI's runner) what they
 leave in the work directory is root's; the same image hands it back before
 the directory is removed. The PowerShell container runs as the calling user.
@@ -299,22 +300,115 @@ anything at all. Each case runs in its own sandbox directory with its own
   `ReplaceFile` does on NTFS (.NET maps `File.Replace` to a rename on Linux),
   and the free-space refusal (no way to fill a volume from the test).
 
+### The real images
+
+The stub harness proves the parsers against what the tools print; it cannot
+show that the tools are there, answer the way the stubs say, and that nothing
+leaks to stderr on a stock system. `run_openwrt_real.sh` runs the agent in the
+official OpenWrt root file systems, x86_64, so GitHub's runner runs them
+natively (an arm64 host emulates them: `--platform linux/amd64` is always
+passed, because the 24.10.8 image has no other platform).
+
+- **Images.** `openwrt/rootfs:x86-64-24.10.8`, pinned by digest, and
+  `openwrt/rootfs:x86-64-master`, floating on purpose: OpenWrt work is tested on
+  master, and a red run there is news. The run prints the snapshot
+  (`DISTRIB_REVISION` and the image digest); when upstream breaks, pin a
+  last-good digest with `BK_OWRT_MASTER_IMAGE` in the workflow, never
+  `continue-on-error`. A local run uses the master image docker already has;
+  `docker pull --platform linux/amd64 openwrt/rootfs:x86-64-master` refreshes
+  it.
+- **Boot (`openwrt-real/boot.sh`).** The image is a router without its boot:
+  the directories `/etc/init.d/boot` makes, then `ubusd`, `procd` (not PID 1,
+  but it serves `system` and `service`), `logd`, `netifd` with a static WAN on
+  the container's own `eth0` (address, gateway and resolver as docker gave
+  them) and an empty `br-lan` on `10.231.0.1/24`, `fw4` (needs
+  `--cap-add NET_ADMIN`, which reaches only the container's namespace) and
+  `dnsmasq`. `ujail` is moved aside: procd cannot clone namespaces in an
+  unprivileged container and dnsmasq never starts jailed. One ping to the
+  gateway is the traffic a router has had by then: without it the agent's
+  IPv4/IPv6 rates have no state to start from. Nothing is installed; the
+  stock userland is the point. `VER_env.txt` keeps the release, the board,
+  `ubus list`, the nft tables and which services did not come up; one that
+  did not (`VER_boot_fail.txt`) fails the run.
+- **Runs.** `r1`, 5 s, `r2`, both a plain `--dry-run` with no `STATUS_TEST_*`
+  seam, as the owner would type it.
+- **What stays null, honestly.** No radio (`wifi_*`), no modem (`lte_*`),
+  no `smartctl`, `iw`, `hostapd_cli`, `ethtool`, `tc`, `wg`, `mwan3` or SQM
+  package, an empty bridge (`lan_ports`), `eth0` is a veth with no port below
+  it (`wan_link_dev`, the WAN error counters), no `/tmp/sysinfo` (`model`,
+  `board_name`), a busybox `df` without `-i` (`inode_usage`), and 24.10 has
+  no downloaded package lists (`upgradable_packages`). Each is a `NULL_OK`
+  entry with its reason (below); every other key must be measured.
+
+`assert_real_payload.py PROFILE DIR` checks every run and prints one line per
+check:
+
+- exit 0; stdout is exactly one JSON object with no key twice (a heredoc key
+  written twice is valid JSON, and PHP keeps only the last value); the right
+  `agent_type` and the `AGENT_VERSION` of the source; no value is the string
+  `"null"`.
+- **stderr** holds only the agent's own log lines
+  (`YYYY-MM-DD HH:MM:SS - ...`) and none of them carries an error marker
+  (`CHYBA`, `VAROV`, `Traceback`, `not found`, `cannot`, `failed`, ...): raw
+  tool stderr that leaked past a missing `2>/dev/null` fails the run. An
+  exception goes into `real/stderr_allow.txt` as `<scope> <regex>  # why`
+  (scope: a profile or a glob such as `openwrt-*`); an entry that matches no
+  line fails as stale. The list is empty.
+- **`r1`** has no delta yet: `cpu` and `net` are null.
+- **`r2`** measures the CORE set: the numbers (`cpu`, `cpu_cores`, `ram`,
+  `hdd`, `load1`, `uptime`, `boot_time`, `agent_time`, `agent_run_ms`, ...),
+  `os`, `hostname`, `kernel`, `installed_packages` > 0, `interfaces` and
+  `filesystems`, the package manager (`opkg` on 24.10, `apk` on master), and
+  what `boot.sh` set up: WAN up, `static`, on `eth0`, `lan_subnet`
+  `10.231.0.1/24`, the firewall on with a counted `fw_accepted`, `dns_engine`
+  `Dnsmasq`, log lines `on`. `wan_internet` and `dns_resolver_ok` depend on
+  the runner's network (ICMP is often blocked there) and are checked as
+  true, false or null only.
+- **Every other key of `r2`** must be measured too: not null, `[]`, `{}` or
+  `""`. The exceptions are two lists in `assert_real_payload.py`, each entry
+  a scope (`openwrt-24.10`, `openwrt-master`, `ubuntu/sh`, ...), a key glob
+  and the reason. `NULL_OK` is what the image or `boot.sh` does not give the
+  agent: such a key that gets measured fails as stale, and so does an entry
+  that names no key any more. `VARIES` is what depends on the runner (its
+  network, disks, thermal zones, DMI) or on timing: `wan_latency_ms`,
+  `dns_latency_ms`, `disk_devices`, `temperature`, `top_io_processes`, the
+  log counts, master's `upgradable_packages`. Either way passes, and
+  `golden.py` still checks the type. A collector that goes null or empty
+  fails here; each run prints what the two lists excused.
+- **`/proc/net/stat/nf_conntrack`**, the only source of
+  `conntrack_insert_failed`, `conntrack_drop` and `conntrack_early_drop`, is
+  the kernel's, not the image's: it needs `CONFIG_NF_CONNTRACK_PROCFS` and
+  `nf_conntrack` loaded. OpenWrt's kernels and Docker Desktop's have it,
+  GitHub's runner kernel does not. `run-in-container.sh` asks the container
+  and prints the answer (`VER_nf_stat.txt`; no answer fails). Present: the
+  three are measured like every other key, and any stderr line naming the
+  file fails. Absent: they must be null in both runs - a number would be
+  invented. Known gap: agent 0.1.12 opens the file before its `2>/dev/null`
+  applies and prints `agent_openwrt.sh: line 1922: can't open
+  /proc/net/stat/nf_conntrack: no such file`; that line passes only when the
+  file is absent and the payload is 0.1.12, so 0.1.13 must not print it.
+  `assert_real_payload.py selftest` (in `lint`) walks both paths.
+- Values that vary between runs are checked by type only.
+
 ### CI
 
 `.github/workflows/test.yml` runs on pull requests, on pushes to branches
 other than `main`, and on `main` as the first job of `deploy-worker.yml`
 (`needs: test`), so the Worker is not deployed from a red run. The agents are
 published by the monitoring repo from its submodule gitlink, and a release is
-a commit on `main` that passed this workflow. Three jobs:
+a commit on `main` that passed this workflow. Four jobs:
 
 - `lint`: `bash -n agent.sh`, `dash -n agent_openwrt.sh`, `py_compile
   agent.py`, PowerShell's parser on `agent.ps1`; ShellCheck 0.11.0 (pinned
   image) at warning level on exactly the two shell agents, both clean today
   (fewer files found fails the step instead of passing on nothing); every
   agent's last line equals `# bk-agent-end <AGENT_VERSION>`;
-  `agent.ps1` still starts with a UTF-8 BOM; `node --test tests/*.test.mjs`.
+  `agent.ps1` still starts with a UTF-8 BOM; `node --test tests/*.test.mjs`;
+  `assert_real_payload.py selftest`.
 - `e2e`: the three harnesses above, one after another in one job - the
   account's 20 concurrent jobs are shared with the OpenWrt builds.
+- `real`: `run_openwrt_real.sh all` (the real images above), beside `e2e`, so
+  the workflow takes no longer.
 - `windows-ps51`: `agent.ps1 -SelfCheck` and `-DryRun` on `windows-latest`
   under Windows PowerShell 5.1, the engine the scheduled task runs.
 

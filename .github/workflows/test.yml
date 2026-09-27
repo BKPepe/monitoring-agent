@@ -95,6 +95,12 @@ jobs:
       - name: agent.ps1 keeps its UTF-8 BOM
         run: test "$(head -c 3 vps-agent/agent.ps1 | od -An -tx1 | tr -d ' \n')" = "efbbbf"
 
+      # The /proc/net/stat/nf_conntrack rules of the real-image checks on
+      # their own samples: GitHub's runner kernel lacks the file and Docker
+      # Desktop's has it, so a real run walks only one of the two paths.
+      - name: Real payload rules (assert_real_payload.py selftest)
+        run: python3 tests/assert_real_payload.py selftest
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -117,6 +123,19 @@ jobs:
         run: bash tests/run_openwrt_e2e.sh
       - name: agent.ps1 (PowerShell 7, mock API)
         run: bash tests/run_windows_e2e.sh
+
+  # The agents in the images they really run on, not against stubs: the
+  # official OpenWrt rootfs with its services up (24.10 pinned by digest,
+  # master floating on purpose), each agent with a plain --dry-run. Beside
+  # e2e, so the workflow takes no longer.
+  real:
+    name: Real images
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: agent_openwrt.sh in openwrt/rootfs 24.10.8 and master
+        run: bash tests/run_openwrt_real.sh all
 
   # The engine the scheduled task actually runs. The container job above is
   # pwsh 7 on Linux; this one runs agent.ps1 under Windows PowerShell 5.1 with
