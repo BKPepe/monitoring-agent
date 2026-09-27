@@ -12,6 +12,7 @@ second, parsers reading the right columns.
 | `run_openwrt_e2e.sh` | `agent_openwrt.sh` in busybox (ash, busybox awk/sed) with canned `wg`, `mwan3`, `tc`, `uci`, `logread`, `iwinfo`, `hostapd_cli`, `iw`, `smartctl`, `df`, `nft`, `ubus`, `ping`, `openssl` from `openwrt-stubs/bin` and a fake `/sys` + `/proc` from `openwrt-stubs/mkroot.sh`; six payload runs, then the scenario and hardening runs on canned server answers, including the self-update (end line, self-check, direction, swap, probation, rollback, a reboot inside the probation, the refused-file list on the flash: kept over a reboot, no expiry, a new sha of the same version taken, last 8) and the remote-action gates | docker, python3 |
 | `run_windows_e2e.sh` | `agent.ps1` in PowerShell 7 (Linux container, `windows/`): parser, UTF-8 BOM, end line, PSScriptAnalyzer's Windows PowerShell 5.1 compatibility rules, unit tests of functions cut out of the agent's own syntax tree, then 40-odd agent runs against `windows/mock_api.ps1` - dry run, `-SelfCheck`, remote-action gates, self-update refusals, swap, probation and rollback | docker |
 | `run_openwrt_real.sh [24.10\|master\|all]` | `agent_openwrt.sh` with a plain `--dry-run`, twice, in the official `openwrt/rootfs` x86_64 images (24.10.8 pinned, master floating) with ubus, procd, logd, netifd, fw4 and dnsmasq up (`openwrt-real/boot.sh`), asserted by `assert_real_payload.py` | docker, python3 |
+| `run_linux_distros.sh [ubuntu\|alpine\|rocky\|all]` | `agent.sh` and `agent.py` with a plain `--dry-run`, twice each, on Ubuntu 24.04, Alpine 3.24 (busybox `ps`/`awk`/`df`) and Rocky 9 (Python 3.9), each with only what the agents need installed (`linux-distros/*/Dockerfile`, base images pinned by digest); the same assertions | docker, python3 |
 
 All of them end through `e2e_cleanup.sh`. The Linux and OpenWrt containers run
 as root, so on a Linux host whose user is not root (CI's runner) what they
@@ -390,6 +391,32 @@ check:
   `assert_real_payload.py selftest` (in `lint`) walks both paths.
 - Values that vary between runs are checked by type only.
 
+`run_linux_distros.sh` does the same for the Linux agents on Ubuntu 24.04,
+Alpine 3.24 and Rocky 9 (Debian is `run_linux_e2e.sh`'s): `sh1`, 3 s, `sh2`,
+then `py1`, `py2`. Each image gets only what a stock server of that
+distribution has and the agents need - no `procps` on Alpine on purpose, busybox
+`ps`, `awk` and `df` are what it is there for. CORE for `sh2`/`py2`: `os`,
+`hostname`, `kernel`, the numbers (`cpu`, `ram`, `hdd`, `load1`, `uptime`,
+`boot_time`, `net`, `fork_rate`, `zombie_count`), `processes`, and for
+`agent.sh` `filesystems`; every other key must be measured, as in the OpenWrt
+images. `NULL_OK` there: no TeamSpeak, tailscale, zerotier or UPS, nothing
+listening and no service running in the container, no `systemd-detect-virt`,
+`reboot_required` off Debian, Alpine's `timezone`, and no `nslookup` on
+Ubuntu and Rocky (`agent.sh`'s `dns_latency_ms`). `VARIES`: `temperature`,
+`cloud_provider` (the runner's DMI: Azure on GitHub), the resolver's
+latency, and `agent.py`'s `top_cpu_processes` (what used CPU in its sample).
+
+A CORE key one scope does not measure is a gap: a `NULL_OK` entry on a CORE
+key, stale when the CORE check passes. There is one:
+
+- **Alpine, `agent.sh`: `processes` and the top lists are `[]`, `zombie_count`
+  null.** Busybox `ps` has no `-o %cpu`, so
+  `ps -eo pid=,ppid=,stat=,%cpu=,rss=,comm=` fails and the agent sends empty
+  lists. `[]` is not an honest "unknown": on an Alpine host with monitored
+  processes the server would report every one of them as not running. It
+  should be null or be read from `/proc`; that is an open finding for the
+  agent, not something this harness hides.
+
 ### CI
 
 `.github/workflows/test.yml` runs on pull requests, on pushes to branches
@@ -407,8 +434,8 @@ a commit on `main` that passed this workflow. Four jobs:
   `assert_real_payload.py selftest`.
 - `e2e`: the three harnesses above, one after another in one job - the
   account's 20 concurrent jobs are shared with the OpenWrt builds.
-- `real`: `run_openwrt_real.sh all` (the real images above), beside `e2e`, so
-  the workflow takes no longer.
+- `real`: `run_openwrt_real.sh all` and `run_linux_distros.sh all` (the real
+  images above), beside `e2e`, so the workflow takes no longer.
 - `windows-ps51`: `agent.ps1 -SelfCheck` and `-DryRun` on `windows-latest`
   under Windows PowerShell 5.1, the engine the scheduled task runs.
 
