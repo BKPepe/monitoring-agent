@@ -12,6 +12,12 @@ second, parsers reading the right columns.
 | `run_openwrt_e2e.sh` | `agent_openwrt.sh` in busybox (ash, busybox awk/sed) with canned `wg`, `mwan3`, `tc`, `uci`, `logread`, `iwinfo`, `hostapd_cli`, `iw`, `smartctl`, `df`, `nft`, `ubus`, `ping`, `openssl` from `openwrt-stubs/bin` and a fake `/sys` + `/proc` from `openwrt-stubs/mkroot.sh`; six payload runs, then the scenario and hardening runs on canned server answers, including the self-update (end line, self-check, direction, swap, probation, rollback, a reboot inside the probation, the refused-file list on the flash: kept over a reboot, no expiry, a new sha of the same version taken, last 8) and the remote-action gates | docker, python3 |
 | `run_windows_e2e.sh` | `agent.ps1` in PowerShell 7 (Linux container, `windows/`): parser, UTF-8 BOM, end line, PSScriptAnalyzer's Windows PowerShell 5.1 compatibility rules, unit tests of functions cut out of the agent's own syntax tree, then 40-odd agent runs against `windows/mock_api.ps1` - dry run, `-SelfCheck`, remote-action gates, self-update refusals, swap, probation and rollback | docker |
 
+All three end through `e2e_cleanup.sh`. The Linux and OpenWrt containers run
+as root, so on a Linux host whose user is not root (CI's runner) what they
+leave in the work directory is root's; the same image hands it back before
+the directory is removed. The PowerShell container runs as the calling user.
+A cleanup problem is a warning: the exit code is the tests' result.
+
 The stub outputs are what the real tools print (`wg show all dump`,
 `mwan3 status`, `tc -s qdisc`, ...); when a tool changes its format, update the
 stub and the assertion together.

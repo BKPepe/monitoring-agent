@@ -5,7 +5,8 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+. "$here/e2e_cleanup.sh"
+trap 'bk_e2e_exit $? "$work" busybox:1.36 "${BK_E2E_NAME:-}"' EXIT
 mkdir -p "$work/agent" "$work/out"
 cp "$here/../vps-agent/agent_openwrt.sh" "$work/agent/"
 cp -r "$here/openwrt-stubs" "$work/stubs"

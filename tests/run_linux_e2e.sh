@@ -25,15 +25,20 @@ done
 [ "$sentinel_ok" = 1 ]
 
 work="$(mktemp -d)"
+. "$here/e2e_cleanup.sh"
 # BK_E2E_KEEP=<dir>: keep the payloads, logs and case facts there.
-trap 'if [ -n "${BK_E2E_KEEP:-}" ]; then mkdir -p "$BK_E2E_KEEP" && cp -R "$work/out/." "$BK_E2E_KEEP/"; fi; rm -rf "$work"' EXIT
+keep_out() {
+    [ -z "${BK_E2E_KEEP:-}" ] || { mkdir -p "$BK_E2E_KEEP" && cp -R "$work/out/." "$BK_E2E_KEEP/"; }
+}
+name="${BK_E2E_CONTAINER:-bk-linux-e2e-$$}"
+trap 'bk_e2e_exit $? "$work" bk-agent-e2e "$name" keep_out' EXIT
 mkdir -p "$work/agent" "$work/out" "$work/tests"
 cp "$here/../vps-agent/agent.sh" "$here/../vps-agent/agent.py" "$work/agent/"
 cp "$here/test_agent_py.py" "$work/tests/"
 docker build -q -t bk-agent-e2e "$here/linux" >/dev/null
 # Two small tmpfs mounts: the update case for a directory without room for
 # the new file.
-docker run --rm --name "${BK_E2E_CONTAINER:-bk-linux-e2e-$$}" \
+docker run --rm --name "$name" \
     --tmpfs /tiny-sh:rw,size=512k --tmpfs /tiny-py:rw,size=512k \
     -v "$work:/work" -v "$here/linux:/harness:ro" bk-agent-e2e bash /harness/run-in-container.sh
 python3 "$here/assert_linux_payload.py" "$work/out"
