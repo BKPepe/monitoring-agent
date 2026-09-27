@@ -120,8 +120,9 @@ jobs:
 
   # The agents in the images they really run on, not against stubs: the
   # official OpenWrt rootfs with its services up (24.10 pinned by digest,
-  # master floating on purpose), each agent with a plain --dry-run. Beside
-  # e2e, so the workflow takes no longer.
+  # master floating on purpose) and three more Linux distributions, each
+  # agent with a plain --dry-run. Beside e2e, so the workflow takes no
+  # longer.
   real:
     name: Real images
     runs-on: ubuntu-latest
@@ -130,6 +131,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: agent_openwrt.sh in openwrt/rootfs 24.10.8 and master
         run: bash tests/run_openwrt_real.sh all
+      - name: agent.sh + agent.py on Ubuntu, Alpine and Rocky
+        run: bash tests/run_linux_distros.sh all
 
   # The engine the scheduled task actually runs. The container job above is
   # pwsh 7 on Linux; this one runs agent.ps1 under Windows PowerShell 5.1 with
