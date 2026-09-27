@@ -25,6 +25,8 @@ kill "$yp"
 
 # The same query once more with python3 made unusable, so the nc fallback is
 # the one answering. Without this the second transport would ship untested.
+# (The agents append the system directories to PATH only when missing, so a
+# directory put first still wins.)
 mkdir -p /agent/nopython
 printf '#!/bin/sh\nexit 1\n' > /agent/nopython/python3
 chmod +x /agent/nopython/python3
@@ -32,3 +34,28 @@ PATH="/agent/nopython:$PATH" bash agent.sh --dry-run > /work/out/sh3.json 2>/wor
 
 kill "$ts3_pid" 2>/dev/null || true
 if grep -qi traceback /work/out/py1.err /work/out/py2.err; then cat /work/out/py2.err >&2; exit 1; fi
+
+# cron's environment: PATH=/usr/bin:/bin and nothing else. A tool in an sbin
+# directory - here a stand-in zerotier-cli, which Debian installs in
+# /usr/sbin - has to be found there too, or every cron run reports null for
+# what the manual test measured. Fresh directories, so both runs are first
+# runs and compare like with like.
+printf '#!/bin/sh\necho "200 listnetworks 8056c2e21c000001 home 02:aa:bb:cc:dd:ee OK PRIVATE ztabc 10.147.17.5/24"\n' > /usr/sbin/zerotier-cli
+chmod +x /usr/sbin/zerotier-cli
+for mode in i c; do
+    mkdir -p "/cron/$mode"
+    cp agent.sh agent.py "/cron/$mode/"
+done
+bash /cron/i/agent.sh --dry-run > /work/out/cron_sh_i.json 2>/work/out/cron_sh_i.err
+env -i PATH=/usr/bin:/bin HOME=/root bash /cron/c/agent.sh --dry-run > /work/out/cron_sh_c.json 2>/work/out/cron_sh_c.err
+python3 /cron/i/agent.py --dry-run > /work/out/cron_py_i.json 2>/work/out/cron_py_i.err
+env -i PATH=/usr/bin:/bin HOME=/root python3 /cron/c/agent.py --dry-run > /work/out/cron_py_c.json 2>/work/out/cron_py_c.err
+rm -f /usr/sbin/zerotier-cli
+
+# agent.py's unit tests, on this image's Python.
+BK_AGENT_PY=/agent/agent.py python3 -m unittest discover -s /work/tests -p 'test_agent_py.py' > /work/out/py_unit.txt 2>&1 \
+    || { cat /work/out/py_unit.txt >&2; exit 1; }
+tail -n 3 /work/out/py_unit.txt
+
+# Remote actions, --selfcheck, self-update and rollback against a fake server.
+bash /harness/run-security-cases.sh

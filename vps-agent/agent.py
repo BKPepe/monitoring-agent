@@ -14,6 +14,7 @@ import json
 import hmac
 import hashlib
 import datetime
+import urllib.error
 import urllib.request
 import subprocess
 import threading
@@ -23,6 +24,18 @@ import threading
 # them without a word. Better to say so once.
 if sys.version_info < (3, 7):
     sys.exit("agent.py vyzaduje Python 3.7+ (subprocess capture_output)")
+
+# cron starts jobs with PATH=/usr/bin:/bin on Debian and most distributions,
+# while smartctl, sysctl and friends live in the sbin directories: a metric
+# the manual `--verbose` test measured came out null on every cron run after
+# it. subprocess looks tools up in os.environ["PATH"], so the system
+# directories are appended there when missing - appended, not prepended, so
+# a PATH the operator set on purpose keeps its order.
+_path_parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+for _bk_dir in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+    if _bk_dir not in _path_parts:
+        _path_parts.append(_bk_dir)
+os.environ["PATH"] = os.pathsep.join(_path_parts)
 
 # === VÝCHOZÍ KONFIGURACE ===
 # Pokud chcete, můžete tyto hodnoty nechat zde, nebo vytvořit soubor 'agent.cfg' ve stejné složce
@@ -87,7 +100,34 @@ if os.path.exists(cfg_path):
         pass
 
 AGENT_VERSION = "0.1.2"
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent.log')
+
+# --selfcheck: the updater runs a freshly downloaded copy this way before it
+# replaces the running agent (see self_update). It is the whole collection of
+# a dry run, printed as ONE line {"agent_type","agent_version","payload"}: a
+# release that dies halfway (the NameError that kept this agent silent for
+# 17 days passed py_compile) is refused before it is installed. Only the
+# updater sets BK_UPDATE_SELFCHECK=1; a hand-typed --selfcheck must not
+# quietly turn into some other run.
+SELFCHECK = '--selfcheck' in sys.argv
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+# Where the log and the between-run counters live: next to the script, or,
+# for a self-check, in a scratch directory of its own - the running agent
+# holds the real lock at that moment, and its files must not be written by a
+# version that may use another format.
+_data_dir = _script_dir
+if SELFCHECK:
+    if os.environ.get('BK_UPDATE_SELFCHECK') != '1':
+        sys.stderr.write("--selfcheck spousti jen aktualizace agenta (BK_UPDATE_SELFCHECK=1).\n")
+        sys.exit(2)
+    import atexit
+    import shutil
+    import tempfile
+    _data_dir = tempfile.mkdtemp(prefix='bk-selfcheck.')
+    atexit.register(shutil.rmtree, _data_dir, True)
+    # Not needed to build a payload, and this output is not a report.
+    AGENT_KEY = ""
+
+LOG_FILE = os.path.join(_data_dir, 'agent.log')
 # V Docker režimu je adresář se skriptem připojený read-only, proto se stavový
 # soubor pro výpočet síťové propustnosti ukládá vždy do /tmp.
 # --dry-run / --print: collect, print the JSON to stdout, send nothing. A dry
@@ -95,9 +135,9 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent.log')
 # cron ticks it used to overwrite the counters, and the next cron report
 # shipped forks and network errors for a fraction of the interval as if they
 # covered all of it. Two dry runs in a row still delta against each other.
-DRY_RUN = '--dry-run' in sys.argv or '--print' in sys.argv
+DRY_RUN = '--dry-run' in sys.argv or '--print' in sys.argv or SELFCHECK
 _STATE_SUFFIX = '.dryrun' if DRY_RUN else ''
-NET_STATE_FILE = ('/tmp/status-agent-net.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_net.state')) + _STATE_SUFFIX
+NET_STATE_FILE = ('/tmp/status-agent-net.state' if DOCKER_MODE else os.path.join(_data_dir, 'agent_net.state')) + _STATE_SUFFIX
 
 # Between-run state and caches live next to the script (a root-owned
 # directory), not in the world-writable /tmp where any local user could
@@ -106,11 +146,37 @@ NET_STATE_FILE = ('/tmp/status-agent-net.state' if DOCKER_MODE else os.path.join
 # write would fail silently and CPU, network and fork rate would stay null
 # forever, which is worse than the /tmp exposure. The fallback says so in
 # the log rather than degrading quietly.
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = '/tmp' if (DOCKER_MODE or not os.access(_script_dir, os.W_OK)) else _script_dir
+if SELFCHECK:
+    STATE_DIR = _data_dir
+else:
+    STATE_DIR = '/tmp' if (DOCKER_MODE or not os.access(_script_dir, os.W_OK)) else _script_dir
 STATE_DIR_FALLBACK = STATE_DIR == '/tmp' and not DOCKER_MODE
 
-VERBOSE = '--verbose' in sys.argv or '-v' in sys.argv or os.environ.get('STATUS_VERBOSE') == '1' or sys.stdout.isatty()
+# Self-update bookkeeping sits next to the script itself and is named after
+# it, so agent.sh and agent.py installed in one directory never share a file.
+#   .prev        the version this one replaced (a hardlink, a copy if not)
+#   .probation   "<new> <old> <sha256> <runs> <rejected>" from the swap until
+#                the new version's first accepted report
+#   .last-ok     "<version> <unix time>" of the last accepted report
+#   .refused     "<sha256> <unix time>" of a file this host took back or
+#                refused for what its bytes are (no end sentinel, bad syntax,
+#                failed self-check): not downloaded again for 24 h
+# The real path, so an agent reached through a symlink replaces the file,
+# not the link.
+SELF_PATH = os.path.realpath(__file__)
+PROBATION_FILE = SELF_PATH + '.probation'
+LAST_OK_FILE = SELF_PATH + '.last-ok'
+REFUSED_FILE = SELF_PATH + '.refused'
+# A new version that the server refused this many times, or that did not get
+# a single report through in this many runs, is replaced by the previous one.
+# Refusals (4xx) count fast; runs with no answer only after a long outage, so
+# a network outage alone does not roll anything back after a few minutes.
+ROLLBACK_REJECTED = 3
+ROLLBACK_RUNS = 30
+# Remote-action nonces already used (see _action_gate).
+NONCE_FILE = os.path.join(STATE_DIR, 'vps_agent_action_nonces')
+
+VERBOSE = not SELFCHECK and ('--verbose' in sys.argv or '-v' in sys.argv or os.environ.get('STATUS_VERBOSE') == '1' or sys.stdout.isatty())
 
 def log_message(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -465,7 +531,7 @@ def get_inode_usage():
     except Exception:
         return None
 
-DISKIO_STATE_FILE = ('/tmp/status-agent-diskio.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_diskio.state')) + _STATE_SUFFIX
+DISKIO_STATE_FILE = ('/tmp/status-agent-diskio.state' if DOCKER_MODE else os.path.join(_data_dir, 'agent_diskio.state')) + _STATE_SUFFIX
 _WHOLE_DISK_RE = re.compile(r'^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+)$')
 
 def get_disk_io_sectors():
@@ -535,7 +601,7 @@ def get_disk_io():
     write_kbps = round((delta_write * sector_size / elapsed) / 1024, 1)
     return read_kbps, write_kbps
 
-FORKRATE_STATE_FILE = ('/tmp/status-agent-forkrate.state' if DOCKER_MODE else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_forkrate.state')) + _STATE_SUFFIX
+FORKRATE_STATE_FILE = ('/tmp/status-agent-forkrate.state' if DOCKER_MODE else os.path.join(_data_dir, 'agent_forkrate.state')) + _STATE_SUFFIX
 
 def get_fork_rate():
     """
@@ -1161,64 +1227,334 @@ def get_local_teamspeak_servers(ports):
     return servers
 
 
-def self_update(update_info):
-    """
-    Aktualizace agenta na novější verzi ze serveru.
+# --- Self-update -------------------------------------------------------------
+# The server offers a version and the SHA-256 of its file. The download
+# replaces this script only when it is, in this order:
+#   - strictly newer than this version: a server that serves an older file
+#     (a pinned submodule reverted) must not downgrade the fleet;
+#   - not a file this host rolled back or refused within the last day (so
+#     a bad release is not downloaded and logged again every run);
+#   - the file the server hashed;
+#   - complete: its last line is "# bk-agent-end <offered version>". A
+#     transfer cut short can still compile, and the checksum comes from the
+#     same server;
+#   - valid Python, and a working agent: `--selfcheck` runs its whole dry-run
+#     collection and must print this agent's payload;
+# and then by a rename inside this directory, with the current version kept
+# as .prev and a .probation file that brings it back if the new one gets no
+# report through (see _probation_check).
 
-    Bezpečnostní pojistky: soubor se stahuje do dočasného souboru, ověřuje se
-    SHA-256 checksum z API odpovědi i syntaxe (py_compile) a teprve poté se
-    atomicky nahradí běžící skript. Při jakémkoli selhání zůstává původní verze.
-    """
-    import hashlib
-    import py_compile
+_VERSION_RE = re.compile(r'[0-9]{1,18}(\.[0-9]{1,18})*')
+SELFCHECK_TIMEOUT_S = 60
+
+
+def _version_newer(offered, current):
+    """True when `offered` is a newer dotted-numeric version than `current`
+    ("0.1.10" > "0.1.9"). Anything else (a "-rc1" suffix, a non-string)
+    cannot be shown to be newer and is not installed."""
+    if not isinstance(offered, str) or not isinstance(current, str):
+        return False
+    if not _VERSION_RE.fullmatch(offered) or not _VERSION_RE.fullmatch(current):
+        return False
+    a = [int(p) for p in offered.split('.')]
+    b = [int(p) for p in current.split('.')]
+    # (1, 0) < (1, 0, 0) for Python tuples; the versions are the same.
+    width = max(len(a), len(b))
+    a += [0] * (width - len(a))
+    b += [0] * (width - len(b))
+    return a > b
+
+
+def _sentinel_ok(data, version):
+    """The downloaded file's last line must be the end-of-file sentinel of the
+    offered version - a transfer cut short has no last line of its own."""
+    text = data[:-1] if data.endswith(b'\n') else data
+    last = text.rsplit(b'\n', 1)[-1]
+    return last == ('# bk-agent-end ' + version).encode('ascii')
+
+
+def _selfcheck_ok(output, version):
+    """`output` (the self-check's stdout) must be exactly one line: a JSON
+    object for a python agent of `version`. The payload member is optional
+    in the contract (so it can change); when present it has to be this
+    agent's payload."""
+    if output.count('\n') != 1 or not output.endswith('\n'):
+        return False
+    try:
+        doc = json.loads(output)
+    except ValueError:
+        return False
+    if not isinstance(doc, dict) or doc.get('agent_type') != 'python' or doc.get('agent_version') != version:
+        return False
+    payload = doc.get('payload')
+    if payload is not None:
+        if not isinstance(payload, dict) or payload.get('agent_type') != 'python' or payload.get('version') != version:
+            return False
+    return True
+
+
+def _run_selfcheck(path):
+    """Runs the downloaded agent with --selfcheck under a timeout. Returns
+    (exit code or None on timeout, stdout, first bytes of stderr). Output
+    goes through files, not pipes, and the child gets its own process group:
+    a probe it leaves behind (a hung smartctl) would otherwise keep a pipe
+    open and this agent waiting on it for ever."""
+    import signal
     import tempfile
+    env = dict(os.environ, BK_UPDATE_SELFCHECK='1')
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen([sys.executable, path, '--selfcheck'], stdin=subprocess.DEVNULL,
+                                stdout=out_f, stderr=err_f, env=env, start_new_session=True)
+        try:
+            rc = proc.wait(timeout=SELFCHECK_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            rc = None
+        out_f.seek(0)
+        err_f.seek(0)
+        return rc, out_f.read().decode('utf-8', 'replace'), err_f.read(300).decode('utf-8', 'replace')
 
-    url = update_info.get("update_url", "")
-    expected_sha = update_info.get("update_sha256", "")
-    latest = update_info.get("latest_version", "?")
 
-    if not url or not expected_sha:
+def _write_line(path, line):
+    """One short line, replaced atomically (a temp file in the same directory
+    and a rename), so a kill mid-write never leaves half a marker."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(line + '\n')
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_dir(path):
+    """The rename itself on the disk, where the platform allows it."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _refuse_sha(sha):
+    """Remembers a file (by its sha256) this host will not install for a day."""
+    try:
+        _write_line(REFUSED_FILE, f"{sha} {int(time.time())}")
+    except OSError:
+        pass
+
+
+def _recently_refused(sha):
+    """True when this exact file was taken back off this host, or refused for
+    what its bytes are, in the last 24 h: without that, the restored version
+    would reinstall it on the very next report and the host would flip
+    between the two - or download and log the same bad file every run."""
+    try:
+        with open(REFUSED_FILE, 'r') as f:
+            parts = f.read().split()
+    except OSError:
+        return False
+    if len(parts) != 2 or not re.fullmatch(r'[0-9]{1,18}', parts[1]):
+        return False
+    return parts[0] == sha and time.time() - int(parts[1]) < 86400
+
+
+def self_update(update_info):
+    url = update_info.get("update_url")
+    expected_sha = update_info.get("update_sha256")
+    latest = update_info.get("latest_version")
+
+    if not url or not expected_sha or not isinstance(url, str) or not isinstance(expected_sha, str):
+        return False
+    # Debug level: the server repeats its offer with every report, and a
+    # refusal that stands until the server changes must not fill the log.
+    if not _version_newer(latest, AGENT_VERSION):
+        log_debug(f"Aktualizace na '{latest}' odmítnuta: není novější než {AGENT_VERSION}.")
+        return False
+    if _recently_refused(expected_sha):
+        log_debug(f"Aktualizace na {latest} odložena: tento soubor byl na tomto stroji odmítnut nebo vrácen zpět před méně než 24 h.")
         return False
 
-    self_path = os.path.abspath(__file__)
-    log_message(f"K dispozici je nová verze agenta {latest} (aktuální {AGENT_VERSION}), stahuji z {url}...")
+    self_dir = os.path.dirname(SELF_PATH)
+    new_path = SELF_PATH + '.new'
+    prev_path = SELF_PATH + '.prev'
 
+    def refused(reason, refuse_sha=None):
+        log_message(f"CHYBA UPDATE: {reason} Aktualizace zrušena.")
+        _unlink_quiet(new_path)
+        # A refusal for what the file IS (not for a full disk or a failed
+        # download) will not change until the server serves other bytes.
+        if refuse_sha:
+            _refuse_sha(refuse_sha)
+        return False
+
+    # Room for the new file beside this one and for a copied .prev where a
+    # hardlink is not possible, checked before anything is written: a full
+    # disk breaks far more on the host than this agent.
+    try:
+        need = 2 * os.path.getsize(SELF_PATH) + 64 * 1024
+        st = os.statvfs(self_dir)
+        if st.f_bavail * st.f_frsize < need:
+            return refused(f"Vedle {SELF_PATH} není místo na novou verzi (volno {st.f_bavail * st.f_frsize // 1024} kB, potřeba {need // 1024} kB).")
+    except OSError:
+        pass
+
+    log_message(f"K dispozici je nová verze agenta {latest} (aktuální {AGENT_VERSION}), stahuji z {url}...")
     try:
         with urllib.request.urlopen(url, timeout=15) as response:
             new_source = response.read()
-
-        actual_sha = hashlib.sha256(new_source).hexdigest()
-        if actual_sha != expected_sha:
-            log_message(f"CHYBA UPDATE: Checksum nesouhlasí (očekáván {expected_sha}, stažen {actual_sha}). Aktualizace zrušena.")
-            return False
-
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.py', dir=os.path.dirname(self_path))
-        try:
-            with os.fdopen(tmp_fd, 'wb') as f:
-                f.write(new_source)
-
-            py_compile.compile(tmp_path, doraise=True)
-
-            os.chmod(tmp_path, 0o755)
-            backup_path = self_path + '.bak'
-            try:
-                with open(self_path, 'rb') as src, open(backup_path, 'wb') as dst:
-                    dst.write(src.read())
-            except Exception:
-                pass
-
-            os.replace(tmp_path, self_path)
-            log_message(f"OK: Agent aktualizován na verzi {latest}. Nová verze se použije při příštím spuštění.")
-            return True
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
     except Exception as e:
-        log_message(f"CHYBA UPDATE: Aktualizace se nezdařila: {e}")
-        return False
+        return refused(f"Stažení nové verze se nezdařilo: {e}.")
+
+    actual_sha = hashlib.sha256(new_source).hexdigest()
+    if actual_sha != expected_sha:
+        return refused(f"Checksum nesouhlasí (očekáván {expected_sha}, stažen {actual_sha}).")
+    if not _sentinel_ok(new_source, latest):
+        return refused(f"Stažený soubor nekončí řádkem '# bk-agent-end {latest}' (neúplný přenos nebo jiná verze).", refuse_sha=actual_sha)
+    try:
+        # compile() rather than py_compile: the same check, and no .pyc
+        # left behind for a file that may never be installed.
+        compile(new_source, new_path, 'exec')
+    except (SyntaxError, ValueError) as e:
+        return refused(f"Stažený soubor neprošel kontrolou syntaxe: {e}.", refuse_sha=actual_sha)
+
+    # One fixed name in this directory: a run killed mid-update leaves one
+    # file the next attempt overwrites, and the final rename stays inside one
+    # filesystem. The data reaches the disk before the name points at it.
+    try:
+        _unlink_quiet(new_path)
+        with open(new_path, 'wb') as f:
+            f.write(new_source)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(new_path, os.stat(SELF_PATH).st_mode & 0o7777)
+    except OSError as e:
+        return refused(f"Novou verzi nelze uložit vedle {SELF_PATH}: {e}.")
+
+    rc, out, err = _run_selfcheck(new_path)
+    if rc != 0 or not _selfcheck_ok(out, latest):
+        why = 'vypršel čas' if rc is None else f'kód {rc}'
+        detail = ' '.join(err.split())
+        return refused(f"Nová verze neprošla samokontrolou (--selfcheck, {why}){': ' + detail if detail else ''}.", refuse_sha=actual_sha)
+
+    # The current version stays beside the new one for the probation.
+    try:
+        _unlink_quiet(prev_path)
+        try:
+            os.link(SELF_PATH, prev_path)
+        except OSError:
+            import shutil
+            shutil.copy2(SELF_PATH, prev_path)
+    except OSError as e:
+        _unlink_quiet(prev_path)
+        return refused(f"Nelze uložit současnou verzi jako {prev_path}: {e}.")
+    # Written BEFORE the rename, so the new version never runs without it; if
+    # the rename fails, the old version finds a file naming another version
+    # and drops it.
+    try:
+        _write_line(PROBATION_FILE, f"{latest} {AGENT_VERSION} {expected_sha} 0 0")
+    except OSError as e:
+        return refused(f"Nelze zapsat {PROBATION_FILE} - bez něj by vadnou verzi nešlo vrátit ({e}).")
+    try:
+        os.replace(new_path, SELF_PATH)
+    except OSError as e:
+        _unlink_quiet(PROBATION_FILE)
+        return refused(f"Nepodařilo se nahradit {SELF_PATH} (práva?): {e}.")
+    _fsync_dir(self_dir)
+    log_message(f"OK: Agent aktualizován na verzi {latest}. Nová verze se použije při příštím spuštění.")
+    return True
+
+
+# --- Probation of a freshly installed version ---------------------------------
+# The updater checks a download as well as it can before the swap, but some
+# failures only show against the real server: a payload it rejects, a
+# transport that no longer connects. Until the first accepted report the
+# .probation file counts this version's runs and refusals; past the limits
+# the previous version (.prev) comes back and runs at once, and the refused
+# file is remembered for a day so the same offer does not reinstall it.
+
+def _read_probation():
+    try:
+        with open(PROBATION_FILE, 'r') as f:
+            parts = f.read().split()
+    except OSError:
+        return None
+    if len(parts) != 5:
+        parts = (parts + [''] * 5)[:5]
+    new, old, sha, runs, rejected = parts
+    return {
+        'new': new, 'old': old, 'sha': sha,
+        'runs': int(runs) if re.fullmatch(r'[0-9]{1,9}', runs) else 0,
+        'rejected': int(rejected) if re.fullmatch(r'[0-9]{1,9}', rejected) else 0,
+    }
+
+
+def _save_probation(pb):
+    try:
+        _write_line(PROBATION_FILE, f"{pb['new']} {pb['old']} {pb['sha']} {pb['runs']} {pb['rejected']}")
+    except OSError:
+        pass
+
+
+def _probation_check():
+    """At the start of a report run. Returns the probation record while this
+    version is on probation (main() counts a refusal into it), else None.
+    Rolls back and hands the run to the restored version past the limits."""
+    pb = _read_probation()
+    if pb is None:
+        return None
+    if pb['new'] != AGENT_VERSION:
+        # Left behind by a swap that never happened: not this version's.
+        _unlink_quiet(PROBATION_FILE)
+        return None
+    if pb['rejected'] < ROLLBACK_REJECTED and pb['runs'] < ROLLBACK_RUNS:
+        pb['runs'] += 1
+        _save_probation(pb)
+        return pb
+    _unlink_quiet(PROBATION_FILE)
+    prev_path = SELF_PATH + '.prev'
+    try:
+        with open(prev_path, 'rb') as f:
+            compile(f.read(), prev_path, 'exec')
+    except (OSError, SyntaxError, ValueError):
+        log_message(f"CHYBA UPDATE: verze {AGENT_VERSION} nedoručila žádný report ({pb['runs']} běhů, {pb['rejected']} odmítnutí serverem), ale předchozí verze ({prev_path}) chybí nebo je poškozená - zůstávám.")
+        return None
+    try:
+        os.replace(prev_path, SELF_PATH)
+    except OSError as e:
+        log_message(f"CHYBA UPDATE: vrácení předchozí verze {pb['old']} se nezdařilo: {e}")
+        return None
+    _refuse_sha(pb['sha'])
+    log_message(f"VAROVÁNÍ: verze {AGENT_VERSION} nedoručila žádný report ({pb['runs']} běhů, {pb['rejected']} odmítnutí serverem), vrácena předchozí verze {pb['old']}.")
+    # The restored script takes over this run. The lock file descriptor is
+    # not inherited (Python opens files close-on-exec), so it takes the lock
+    # afresh. If that fails, the restored file is in place for the next run.
+    try:
+        os.execv(sys.executable, [sys.executable, SELF_PATH] + sys.argv[1:])
+    except OSError as e:
+        log_message(f"VAROVÁNÍ: předchozí verze se spustí až příštím během ({e}).")
+        sys.exit(1)
 
 
 def send_action_result(action_id, status, message):
@@ -1246,57 +1582,157 @@ def send_action_result(action_id, status, message):
         log_message(f"VAROVÁNÍ: Potvrzení akce {action_id} se nepodařilo odeslat: {e}")
 
 
+# Shared by the four agents (agent.sh, agent.py, agent.ps1, agent_openwrt.sh):
+# 1-128 characters, a letter, digit or underscore first, then those and
+# "_ . @ $ -". No "/" or "\" (the name becomes part of a path run as root),
+# no leading "." (no "..") and no leading "-" (systemctl would read an
+# option). "@" is a systemd template instance, "$" a Windows one
+# (MSSQL$SQLEXPRESS).
+_SERVICE_NAME_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.@$-]{0,127}')
+
+
+def valid_service_name(name):
+    return isinstance(name, str) and _SERVICE_NAME_RE.fullmatch(name) is not None
+
+
+# restart_service restarts a service, not the machine. systemctl takes the
+# unit type from the suffix: "systemctl restart poweroff.target" (or
+# emergency.target, or a .mount) is a system-wide action that ALLOWED_ACTIONS
+# never allowed - reboot_server is an entry of its own. A name with no suffix
+# stays a service (systemctl adds ".service"), and so does "php8.2-fpm".
+_NON_SERVICE_UNIT_SUFFIXES = ('.target', '.mount', '.automount', '.socket', '.device',
+                              '.swap', '.path', '.timer', '.slice', '.scope')
+
+
+def service_unit_ok(name):
+    return not name.endswith(_NON_SERVICE_UNIT_SUFFIXES)
+
+
+def _digits(value):
+    """action_id / timestamp as an int when they are a plain number (a JSON
+    integer or a string of at most 18 ASCII digits), else None. JSON true is
+    an int in Python and is not a number here."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value < 10 ** 18 else None
+    if isinstance(value, str) and re.fullmatch(r'[0-9]{1,18}', value):
+        return int(value)
+    return None
+
+
+def _action_gate(act_type, act_nonce, svc_name, now):
+    """What a correctly SIGNED action still has to pass - the gate
+    agent_openwrt.sh has had since 0.1.7. Returns the reason for a refusal,
+    or None. Without it a signed answer could be replayed for as long as its
+    timestamp held (the same nonce ran twice)."""
+    # Single use. A signature is good for 30 s either side of its timestamp,
+    # so at most 60 s after its first use - that long the nonce is
+    # remembered. Written BEFORE the action runs: a reboot would not come
+    # back to do it.
+    if not isinstance(act_nonce, str) or not re.fullmatch(r'[A-Za-z0-9]{1,128}', act_nonce):
+        return "nonce chybí nebo má nepovolené znaky"
+    keep = []
+    try:
+        with open(NONCE_FILE, 'r') as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError:
+        # Unreadable is not "never used".
+        return f"nonce nejde přečíst z {NONCE_FILE}"
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 2 or not re.fullmatch(r'[0-9]{1,18}', parts[0]):
+            continue
+        if now - int(parts[0]) > 60:
+            continue
+        if parts[1] == act_nonce:
+            return "nonce už byl použit (opakovaná odpověď)"
+        keep.append(line)
+    keep.append(f"{now} {act_nonce}")
+    # A nonce that cannot be remembered could be replayed: refuse.
+    try:
+        _write_line(NONCE_FILE, '\n'.join(keep))
+    except OSError:
+        return f"nonce nejde uložit do {NONCE_FILE}"
+    if not isinstance(act_type, str) or not re.fullmatch(r'[a-z_]+', act_type):
+        return "neplatný typ akce"
+    allowed = [a.strip() for a in ALLOWED_ACTIONS.split(",") if a.strip()]
+    if act_type not in allowed:
+        return f"akce '{act_type}' není v ALLOWED_ACTIONS"
+    if act_type == "restart_service" and not valid_service_name(svc_name):
+        return "neplatný název služby"
+    if act_type == "restart_service" and not service_unit_ok(svc_name):
+        return f"'{svc_name}' není služba (jednotka systemd jiného typu)"
+    return None
+
+
 def handle_remote_action(res_body):
     """Zpracování HMAC-podepsané vzdálené akce z odpovědi serveru. Opt-in přes
-    REMOTE_ACTIONS_ENABLED=1; whitelist v ALLOWED_ACTIONS; podpis se ověřuje
-    proti "action={a}|ts={t}|nonce={n}" klíčem agenta a platí max. 30 s -
-    identická logika jako v shell agentech, jen s poctivým JSON parsováním
-    místo awk. Každá větev (úspěch i odmítnutí) hlásí výsledek zpět."""
+    REMOTE_ACTIONS_ENABLED=1; podpis se ověřuje proti "action={a}|ts={t}|nonce={n}"
+    klíčem agenta a platí max. 30 s. Same order as the shell agents: numbers
+    first, then the time window, the signature, and only then the gate
+    (single-use nonce, allow-list, service name). Každá větev (úspěch i
+    odmítnutí) hlásí výsledek zpět."""
     try:
         data = json.loads(res_body)
     except ValueError:
+        return
+    if not isinstance(data, dict):
         return
 
     # Server akci posílá zanořenou v "pending_action" (viz agent_api.php);
     # top-level fallback jen pro případ budoucí změny formátu.
     act = data.get("pending_action") if isinstance(data.get("pending_action"), dict) else data
 
-    act_id = act.get("action_id")
+    raw_id = act.get("action_id")
+    raw_ts = act.get("timestamp")
     act_type = act.get("action")
-    act_ts = act.get("timestamp")
     act_sig = act.get("signature")
     act_nonce = act.get("nonce", "")
 
-    if not act_id or not act_type or not act_ts or not act_sig:
+    # Numbers before anything else: int("12a") used to raise into main()'s
+    # network handler, which ended the run as a "connection failure" - no
+    # self-update that run either. Not a number = no action.
+    act_id = _digits(raw_id)
+    act_ts = _digits(raw_ts)
+    if (raw_id is not None and act_id is None) or (raw_ts is not None and act_ts is None):
+        log_message("VAROVÁNÍ: Vzdálená akce má nečíselné action_id nebo timestamp, ignoruji ji.")
+        return
+    if act_id is None or act_ts is None or not act_type or not act_sig:
+        return
+    if not isinstance(act_type, str) or not isinstance(act_sig, str):
         return
 
-    if abs(int(time.time()) - int(act_ts)) > 30:
+    now = int(time.time())
+    if abs(now - act_ts) > 30:
         log_message("VAROVÁNÍ: Odmítnuta vzdálená akce - vypršená platnost (časové okno > 30s)")
         send_action_result(act_id, "failed", "Vypršela platnost podpisu (>30s)")
         return
 
-    allowed = [a.strip() for a in ALLOWED_ACTIONS.split(",") if a.strip()]
-    if act_type not in allowed:
-        log_message(f"VAROVÁNÍ: Odmítnuta vzdálená akce '{act_type}' - není na seznamu ALLOWED_ACTIONS!")
-        send_action_result(act_id, "failed", f"Akce '{act_type}' není v ALLOWED_ACTIONS")
-        return
-
-    calc_str = f"action={act_type}|ts={act_ts}|nonce={act_nonce}"
+    # The timestamp exactly as the server signed it.
+    ts_text = raw_ts if isinstance(raw_ts, str) else str(raw_ts)
+    calc_str = f"action={act_type}|ts={ts_text}|nonce={act_nonce}"
     calc_sig = hmac.new(AGENT_KEY.encode('utf-8'), calc_str.encode('utf-8'), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calc_sig, str(act_sig)):
+    if not hmac.compare_digest(calc_sig.encode('utf-8'), act_sig.encode('utf-8')):
         log_message("VAROVÁNÍ: Odmítnuta vzdálená akce - neplatný HMAC podpis!")
         send_action_result(act_id, "failed", "Neplatný HMAC podpis")
+        return
+
+    svc_name = act.get("service_name") or data.get("service_name") or ""
+    # The gate only ever sees a verified signature: an unsigned answer learns
+    # nothing about the list and burns no nonce.
+    refused = _action_gate(act_type, act_nonce, svc_name, now)
+    if refused:
+        log_message(f"VAROVÁNÍ: Odmítnuta vzdálená akce {act_type} (ID: {act_id}): {refused}")
+        send_action_result(act_id, "failed", f"Odmítnuto: {refused}")
         return
 
     log_message(f"Aktivována bezpečná vzdálená akce: {act_type} (ID: {act_id})")
 
     if act_type == "restart_service":
-        svc_name = str(act.get("service_name") or data.get("service_name") or "").strip()
-        # Jméno služby jde do shellového příkazu - povolit jen bezpečné znaky,
-        # i když je podepsané serverem (obrana do hloubky).
-        if not svc_name or not re.fullmatch(r'[A-Za-z0-9_.@-]+', svc_name):
-            send_action_result(act_id, "failed", "Chybí nebo je neplatné service_name v payloadu akce")
-            return
+        # svc_name was checked by _action_gate.
         try:
             if subprocess.call(["systemctl", "restart", svc_name],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120) == 0:
@@ -1312,7 +1748,8 @@ def handle_remote_action(res_body):
         except OSError:
             pass
         init_script = f"/etc/init.d/{svc_name}"
-        if os.access(init_script, os.X_OK):
+        # isfile as well as X_OK: a directory passes X_OK.
+        if os.path.isfile(init_script) and os.access(init_script, os.X_OK):
             try:
                 rc = subprocess.call([init_script, "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
             except (subprocess.TimeoutExpired, OSError) as e:
@@ -1346,6 +1783,10 @@ def handle_remote_action(res_body):
             # was wrong, and the administration would show a reboot that never
             # happened.
             send_action_result(act_id, "failed", "Reboot se nepodařilo spustit (reboot ani systemctl reboot neuspěly)")
+    else:
+        # On the list but unknown to this version: say so, or the action
+        # stays "sent" for ever.
+        send_action_result(act_id, "failed", f"Tato verze agenta akci '{act_type}' nezná")
 
 
 def get_discovered_services(ports, processes):
@@ -1529,6 +1970,9 @@ def main():
 
     if STATE_DIR_FALLBACK:
         log_message(f"VAROVANI: do {_script_dir} nelze zapisovat, stav se ukládá do /tmp.")
+    # Before any collection, so a version that fails later in the run still
+    # reaches it. A dry run is not a report run.
+    probation = None if DRY_RUN else _probation_check()
     log_debug("Získávám systémové statistiky...")
     cpu, cpu_steal, iowait = get_cpu_usage()
     ram = get_ram_usage()
@@ -1614,6 +2058,13 @@ def main():
         "discovered_services": discovered_services
     }
 
+    if SELFCHECK:
+        # One line for the updater: the payload goes through the same
+        # json.dumps as a real report, so a value it cannot serialise fails
+        # here and not on every report after the swap.
+        print(json.dumps({"agent_type": "python", "agent_version": AGENT_VERSION, "payload": payload}, separators=(',', ':')))
+        return
+
     if DRY_RUN:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         log_debug("Režim --dry-run: data se neodesílají.")
@@ -1637,6 +2088,14 @@ def main():
             if res_code == 200:
                 log_debug("OK: Statistiky úspěšně odeslány.")
                 log_debug("Odpověď: " + res_body.strip())
+                # The stamp a version on probation waits for: which version
+                # the server accepted a report from, and when. It ends the
+                # probation.
+                try:
+                    _write_line(LAST_OK_FILE, f"{AGENT_VERSION} {int(time.time())}")
+                except OSError:
+                    pass
+                _unlink_quiet(PROBATION_FILE)
 
                 # Vzdálené akce (opt-in přes REMOTE_ACTIONS_ENABLED=1) - v Docker
                 # režimu nedávají smysl (kontejner nevidí systemd hostitele).
@@ -1656,9 +2115,20 @@ def main():
                 log_message(f"CHYBA: Server odpověděl kódem {res_code}.")
                 log_message("Odpověď: " + res_body.strip())
                 sys.exit(1)
+    except urllib.error.HTTPError as e:
+        # The server answered, and said no. A version on probation that the
+        # server turns away is counted: a few refusals take it back
+        # (_probation_check). Only 4xx - a 5xx or no answer at all is not
+        # this version's doing and counts only as a run.
+        if probation is not None and 400 <= e.code < 500:
+            probation['rejected'] += 1
+            _save_probation(probation)
+        log_message(f"CHYBA: Server odpověděl kódem {e.code}.")
+        sys.exit(1)
     except Exception as e:
         log_message(f"CHYBA: Nepodařilo se navázat spojení se serverem. Detaily: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
     main()
+# bk-agent-end 0.1.2

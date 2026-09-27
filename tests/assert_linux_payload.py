@@ -35,6 +35,17 @@ for kind, label in (("sh2", "bash agent via python3"), ("sh3", "bash agent via n
     )
     check(f"teamspeak: {label} decodes the escaped name", first.get("name") == "Blood Kings")
 
+# cron's bare environment (env -i PATH=/usr/bin:/bin) against an ordinary
+# run: the agents add the sbin directories themselves, so what one measures
+# the other measures too. zerotier-cli is a stub in /usr/sbin.
+for kind in ("sh", "py"):
+    ri = json.load(open(f"{out}/cron_{kind}_i.json"))
+    rc = json.load(open(f"{out}/cron_{kind}_c.json"))
+    check(f"{kind}: a tool in /usr/sbin is found under cron's PATH", ri.get("zerotier_networks") == 1 and rc.get("zerotier_networks") == 1)
+    measured = {k for k, v in ri.items() if v is not None}
+    lost = sorted(k for k in measured if rc.get(k) is None)
+    check(f"{kind}: everything measured in an ordinary run is measured under cron's env{' (lost: ' + ', '.join(lost) + ')' if lost else ''}", not lost)
+
 sh2 = json.load(open(f"{out}/sh2.json"))
 top = sh2["top_cpu_processes"]
 check("sh: the busy `yes` tops the CPU ranking", bool(top) and top[0]["name"] == "yes" and top[0]["cpu"] >= 50)

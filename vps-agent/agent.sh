@@ -4,6 +4,20 @@
 # Tento skript spouštějte na vašem VPS (např. přes cron každých 5 minut).
 # Nevyžaduje žádné knihovny ani Python 3 (pouze standardní sh/bash, awk, grep, df a curl).
 
+# cron starts jobs with PATH=/usr/bin:/bin on Debian and most distributions,
+# while smartctl, sysctl and friends live in the sbin directories: a metric
+# the manual `--verbose` test measured came out null on every cron run after
+# it. The system directories are appended when missing, not prepended, so a
+# PATH the operator set on purpose (a systemd unit, a newer tool in /opt)
+# keeps its order.
+for _bk_dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    case ":$PATH:" in
+        *":$_bk_dir:"*) ;;
+        *) PATH="${PATH:+$PATH:}$_bk_dir" ;;
+    esac
+done
+export PATH
+
 # === VÝCHOZÍ KONFIGURACE ===
 # Pokud chcete, můžete tyto hodnoty nechat zde, nebo vytvořit soubor 'agent.cfg' ve stejné složce
 API_URL="http://localhost/status/agent_api.php"
@@ -100,9 +114,34 @@ LOG_FILE="$ScriptPath/agent.log"
 # Plus one cache for the expensive checks (see HEAVY_OP_INTERVAL_HOURS).
 STATE_FILE="$ScriptPath/agent.state"
 HEAVY_CACHE_FILE="$ScriptPath/agent-heavy.cache"
+BK_LOCK_FILE="$ScriptPath/.agent.lock"
+# Self-update bookkeeping sits next to the script itself and is named after
+# it, so agent.sh and agent.py installed in one directory never share a file.
+#   .prev       the version this one replaced (a hardlink, a copy if not)
+#   .probation  "<new> <old> <sha256> <runs> <rejected>" from the swap until
+#               the new version's first accepted report
+#   .last-ok    "<version> <unix time>" of the last accepted report
+#   .refused    "<sha256> <unix time>" of a file this host took back or
+#               refused for what its bytes are (no end sentinel, bad syntax,
+#               failed self-check): not downloaded again for 24 h
+#   .nonces     remote-action nonces already used
+BK_SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+BK_PROBATION="$BK_SELF.probation"
+BK_LAST_OK="$BK_SELF.last-ok"
+BK_REFUSED="$BK_SELF.refused"
+BK_NONCE_FILE="$BK_SELF.nonces"
+# A new version that the server refused this many times, or that did not get
+# a single report through in this many runs, is replaced by the previous one.
+# Refusals (4xx) count fast; runs with no answer only after a long outage, so
+# a network outage alone does not roll anything back after a few minutes.
+BK_ROLLBACK_REJECTED=3
+BK_ROLLBACK_RUNS=30
+# The script's own arguments, for the restarted run after a rollback.
+BK_ARGS=("$@")
 
 VERBOSE="0"
 DRY_RUN="0"
+SELFCHECK="0"
 [ -t 1 ] && VERBOSE="1"
 for arg in "$@"; do
     case "$arg" in
@@ -138,8 +177,43 @@ for arg in "$@"; do
             DRY_RUN="1"
             VERBOSE="1"
             ;;
+        --selfcheck)
+            SELFCHECK="1"
+            ;;
     esac
 done
+# --selfcheck: the updater runs a freshly downloaded copy this way before it
+# replaces the running agent. It is the whole collection of a dry run,
+# printed as ONE line {"agent_type","agent_version","payload"}: a release
+# that dies halfway, or builds a payload that is not JSON (a missing comma
+# passes `bash -n` and then earns a 400 on every report, for ever), is
+# refused before it is installed. Only the updater sets BK_UPDATE_SELFCHECK=1:
+# a hand-typed --selfcheck must not quietly turn into some other run.
+if [ "$SELFCHECK" = "1" ]; then
+    if [ "$BK_UPDATE_SELFCHECK" != "1" ]; then
+        echo "--selfcheck spousti jen aktualizace agenta (BK_UPDATE_SELFCHECK=1)." >&2
+        exit 2
+    fi
+    # A scratch directory of its own: the running agent holds the real lock
+    # at this moment, and its log, counters and heavy cache must not be
+    # written by a version that may use another format.
+    BK_SC_DIR=$(mktemp -d "${TMPDIR:-/tmp}/bk-selfcheck.XXXXXX" 2>/dev/null) || { echo "selfcheck: mktemp -d failed" >&2; exit 3; }
+    trap 'rm -rf "$BK_SC_DIR"' EXIT
+    LOG_FILE="$BK_SC_DIR/agent.log"
+    STATE_FILE="$BK_SC_DIR/agent.state"
+    # A COPY of the heavy cache, mtime and all (the running agent refreshed
+    # it just before its report): with an empty one the self-check would run
+    # SMART on every disk, and a host whose disks answer slowly (20 s each
+    # for a hung smartctl) ran out of the 60 s and refused every release for
+    # good. The copy is what the new version reads on its first real run too.
+    cp -p "$HEAVY_CACHE_FILE" "$BK_SC_DIR/agent-heavy.cache" 2>/dev/null || true
+    HEAVY_CACHE_FILE="$BK_SC_DIR/agent-heavy.cache"
+    BK_LOCK_FILE="$BK_SC_DIR/.agent.lock"
+    DRY_RUN="1"
+    VERBOSE="0"
+    # Not needed to build a payload, and this output is not a report.
+    AGENT_KEY=""
+fi
 # A dry run keeps its own state series: run by hand between two cron ticks it
 # used to overwrite the counters, and the next cron report shipped forks and
 # network errors for a fraction of the interval as if they covered all of it.
@@ -195,7 +269,7 @@ if command -v flock >/dev/null 2>&1; then
     # The brace group puts the stderr redirect in place BEFORE exec tries to
     # open the lock file - on the exec line itself it came too late, so an
     # unwritable directory printed the error every minute.
-    if { exec 9>"$ScriptPath/.agent.lock"; } 2>/dev/null; then
+    if { exec 9>"$BK_LOCK_FILE"; } 2>/dev/null; then
         flock -n 9 || { log_message "Predchozi beh jeste bezi, tento koncim."; exit 0; }
     fi
 fi
@@ -203,6 +277,61 @@ fi
 # printf's %()T needs bash 4.2; older bash falls back to date (measured, not fabricated).
 bk_now() { printf '%(%s)T' -1 2>/dev/null || date +%s; }
 now_ts=$(bk_now)
+
+# Remembers a file (by its sha256) this host will not install for a day.
+bk_refuse_sha() {
+    printf '%s %s\n' "$1" "$(bk_now)" > "$BK_REFUSED.tmp" 2>/dev/null \
+        && mv -f "$BK_REFUSED.tmp" "$BK_REFUSED" 2>/dev/null
+}
+
+# --- Probation of a freshly installed version ------------------------------
+# The updater checks a download as well as it can before the swap, but some
+# failures only show against the real server: a payload it rejects, a
+# transport that no longer connects. Until the first accepted report the
+# updater's .probation file counts this version's runs and refusals; past the
+# limits the previous version (.prev) comes back and runs at once, and the
+# refused file is remembered for a day so the same offer does not reinstall
+# it straight away. This runs before any collection, so a version that fails
+# later in the run still reaches it. A dry run is not a report run.
+bk_probation_save() { # RUNS REJECTED
+    printf '%s %s %s %s %s\n' "$pb_new" "$pb_old" "$pb_sha" "$1" "$2" > "$BK_PROBATION.tmp" 2>/dev/null \
+        && mv -f "$BK_PROBATION.tmp" "$BK_PROBATION" 2>/dev/null
+}
+bk_probation_check() {
+    [ -f "$BK_PROBATION" ] || return 0
+    pb_new=""; pb_old=""; pb_sha=""; pb_runs=""; pb_rej=""
+    read -r pb_new pb_old pb_sha pb_runs pb_rej < "$BK_PROBATION" 2>/dev/null
+    # Left behind by a swap that never happened, or by an older update: this
+    # version is not on probation.
+    if [ "$pb_new" != "$AGENT_VERSION" ]; then
+        rm -f "$BK_PROBATION" 2>/dev/null
+        return 0
+    fi
+    # A count that is not a small number is a damaged file: start over.
+    case "$pb_runs" in ''|*[!0-9]*|??????????*) pb_runs=0 ;; esac
+    case "$pb_rej" in ''|*[!0-9]*|??????????*) pb_rej=0 ;; esac
+    if [ "$pb_rej" -lt "$BK_ROLLBACK_REJECTED" ] && [ "$pb_runs" -lt "$BK_ROLLBACK_RUNS" ]; then
+        pb_runs=$((pb_runs + 1))
+        bk_probation_save "$pb_runs" "$pb_rej"
+        return 0
+    fi
+    rm -f "$BK_PROBATION" 2>/dev/null
+    if [ ! -f "$BK_SELF.prev" ] || ! bash -n "$BK_SELF.prev" 2>/dev/null; then
+        log_message "CHYBA UPDATE: Verze $AGENT_VERSION nedoručila žádný report ($pb_runs běhů, $pb_rej odmítnutí serverem), ale předchozí verze ($BK_SELF.prev) chybí nebo je poškozená - zůstávám."
+        return 0
+    fi
+    if ! mv -f "$BK_SELF.prev" "$BK_SELF" 2>/dev/null; then
+        log_message "CHYBA UPDATE: Vrácení předchozí verze $pb_old se nezdařilo (práva k $BK_SELF?)."
+        return 0
+    fi
+    bk_refuse_sha "$pb_sha"
+    log_message "VAROVÁNÍ: Verze $AGENT_VERSION nedoručila žádný report ($pb_runs běhů, $pb_rej odmítnutí serverem), vrácena předchozí verze $pb_old."
+    # The restored script takes over this run. exec keeps fd 9, and its own
+    # `exec 9>` reopens the lock file, which drops and retakes the lock.
+    exec bash "$BK_SELF" "${BK_ARGS[@]}"
+}
+pb_new=""
+[ "$DRY_RUN" = "1" ] || bk_probation_check
 
 # Previous-run state, read as plain key=value lines - never eval'ed.
 st_boot_id=""; st_cpu=""; st_diskio=""; st_net=""; st_forks=""; st_ts3=""
@@ -256,7 +385,7 @@ new_st_cpu=""
 [ -n "$stat_now" ] && new_st_cpu="${now_ts}|${stat_now}"
 
 # 2. RAM Usage (%) & MB breakdown
-eval $(awk '
+eval "$(awk '
 /^MemTotal:/ { total=int($2/1024) }
 /^MemFree:/ { free=int($2/1024) }
 /^Buffers:/ { buffers=int($2/1024) }
@@ -268,7 +397,7 @@ END {
     if (used < 0) used = 0;
     pct = (total == 0) ? "0.0" : sprintf("%.1f", (used / total) * 100);
     print "ram=" pct "; ram_total_mb=" total "; ram_used_mb=" used "; ram_available_mb=" avail "; ram_free_mb=" free;
-}' /proc/meminfo 2>/dev/null)
+}' /proc/meminfo 2>/dev/null)"
 [ -z "$ram" ] && ram="null"
 # Kdyz se /proc/meminfo neprecte, NENI to stroj s 0 MB pameti - hodnoty
 # zustavaji null a server i UI to zobrazi jako "nezmereno".
@@ -767,7 +896,7 @@ sys.stdout.write(" ".join(buf.split("\n")))
 ts3_json_list=""
 for q_port in 10011 8219; do
     # Kontrola zda port naslouchá
-    if [[ ", $ports_json," =~ ", $q_port," ]] || [[ "$ports_json" =~ ^$q_port, ]] || [[ "$ports_json" =~ ,$q_port$ ]] || [ "$ports_json" = "$q_port" ]; then
+    if [[ ", $ports_json," == *", $q_port,"* ]] || [[ "$ports_json" =~ ^$q_port, ]] || [[ "$ports_json" =~ ,$q_port$ ]] || [ "$ports_json" = "$q_port" ]; then
         response=$(bk_ts3_query "$q_port" "serverlist")
         if [ -n "$response" ]; then
             servers_parsed=$(echo "$response" | awk '
@@ -846,7 +975,8 @@ for q_port in 10011 8219; do
                 if [ -n "$udp_ports" ]; then
                     IFS=',' read -r -a raw_udp <<< "$udp_ports"
                     for up in "${raw_udp[@]}"; do
-                        udp_arr+=($(echo -n "$up" | tr -d '[:space:]'))
+                        up=${up//[[:space:]]/}
+                        [ -n "$up" ] && udp_arr+=("$up")
                     done
                 fi
                 udp_arr+=("9987" "11515")
@@ -1159,6 +1289,14 @@ EOF
 } > "$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null \
     || log_message "VAROVANI: stav se nepodarilo ulozit do $STATE_FILE - delta metriky (CPU, sit, disk) zustanou null."
 
+if [ "$SELFCHECK" = "1" ]; then
+    # One line for the updater. The payload's newlines are layout only and
+    # become tabs: JSON whitespace between tokens, but still an invalid
+    # control character inside a string, so a value that escaped json_str
+    # fails the updater's parse here just as it would fail on the server.
+    printf '{"agent_type":"bash","agent_version":"%s","payload":%s}\n' "$(json_str "$AGENT_VERSION")" "$(printf '%s' "$payload" | tr '\n' '\t')"
+    exit 0
+fi
 if [ "$DRY_RUN" = "1" ]; then
     printf '%s\n' "$payload"
     log_debug "Rezim --dry-run: data se neodesilaji."
@@ -1189,8 +1327,38 @@ else
     exit 1
 fi
 
+# Shared by the four agents (agent.sh, agent.py, agent.ps1, agent_openwrt.sh):
+# 1-128 characters, a letter, digit or underscore first, then those and
+# "_ . @ $ -". No "/" or "\" (the name becomes part of a path run as root),
+# no leading "." (no "..") and no leading "-" (systemctl would read an
+# option). "@" is a systemd template instance, "$" a Windows one
+# (MSSQL$SQLEXPRESS). The "\$" below keeps "$-" from expanding to the
+# shell's option flags inside the pattern.
+bk_valid_service_name() {
+    case "$1" in
+        ''|[!A-Za-z0-9_]*|*[!A-Za-z0-9_.@\$-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 128 ]
+}
+# restart_service restarts a service, not the machine. systemctl takes the
+# unit type from the suffix: "systemctl restart poweroff.target" (or
+# emergency.target, or a .mount) is a system-wide action that ALLOWED_ACTIONS
+# never allowed - reboot_server is an entry of its own. A name with no suffix
+# stays a service (systemctl adds ".service"), and so does "php8.2-fpm".
+bk_service_unit_ok() {
+    case "$1" in
+        *.target|*.mount|*.automount|*.socket|*.device|*.swap|*.path|*.timer|*.slice|*.scope) return 1 ;;
+    esac
+    return 0
+}
+
 if [ "$http_code" = "200" ]; then
     log_debug "OK: Statistiky úspěšně odeslány."
+    # The stamp a version on probation waits for: which version the server
+    # accepted a report from, and when. It ends the probation.
+    printf '%s %s\n' "$AGENT_VERSION" "$(bk_now)" > "$BK_LAST_OK.tmp" 2>/dev/null \
+        && mv -f "$BK_LAST_OK.tmp" "$BK_LAST_OK" 2>/dev/null
+    rm -f "$BK_PROBATION" 2>/dev/null
 
     # Potvrzení provedení akce zpět na server - bez tohohle by agent_actions.status
     # zůstal navždy na 'sent' ("odesláno, čeká na potvrzení") v administraci, i když
@@ -1210,75 +1378,145 @@ if [ "$http_code" = "200" ]; then
     REMOTE_ACTIONS_ENABLED="${REMOTE_ACTIONS_ENABLED:-0}"
     ALLOWED_ACTIONS="${ALLOWED_ACTIONS:-restart_service,reboot_server}"
 
+    # bk_action_gate: what a correctly SIGNED action still has to pass - the
+    # gate agent_openwrt.sh has had since 0.1.7. Sets act_refused to the
+    # reason, or leaves it empty. Without it a signed answer could be
+    # replayed for as long as its timestamp held, and service_name went into
+    # the command as it came: a signed "../../tmp/x" ran /tmp/x as root, and
+    # the same answer replayed ran it again.
+    bk_action_gate() {
+        act_refused=""
+        # Single use. A signature is good for 30 s either side of its
+        # timestamp, so at most 60 s after its first use - that long the
+        # nonce is remembered. Written BEFORE the action runs: a reboot
+        # would not come back to do it.
+        case "$act_nonce" in
+            ''|*[!A-Za-z0-9]*) act_refused="nonce chybí nebo má nepovolené znaky"; return 0 ;;
+        esac
+        nonce_keep=""; nonce_seen=0
+        if [ -f "$BK_NONCE_FILE" ]; then
+            while read -r n_ts n_val; do
+                case "$n_ts" in ''|*[!0-9]*) continue ;; esac
+                [ "${#n_ts}" -le 18 ] || continue
+                [ $((now_ts - 10#$n_ts)) -gt 60 ] && continue
+                [ "$n_val" = "$act_nonce" ] && nonce_seen=1
+                nonce_keep="$nonce_keep$n_ts $n_val
+"
+            done < "$BK_NONCE_FILE"
+        fi
+        if [ "$nonce_seen" = "1" ]; then
+            act_refused="nonce už byl použit (opakovaná odpověď)"; return 0
+        fi
+        # A nonce that cannot be remembered could be replayed: refuse.
+        if ! printf '%s%s %s\n' "$nonce_keep" "$now_ts" "$act_nonce" > "$BK_NONCE_FILE.tmp" 2>/dev/null \
+            || ! mv -f "$BK_NONCE_FILE.tmp" "$BK_NONCE_FILE" 2>/dev/null; then
+            act_refused="nonce nejde uložit do $BK_NONCE_FILE"; return 0
+        fi
+        # Allow-list. The type is checked first: a comma inside it would
+        # match across two entries of the list.
+        case "$act_type" in
+            *[!a-z_]*) act_refused="neplatný typ akce"; return 0 ;;
+        esac
+        allowed_list=$(printf '%s' "$ALLOWED_ACTIONS" | tr -d ' \t\r')
+        case ",$allowed_list," in
+            *",$act_type,"*) ;;
+            *) act_refused="akce '$act_type' není v ALLOWED_ACTIONS"; return 0 ;;
+        esac
+        if [ "$act_type" = "restart_service" ]; then
+            svc_name=$(echo "$body" | sed -n 's/.*"service_name":"\([^"]*\)".*/\1/p')
+            bk_valid_service_name "$svc_name" || { act_refused="neplatný název služby"; return 0; }
+            bk_service_unit_ok "$svc_name" || { act_refused="'$svc_name' není služba (jednotka systemd jiného typu)"; return 0; }
+        fi
+        return 0
+    }
+
     if [ "$REMOTE_ACTIONS_ENABLED" = "1" ] && [ -n "$body" ]; then
         act_id=$(echo "$body" | awk -F'"action_id":' '{print $2}' | awk -F'[,}]' '{print $1}' | tr -d '[:space:]')
         act_type=$(echo "$body" | awk -F'"action":' '{print $2}' | awk -F'[,"]' '{print $2}' | tr -d '[:space:]')
         act_ts=$(echo "$body" | awk -F'"timestamp":' '{print $2}' | awk -F'[,}]' '{print $1}' | tr -d '[:space:]')
         act_sig=$(echo "$body" | awk -F'"signature":' '{print $2}' | awk -F'[,"]' '{print $2}' | tr -d '[:space:]')
         act_nonce=$(echo "$body" | awk -F'"nonce":' '{print $2}' | awk -F'[,"]' '{print $2}' | tr -d '[:space:]')
+        # Both are used as numbers BEFORE any signature is checked: the
+        # timestamp in shell arithmetic, the id unquoted in the result JSON.
+        # A timestamp like a[$(id)] ran that command as root inside $(( )).
+        # Digits only, at most 18 of them (no overflow), read as decimal
+        # (10#) so a leading zero is not an octal error that ends the run.
+        # Not a number = no action.
+        case "$act_id$act_ts" in
+            *[!0-9]*)
+                log_message "VAROVÁNÍ: Vzdálená akce má nečíselné action_id nebo timestamp, ignoruji ji."
+                act_id=""; act_ts="" ;;
+        esac
+        if [ "${#act_id}" -gt 18 ] || [ "${#act_ts}" -gt 18 ]; then
+            log_message "VAROVÁNÍ: Vzdálená akce má příliš dlouhé action_id nebo timestamp, ignoruji ji."
+            act_id=""; act_ts=""
+        fi
 
         if [ -n "$act_id" ] && [ -n "$act_type" ] && [ -n "$act_ts" ] && [ -n "$act_sig" ]; then
             now_ts=$(bk_now)
-            time_diff=$((now_ts - act_ts))
+            time_diff=$((now_ts - 10#$act_ts))
             [ $time_diff -lt 0 ] && time_diff=$(( -time_diff ))
 
             if [ $time_diff -le 30 ]; then
-                case ",$ALLOWED_ACTIONS," in
-                    *",$act_type,"*)
-                        calc_str="action=${act_type}|ts=${act_ts}|nonce=${act_nonce}"
-                        calc_sig=""
-                        if command -v openssl >/dev/null 2>&1; then
-                            calc_sig=$(echo -n "$calc_str" | openssl dgst -sha256 -hmac "$AGENT_KEY" 2>/dev/null | awk '{print $NF}')
-                        elif command -v python3 >/dev/null 2>&1; then
-                            # Via the environment, not interpolated into Python source:
-                            # the nonce comes from the server and a quote in it would
-                            # have been code running as root.
-                            calc_sig=$(BK_KEY="$AGENT_KEY" BK_MSG="$calc_str" python3 -c "import hmac, hashlib, os; print(hmac.new(os.environ['BK_KEY'].encode(), os.environ['BK_MSG'].encode(), hashlib.sha256).hexdigest())" 2>/dev/null)
-                        fi
+                calc_str="action=${act_type}|ts=${act_ts}|nonce=${act_nonce}"
+                calc_sig=""
+                if command -v openssl >/dev/null 2>&1; then
+                    calc_sig=$(echo -n "$calc_str" | openssl dgst -sha256 -hmac "$AGENT_KEY" 2>/dev/null | awk '{print $NF}')
+                elif command -v python3 >/dev/null 2>&1; then
+                    # Via the environment, not interpolated into Python source:
+                    # the nonce comes from the server and a quote in it would
+                    # have been code running as root.
+                    calc_sig=$(BK_KEY="$AGENT_KEY" BK_MSG="$calc_str" python3 -c "import hmac, hashlib, os; print(hmac.new(os.environ['BK_KEY'].encode(), os.environ['BK_MSG'].encode(), hashlib.sha256).hexdigest())" 2>/dev/null)
+                fi
 
-                        if [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
-                            log_message "Aktivována bezpečná vzdálená akce: $act_type (ID: $act_id)"
-                            case "$act_type" in
-                                restart_service)
-                                    svc_name=$(echo "$body" | sed -n 's/.*"service_name":"\([^"]*\)".*/\1/p')
-                                    if [ -n "$svc_name" ]; then
-                                        if command -v systemctl >/dev/null 2>&1; then
-                                            systemctl restart "$svc_name" 9>&- >/dev/null 2>&1 || true
-                                            log_message "Restartována služba přes systemctl: $svc_name"
-                                            send_action_result "$act_id" "executed" "Služba '$svc_name' restartována přes systemctl"
-                                        elif [ -x "/etc/init.d/$svc_name" ]; then
-                                            # 9>&- closes the run lock for the child: a daemon
-                                            # started by an init script inherits open fds and
-                                            # would otherwise hold the lock for as long as it lives.
-                                            /etc/init.d/"$svc_name" restart 9>&- >/dev/null 2>&1 || true
-                                            log_message "Restartována služba přes init.d: $svc_name"
-                                            send_action_result "$act_id" "executed" "Služba '$svc_name' restartována přes init.d"
-                                        else
-                                            log_message "VAROVÁNÍ: Služba '$svc_name' nenalezena nebo neni spustitelná."
-                                            send_action_result "$act_id" "failed" "Služba '$svc_name' nenalezena nebo neni spustitelná"
-                                        fi
-                                    else
-                                        send_action_result "$act_id" "failed" "Chybí service_name v payloadu akce"
-                                    fi
-                                    ;;
-                                reboot_server)
-                                    log_message "PROVÁDÍM REBOOT SERVERU DLE PODEPSANÉHO POKYNU..."
-                                    # Potvrzení musí odejít PŘED rebootem - jakmile
-                                    # /sbin/reboot ukončí proces, už se nic dalšího neprovede.
-                                    send_action_result "$act_id" "executed" "Server se restartuje"
-                                    /sbin/reboot >/dev/null 2>&1 || systemctl reboot >/dev/null 2>&1 || true
-                                    ;;
-                            esac
-                        else
-                            log_message "VAROVÁNÍ: Odmítnuta vzdálená akce - neplatný HMAC podpis!"
-                            send_action_result "$act_id" "failed" "Neplatný HMAC podpis"
-                        fi
-                        ;;
-                    *)
-                        log_message "VAROVÁNÍ: Odmítnuta vzdálená akce '$act_type' - není na seznamu ALLOWED_ACTIONS!"
-                        send_action_result "$act_id" "failed" "Akce '$act_type' neni v ALLOWED_ACTIONS"
-                        ;;
-                esac
+                act_refused=""
+                # The gate only ever sees a verified signature: an unsigned
+                # answer learns nothing about the list and burns no nonce.
+                if [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
+                    bk_action_gate
+                fi
+                if [ -n "$act_refused" ]; then
+                    log_message "VAROVÁNÍ: Odmítnuta vzdálená akce $act_type (ID: $act_id): $act_refused"
+                    send_action_result "$act_id" "failed" "Odmítnuto: $act_refused"
+                elif [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
+                    log_message "Aktivována bezpečná vzdálená akce: $act_type (ID: $act_id)"
+                    case "$act_type" in
+                        restart_service)
+                            # svc_name was read and checked by bk_action_gate.
+                            if command -v systemctl >/dev/null 2>&1; then
+                                systemctl restart "$svc_name" 9>&- >/dev/null 2>&1 || true
+                                log_message "Restartována služba přes systemctl: $svc_name"
+                                send_action_result "$act_id" "executed" "Služba '$svc_name' restartována přes systemctl"
+                            elif [ -f "/etc/init.d/$svc_name" ] && [ -x "/etc/init.d/$svc_name" ]; then
+                                # -f as well as -x: a directory passes -x.
+                                # 9>&- closes the run lock for the child: a daemon
+                                # started by an init script inherits open fds and
+                                # would otherwise hold the lock for as long as it lives.
+                                /etc/init.d/"$svc_name" restart 9>&- >/dev/null 2>&1 || true
+                                log_message "Restartována služba přes init.d: $svc_name"
+                                send_action_result "$act_id" "executed" "Služba '$svc_name' restartována přes init.d"
+                            else
+                                log_message "VAROVÁNÍ: Služba '$svc_name' nenalezena nebo neni spustitelná."
+                                send_action_result "$act_id" "failed" "Služba '$svc_name' nenalezena nebo neni spustitelná"
+                            fi
+                            ;;
+                        reboot_server)
+                            log_message "PROVÁDÍM REBOOT SERVERU DLE PODEPSANÉHO POKYNU..."
+                            # Potvrzení musí odejít PŘED rebootem - jakmile
+                            # /sbin/reboot ukončí proces, už se nic dalšího neprovede.
+                            send_action_result "$act_id" "executed" "Server se restartuje"
+                            /sbin/reboot >/dev/null 2>&1 || systemctl reboot >/dev/null 2>&1 || true
+                            ;;
+                        *)
+                            # On the list but unknown to this version: say
+                            # so, or the action stays "sent" for ever.
+                            send_action_result "$act_id" "failed" "Tato verze agenta akci '$act_type' nezná"
+                            ;;
+                    esac
+                else
+                    log_message "VAROVÁNÍ: Odmítnuta vzdálená akce - neplatný HMAC podpis!"
+                    send_action_result "$act_id" "failed" "Neplatný HMAC podpis"
+                fi
             else
                 log_message "VAROVÁNÍ: Odmítnuta vzdálená akce - vypršená platnost (časové okno > 30s)"
                 send_action_result "$act_id" "failed" "Vypršela platnost podpisu (>30s)"
@@ -1286,64 +1524,248 @@ if [ "$http_code" = "200" ]; then
         fi
     fi
 else
+    # A version on probation that the server turns away is counted: a few
+    # refusals take it back (bk_probation_check). Only 4xx - the server read
+    # the report and said no; a 5xx or no answer at all is not this
+    # version's doing and counts only as a run.
+    case "$http_code" in
+        4??)
+            if [ -f "$BK_PROBATION" ] && [ "$pb_new" = "$AGENT_VERSION" ]; then
+                pb_rej=$((pb_rej + 1))
+                bk_probation_save "$pb_runs" "$pb_rej"
+            fi
+            ;;
+    esac
     log_message "CHYBA: Server odpověděl kódem $http_code."
     log_message "Odpověď: $body"
     exit 1
 fi
 
 # 9. Automatická aktualizace agenta (opt-in přes AUTO_UPDATE=1)
-# Server v odpovědi oznámí novější verzi včetně SHA-256 checksumu. Nová verze
-# se stáhne do dočasného souboru, ověří se checksum i syntaxe (bash -n) a teprve
-# potom se atomicky nahradí tento skript. Při dalším spuštění (cron/systemd)
-# už poběží nová verze.
-if [ "$AUTO_UPDATE" = "1" ]; then
+# The server offers a version and the SHA-256 of its file. The download
+# replaces this script only when it is, in this order:
+#   - strictly newer than this version: a server that serves an older file
+#     (a pinned submodule reverted) must not downgrade the fleet;
+#   - not a file this host rolled back or refused within the last day (so
+#     a bad release is not downloaded and logged again every run);
+#   - the file the server hashed;
+#   - complete: its last line is "# bk-agent-end <offered version>". A
+#     transfer cut short can still pass `bash -n` and the checksum is taken
+#     from the same server;
+#   - valid bash, and a working agent: `--selfcheck` runs its whole dry-run
+#     collection and prints the payload, which must parse as JSON;
+# and then by a rename inside this directory, never a copy across
+# filesystems, with the current version kept as .prev and a .probation file
+# that brings it back if the new one gets no report through.
+
+# 0 when $1 is a newer dotted-numeric version than $2 ("0.1.10" > "0.1.9").
+# Anything else (a "-rc1" suffix, an empty string) cannot be shown to be
+# newer and is not installed.
+bk_version_newer() {
+    local a="$1" b="$2" x y
+    case "$a" in ''|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+    case "$b" in ''|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+    while [ -n "$a" ] || [ -n "$b" ]; do
+        x=${a%%.*}; y=${b%%.*}
+        if [ "$a" = "$x" ]; then a=""; else a=${a#*.}; fi
+        if [ "$b" = "$y" ]; then b=""; else b=${b#*.}; fi
+        # Long enough to overflow is not a version anyone released.
+        { [ "${#x}" -le 18 ] && [ "${#y}" -le 18 ]; } || return 1
+        x=$((10#${x:-0})); y=$((10#${y:-0}))
+        [ "$x" -gt "$y" ] && return 0
+        [ "$x" -lt "$y" ] && return 1
+    done
+    return 1
+}
+
+# 0 when file $1 holds exactly one line: the --selfcheck answer of a bash
+# agent of version $2.
+bk_selfcheck_ok() {
+    local lines line
+    lines=$(wc -l < "$1" 2>/dev/null)
+    [ "${lines//[[:space:]]/}" = "1" ] || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        # A real JSON parse. The payload is put together by hand in bash, and
+        # what matters is that the server will be able to read it. The
+        # payload member is optional in the contract (so it can change);
+        # when present it has to be this agent's payload.
+        python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or d.get("agent_type") != "bash" or d.get("agent_version") != sys.argv[2]:
+    sys.exit(1)
+p = d.get("payload")
+if p is not None and not (isinstance(p, dict) and p.get("agent_type") == "bash" and p.get("version") == sys.argv[2]):
+    sys.exit(1)
+' "$1" "$2" 2>/dev/null
+        return $?
+    fi
+    # No python3: the contract's opening members and a closing brace. A
+    # payload that is not JSON gets past this one; the server then refuses
+    # its reports and the probation takes the version back.
+    IFS= read -r line < "$1" || return 1
+    case "$line" in
+        "{\"agent_type\":\"bash\",\"agent_version\":\"$2\""*"}") return 0 ;;
+    esac
+    return 1
+}
+
+bk_update_refused() { # MESSAGE [SHA to remember]
+    log_message "CHYBA UPDATE: $1 Aktualizace zrušena."
+    rm -f "$BK_SELF.new" 2>/dev/null
+    # A refusal for what the file IS (not for a full disk or a failed
+    # download) will not change until the server serves other bytes.
+    [ -n "${2:-}" ] && bk_refuse_sha "$2"
+    return 0
+}
+
+bk_self_update() {
+    local update_available update_url update_sha latest_version new actual_sha last_line
+    local self_kb self_mode free_kb need_kb rb_sha rb_ts sc_dir sc_rc sc_why download_ok
     update_available=$(echo "$body" | grep -o '"update_available":[a-z]*' | cut -d: -f2)
-    if [ "$update_available" = "true" ]; then
-        update_url=$(echo "$body" | sed -n 's/.*"update_url":"\([^"]*\)".*/\1/p' | sed 's,\\/,/,g')
-        update_sha=$(echo "$body" | sed -n 's/.*"update_sha256":"\([a-f0-9]*\)".*/\1/p')
-        latest_version=$(echo "$body" | sed -n 's/.*"latest_version":"\([^"]*\)".*/\1/p')
+    [ "$update_available" = "true" ] || return 0
+    update_url=$(echo "$body" | sed -n 's/.*"update_url":"\([^"]*\)".*/\1/p' | sed 's,\\/,/,g')
+    update_sha=$(echo "$body" | sed -n 's/.*"update_sha256":"\([a-f0-9]*\)".*/\1/p')
+    latest_version=$(echo "$body" | sed -n 's/.*"latest_version":"\([^"]*\)".*/\1/p')
+    { [ -n "$update_url" ] && [ -n "$update_sha" ]; } || return 0
 
-        if [ -n "$update_url" ] && [ -n "$update_sha" ]; then
-            self_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
-            tmp_file=$(mktemp "$ScriptPath/agent-update.XXXXXX" 2>/dev/null || echo "/tmp/agent-update-$$")
-            log_message "K dispozici je nová verze agenta $latest_version (aktuální $AGENT_VERSION), stahuji z $update_url..."
-
-            download_ok=0
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsS -m 60 --connect-timeout 10 -o "$tmp_file" "$update_url" && download_ok=1
-            elif command -v wget >/dev/null 2>&1; then
-                wget -q -T 60 -t 2 -O "$tmp_file" "$update_url" && download_ok=1
-            fi
-
-            if [ "$download_ok" = "1" ]; then
-                if command -v sha256sum >/dev/null 2>&1; then
-                    actual_sha=$(sha256sum "$tmp_file" | awk '{print $1}')
-                else
-                    actual_sha=$(shasum -a 256 "$tmp_file" 2>/dev/null | awk '{print $1}')
-                fi
-
-                if [ "$actual_sha" = "$update_sha" ]; then
-                    if bash -n "$tmp_file" 2>/dev/null; then
-                        cp "$self_path" "$self_path.bak" 2>/dev/null || true
-                        chmod +x "$tmp_file"
-                        if mv "$tmp_file" "$self_path"; then
-                            log_message "OK: Agent aktualizován na verzi $latest_version. Nová verze se použije při příštím spuštění."
-                            exit 0
-                        else
-                            log_message "CHYBA UPDATE: Nepodařilo se nahradit $self_path (práva?). Aktualizace zrušena."
-                        fi
-                    else
-                        log_message "CHYBA UPDATE: Stažený soubor neprošel kontrolou syntaxe. Aktualizace zrušena."
-                    fi
-                else
-                    log_message "CHYBA UPDATE: Checksum nesouhlasí (očekáván $update_sha, stažen $actual_sha). Aktualizace zrušena."
-                fi
-            else
-                log_message "CHYBA UPDATE: Stažení nové verze se nezdařilo."
-            fi
-            rm -f "$tmp_file" 2>/dev/null || true
+    # Debug level: the server repeats its offer with every report, and a
+    # refusal that stands until the server changes must not fill the log.
+    if ! bk_version_newer "$latest_version" "$AGENT_VERSION"; then
+        log_debug "Aktualizace na '$latest_version' odmítnuta: není novější než $AGENT_VERSION."
+        return 0
+    fi
+    if [ -f "$BK_REFUSED" ]; then
+        rb_sha=""; rb_ts=""
+        read -r rb_sha rb_ts < "$BK_REFUSED" 2>/dev/null
+        case "$rb_ts" in ''|*[!0-9]*) rb_ts=0 ;; esac
+        [ "${#rb_ts}" -le 18 ] || rb_ts=0
+        if [ "$rb_sha" = "$update_sha" ] && [ $((now_ts - 10#$rb_ts)) -lt 86400 ]; then
+            log_debug "Aktualizace na $latest_version odložena: tento soubor byl na tomto stroji odmítnut nebo vrácen zpět před méně než 24 h."
+            return 0
         fi
     fi
+    # The self-check below must not be able to hang the agent for good.
+    if ! command -v timeout >/dev/null 2>&1; then
+        log_message "CHYBA UPDATE: Chybí příkaz 'timeout' (coreutils), bez něj nejde novou verzi ověřit. Aktualizace zrušena."
+        return 0
+    fi
+    # Room for the new file beside this one and for a copied .prev where a
+    # hardlink is not possible, checked before anything is written: a full
+    # disk breaks far more on the host than this agent. A df that says
+    # nothing does not stop the update - the writes below then fail cleanly.
+    self_kb=$(( $(wc -c < "$BK_SELF") / 1024 + 1 ))
+    need_kb=$(( 2 * self_kb + 64 ))
+    free_kb=$(df -Pk "$ScriptPath" 2>/dev/null | awk 'NR == 2 {print $4}')
+    case "$free_kb" in
+        ''|*[!0-9]*) ;;
+        *)
+            if [ "$free_kb" -lt "$need_kb" ]; then
+                log_message "CHYBA UPDATE: Vedle $BK_SELF není místo na novou verzi (volno ${free_kb} kB, potřeba ${need_kb} kB). Aktualizace zrušena."
+                return 0
+            fi
+            ;;
+    esac
+
+    # One fixed name in this directory: a run killed mid-download leaves one
+    # file the next attempt overwrites, and the final rename stays inside one
+    # filesystem (a rename is atomic, a cross-filesystem mv is a copy that
+    # cron can catch half written).
+    new="$BK_SELF.new"
+    rm -f "$new" 2>/dev/null
+    log_message "K dispozici je nová verze agenta $latest_version (aktuální $AGENT_VERSION), stahuji z $update_url..."
+    download_ok=0
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS -m 60 --connect-timeout 10 -o "$new" "$update_url" 9>&- && download_ok=1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 60 -t 2 -O "$new" "$update_url" 9>&- && download_ok=1
+    fi
+    if [ "$download_ok" != "1" ]; then
+        bk_update_refused "Stažení nové verze se nezdařilo."
+        return 0
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_sha=$(sha256sum "$new" | awk '{print $1}')
+    else
+        actual_sha=$(shasum -a 256 "$new" 2>/dev/null | awk '{print $1}')
+    fi
+    if [ "$actual_sha" != "$update_sha" ]; then
+        bk_update_refused "Checksum nesouhlasí (očekáván $update_sha, stažen $actual_sha)."
+        return 0
+    fi
+    last_line=$(tail -n 1 "$new" 2>/dev/null)
+    if [ "$last_line" != "# bk-agent-end $latest_version" ]; then
+        bk_update_refused "Stažený soubor nekončí řádkem '# bk-agent-end $latest_version' (neúplný přenos nebo jiná verze)." "$actual_sha"
+        return 0
+    fi
+    if ! bash -n "$new" 2>/dev/null; then
+        bk_update_refused "Stažený soubor neprošel kontrolou syntaxe." "$actual_sha"
+        return 0
+    fi
+    # Output to files, not $( ): a probe the self-check leaves behind (a hung
+    # smartctl) would keep a pipe open and the capture waiting for ever.
+    sc_dir=$(mktemp -d "${TMPDIR:-/tmp}/bk-update.XXXXXX" 2>/dev/null)
+    if [ -z "$sc_dir" ]; then
+        bk_update_refused "Nelze vytvořit dočasný adresář pro samokontrolu."
+        return 0
+    fi
+    # No -k: busybox timeout before 1.36 has no such option, and an unknown
+    # option would fail every self-check - and be remembered as the file's
+    # fault. The self-check does not trap TERM.
+    BK_UPDATE_SELFCHECK=1 timeout 60 bash "$new" --selfcheck > "$sc_dir/out" 2> "$sc_dir/err" < /dev/null 9>&-
+    sc_rc=$?
+    if [ "$sc_rc" != "0" ] || ! bk_selfcheck_ok "$sc_dir/out" "$latest_version"; then
+        sc_why=$(head -c 300 "$sc_dir/err" 2>/dev/null | tr '\n' ' ')
+        rm -rf "$sc_dir"
+        bk_update_refused "Nová verze neprošla samokontrolou (--selfcheck, kód $sc_rc)${sc_why:+: $sc_why}" "$actual_sha"
+        return 0
+    fi
+    rm -rf "$sc_dir"
+
+    # The current version stays beside the new one for the probation.
+    rm -f "$BK_SELF.prev" 2>/dev/null
+    if ! ln "$BK_SELF" "$BK_SELF.prev" 2>/dev/null && ! cp -p "$BK_SELF" "$BK_SELF.prev" 2>/dev/null; then
+        rm -f "$BK_SELF.prev" 2>/dev/null
+        bk_update_refused "Nelze uložit současnou verzi jako $BK_SELF.prev."
+        return 0
+    fi
+    # The mode of the file it replaces (an agent kept at 0700 stays 0700).
+    self_mode=$(stat -c %a "$BK_SELF" 2>/dev/null)
+    case "$self_mode" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) chmod "$self_mode" "$new" 2>/dev/null ;;
+        *) chmod +x "$new" 2>/dev/null ;;
+    esac
+    # The data on the disk before the name points at it: a power cut right
+    # after the rename must not leave the name on an empty file. GNU sync
+    # with a file argument flushes that file only; an older one ignores the
+    # argument and flushes everything, which is slower but just as safe.
+    sync "$new" 2>/dev/null || sync
+    # Written BEFORE the rename, so the new version never runs without it;
+    # if the rename fails, the old version finds a file naming another
+    # version and drops it.
+    pb_new="$latest_version"; pb_old="$AGENT_VERSION"; pb_sha="$update_sha"
+    if ! bk_probation_save 0 0; then
+        bk_update_refused "Nelze zapsat $BK_PROBATION - bez něj by vadnou verzi nešlo vrátit."
+        return 0
+    fi
+    if ! mv -f "$new" "$BK_SELF" 2>/dev/null; then
+        rm -f "$BK_PROBATION" 2>/dev/null
+        bk_update_refused "Nepodařilo se nahradit $BK_SELF (práva?)."
+        return 0
+    fi
+    sync "$ScriptPath" 2>/dev/null
+    log_message "OK: Agent aktualizován na verzi $latest_version. Nová verze se použije při příštím spuštění."
+    exit 0
+}
+
+if [ "$AUTO_UPDATE" = "1" ]; then
+    bk_self_update
 fi
 
 log_message "Hotovo."
+# bk-agent-end 0.1.3
