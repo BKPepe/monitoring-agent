@@ -158,15 +158,17 @@ STATE_DIR_FALLBACK = STATE_DIR == '/tmp' and not DOCKER_MODE
 #   .probation   "<new> <old> <sha256> <runs> <rejected>" from the swap until
 #                the new version's first accepted report
 #   .last-ok     "<version> <unix time>" of the last accepted report
-#   .refused     "<sha256> <unix time>" of a file this host took back or
-#                refused for what its bytes are (no end sentinel, bad syntax,
-#                failed self-check): not downloaded again for 24 h
+#   .refused     one line "<sha256> <unix time>" per file this host took
+#                back or refused for what its bytes are (no end sentinel, bad
+#                syntax, failed or hung self-check), the last 8, newest last:
+#                never downloaded again (the time is only for a human)
 # The real path, so an agent reached through a symlink replaces the file,
 # not the link.
 SELF_PATH = os.path.realpath(__file__)
 PROBATION_FILE = SELF_PATH + '.probation'
 LAST_OK_FILE = SELF_PATH + '.last-ok'
 REFUSED_FILE = SELF_PATH + '.refused'
+REFUSED_MAX = 8
 # A new version that the server refused this many times, or that did not get
 # a single report through in this many runs, is replaced by the previous one.
 # Refusals (4xx) count fast; runs with no answer only after a long outage, so
@@ -1357,27 +1359,43 @@ def _fsync_dir(path):
         os.close(fd)
 
 
-def _refuse_sha(sha):
-    """Remembers a file (by its sha256) this host will not install for a day."""
+def _refused_lines():
+    """The remembered lines, oldest first. A damaged or hand-grown file is
+    read no further than a full list could reach."""
     try:
-        _write_line(REFUSED_FILE, f"{sha} {int(time.time())}")
+        with open(REFUSED_FILE, 'r', encoding='utf-8', errors='replace') as f:
+            return [line.strip() for _, line in zip(range(64), f)]
+    except OSError:
+        return []
+
+
+def _refuse_sha(sha):
+    """Remembers a file (by its sha256) this host will never install. With a
+    time limit a server that kept offering a bad file had every host download
+    it again, and a rolled-back one installed and on probation again, once a
+    day. Another sha, even under the same version, is tried as usual: that is
+    how a fix arrives, and how a false verdict (a server outage through a
+    whole probation) is lifted - publish the file again with other bytes, or
+    delete the .refused file by hand. The last REFUSED_MAX files, newest last;
+    a sha refused again moves to the end."""
+    if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]+', sha):
+        return
+    keep = [line for line in _refused_lines() if line and line.split()[0] != sha]
+    keep = keep[-(REFUSED_MAX - 1):] + [f"{sha} {int(time.time())}"]
+    try:
+        _write_line(REFUSED_FILE, "\n".join(keep))
     except OSError:
         pass
 
 
-def _recently_refused(sha):
+def _is_refused(sha):
     """True when this exact file was taken back off this host, or refused for
-    what its bytes are, in the last 24 h: without that, the restored version
-    would reinstall it on the very next report and the host would flip
-    between the two - or download and log the same bad file every run."""
-    try:
-        with open(REFUSED_FILE, 'r') as f:
-            parts = f.read().split()
-    except OSError:
+    what its bytes are, at any time: without that, the restored version would
+    reinstall it on the very next report and the host would flip between the
+    two - or download and log the same bad file every run."""
+    if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]+', sha):
         return False
-    if len(parts) != 2 or not re.fullmatch(r'[0-9]{1,18}', parts[1]):
-        return False
-    return parts[0] == sha and time.time() - int(parts[1]) < 86400
+    return any(line.split()[:1] == [sha] for line in _refused_lines())
 
 
 def self_update(update_info):
@@ -1392,8 +1410,8 @@ def self_update(update_info):
     if not _version_newer(latest, AGENT_VERSION):
         log_debug(f"Aktualizace na '{latest}' odmítnuta: není novější než {AGENT_VERSION}.")
         return False
-    if _recently_refused(expected_sha):
-        log_debug(f"Aktualizace na {latest} odložena: tento soubor byl na tomto stroji odmítnut nebo vrácen zpět před méně než 24 h.")
+    if _is_refused(expected_sha):
+        log_debug(f"Aktualizace na {latest} odmítnuta: tento soubor (sha {expected_sha}) byl na tomto stroji už odmítnut nebo vrácen zpět a znovu se nestahuje.")
         return False
 
     self_dir = os.path.dirname(SELF_PATH)
@@ -1492,7 +1510,7 @@ def self_update(update_info):
 # transport that no longer connects. Until the first accepted report the
 # .probation file counts this version's runs and refusals; past the limits
 # the previous version (.prev) comes back and runs at once, and the refused
-# file is remembered for a day so the same offer does not reinstall it.
+# file is remembered for good, so the same offer never reinstalls it.
 
 def _read_probation():
     try:
@@ -1546,7 +1564,7 @@ def _probation_check():
         log_message(f"CHYBA UPDATE: vrácení předchozí verze {pb['old']} se nezdařilo: {e}")
         return None
     _refuse_sha(pb['sha'])
-    log_message(f"VAROVÁNÍ: verze {AGENT_VERSION} nedoručila žádný report ({pb['runs']} běhů, {pb['rejected']} odmítnutí serverem), vrácena předchozí verze {pb['old']}.")
+    log_message(f"VAROVÁNÍ: verze {AGENT_VERSION} nedoručila žádný report ({pb['runs']} běhů, {pb['rejected']} odmítnutí serverem), vrácena předchozí verze {pb['old']}. Tento soubor (sha {pb['sha']}) se už znovu nestáhne.")
     # The restored script takes over this run. The lock file descriptor is
     # not inherited (Python opens files close-on-exec), so it takes the lock
     # afresh. If that fails, the restored file is in place for the next run.

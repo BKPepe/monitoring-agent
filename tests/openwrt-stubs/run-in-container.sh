@@ -746,11 +746,12 @@ rm -rf "$UPD" "$NEWF" /tmp/upd-seen.txt /tmp/upd.done /tmp/sr.sh
 #   wupd3   an OLDER version offered: refused before any download
 #   wupd4   the SAME version offered: the same
 #   wupd5   a download cut short (its own sha, so the sha check passes): no
-#           end mark, refused - and remembered: wupd5b downloads nothing
+#           end mark, refused - and remembered next to the agent on the
+#           flash (agent_openwrt.sh.refused): wupd5b downloads nothing
 #   wupd6   the end mark names another version than the one offered
 #   wupd7   the self-check answers as another agent type
 #   wupd8   the self-check hangs: killed after 10 s with everything it
-#           started, refused
+#           started, refused and remembered like any other verdict
 #   wupd9   the sha does not match: refused and NOT remembered (a transfer
 #           can fail once), wupd9b downloads it again
 #   wupd10  --selfcheck by hand, without the updater's variable: refused,
@@ -761,10 +762,18 @@ rm -rf "$UPD" "$NEWF" /tmp/upd-seen.txt /tmp/upd.done /tmp/sr.sh
 #           refused, the new version stays - an outage is no verdict
 #   wprob3..5  the server answers 400 to every report: three refusals
 #   wprob6  the next run rolls it back to .prev and remembers its sha
-#   wprob7  the old version is offered the same file again: no download
-#   wconf0..2  the same release again (a reboot forgot the verdict), and the
-#           first accepted report ends the probation: update.lastok, .prev
-#           gone; a later report changes nothing
+#   wprob7  after a reboot (the tmpfs is gone) the old version is offered the
+#           same file again: no download - the verdict is on the flash
+#   wbad1   two days later (the verdict dated back 48 h): still no download,
+#           a remembered file has no expiry
+#   wbad2   the same version published again as other bytes (a new sha):
+#           downloaded, checked and taken like any release
+#   wbadl   the list itself (its functions lifted from the agent): the last
+#           8 shas, newest last, a sha refused again moves to the end once
+#   wconf0..2  the same release again on a fresh install (reset_upd removes
+#           the remembered verdict with the rest), and the first accepted
+#           report ends the probation: update.lastok, .prev gone; a later
+#           report changes nothing
 #   wlim0..1  the same release again, and 30 runs without any 200 behind it
 #           (planted): the next run rolls it back though nothing was refused
 #   wreb0..5  a reboot inside the probation: the tmpfs counters are gone after
@@ -780,11 +789,14 @@ mkrel() { # VERSION [VERSION IN THE END MARK]
     sed -e "s/^AGENT_VERSION=.*/AGENT_VERSION=\"$1\"/" -e "s/^# bk-agent-end .*/# bk-agent-end ${2:-$1}/" agent_openwrt.sh
 }
 mkrel 9.9.9 > /srv/upd/good.sh
+# The same release republished with a fix: another sha, the same version and
+# end mark (the comment goes in before the last line).
+{ sed '$d' /srv/upd/good.sh; echo '# republished'; tail -n 1 /srv/upd/good.sh; } > /srv/upd/good2.sh
 head -c 150000 /srv/upd/good.sh > /srv/upd/cut.sh
 mkrel 9.9.9 9.9.8 > /srv/upd/wrongend.sh
 sed 's/"agent_type":"openwrt","agent_version"/"agent_type":"bash","agent_version"/' /srv/upd/good.sh > /srv/upd/badtype.sh
 sed 's/printf .{"agent_type":"openwrt","agent_version"/sleep 37; &/' /srv/upd/good.sh > /srv/upd/hang.sh
-for _f in good cut wrongend badtype hang; do
+for _f in good good2 cut wrongend badtype hang; do
     printf '%s %s\n' "$_f" "$(sha256sum /srv/upd/$_f.sh | cut -d' ' -f1)"
 done > $OUT/upd_fixtures.txt
 usha() { sha256sum "/srv/upd/$1.sh" | cut -d' ' -f1; }
@@ -792,6 +804,9 @@ offer() { # FILE SHA VERSION: a 200 that offers FILE
     printf '200\n{"status":"ok","update_available":true,"update_url":"http:\\/\\/upd.test\\/%s.sh","update_sha256":"%s","latest_version":"%s"}\n' \
         "$1" "$2" "$3" > /tmp/upd-resp.json
 }
+# The verdicts live on the flash next to the agent, so `fresh` (a reboot)
+# keeps them; each refusal case starts without the one before it.
+forget() { rm -f "$UPD/agent_openwrt.sh.refused"; }
 reset_upd() {
     rm -f "$UPD"/agent_openwrt.sh*
     cp agent_openwrt.sh "$UPD/agent_openwrt.sh"
@@ -811,9 +826,16 @@ urun() { # TAG: one cron-like run of the copy; what it left is filed under TAG
     else echo none; fi > "$OUT/$1_prev.txt"
     ls -A "$UPD" > "$OUT/$1_dir.txt"
     cat "$UPD/agent_openwrt.sh.probation" > "$OUT/$1_mark.txt" 2>/dev/null || echo none > "$OUT/$1_mark.txt"
-    for _f in probation bad lastok; do
-        cat "$PRIV/update.$_f" 2>/dev/null || echo none
-    done > "$OUT/$1_state.txt"
+    # probation, the remembered shas (one line, entries joined by ","), lastok
+    {
+        cat "$PRIV/update.probation" 2>/dev/null || echo none
+        if [ -f "$UPD/agent_openwrt.sh.refused" ]; then
+            tr '\n' ',' < "$UPD/agent_openwrt.sh.refused" | sed 's/,$//'; echo
+        else
+            echo none
+        fi
+        cat "$PRIV/update.lastok" 2>/dev/null || echo none
+    } > "$OUT/$1_state.txt"
     for _f in update.dl update.check; do
         [ -e "$PRIV/$_f" ] && echo "$_f"
     done > "$OUT/$1_leftover.txt" || true
@@ -827,17 +849,17 @@ urun wupd4
 offer cut "$(usha cut)" 9.9.9
 urun wupd5
 urun wupd5b
-fresh
+fresh; forget
 offer wrongend "$(usha wrongend)" 9.9.9
 urun wupd6
-fresh
+fresh; forget
 offer badtype "$(usha badtype)" 9.9.9
 urun wupd7
-fresh
+fresh; forget
 offer hang "$(usha hang)" 9.9.9
 urun wupd8
 ps 2>/dev/null | grep -c "[s]leep 37" > $OUT/wupd8_procs.txt || true
-fresh
+fresh; forget
 offer good 0000000000000000000000000000000000000000000000000000000000000000 9.9.9
 urun wupd9
 urun wupd9b
@@ -861,10 +883,41 @@ urun wprob1
 urun wprob2
 printf '400\n{"error":"Invalid JSON"}\n' > /tmp/upd-resp.json
 for _i in 3 4 5 6; do urun "wprob$_i"; done
+fresh
 offer good "$(usha good)" 9.9.9
 urun wprob7
+# The verdict dated two days back: with the old day-long memory this run
+# would download and install the file again.
+printf '%s %s\n' "$(usha good)" "$(( $(date +%s) - 172800 ))" > "$UPD/agent_openwrt.sh.refused"
+urun wbad1
+offer good2 "$(usha good2)" 9.9.9
+urun wbad2
 fresh
+# The list itself, from the agent's own functions: ten verdicts keep the last
+# eight, newest last; one refused again moves to the end once; a damaged
+# line or a non-hex sha refuses nothing.
+sed -n -e '/^BK_UPD_BAD_MAX=/p' -e '/^bk_upd_bad() {/,/^}/p' -e '/^bk_upd_is_bad() {/,/^}/p' agent_openwrt.sh > /tmp/badl.sh
+(
+    BK_UPD_BAD=/tmp/badl.refused; rm -f "$BK_UPD_BAD"
+    . /tmp/badl.sh
+    s() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+    for _i in 1 2 3 4 5 6 7 8 9 10; do bk_upd_bad "$(s "$_i")"; done
+    echo "after10 $(cut -d' ' -f1 "$BK_UPD_BAD" | tr '\n' ' ')"
+    echo "tsok $(awk '$2 ~ /^[0-9]+$/ && NF == 2' "$BK_UPD_BAD" | wc -l | tr -cd '0-9')"
+    for _i in 1 2 3 10; do if bk_upd_is_bad "$(s "$_i")"; then echo "is$_i yes"; else echo "is$_i no"; fi; done
+    bk_upd_bad "$(s 5)"
+    echo "readd $(cut -d' ' -f1 "$BK_UPD_BAD" | tr '\n' ' ')"
+    bk_upd_bad "not-a-sha"
+    bk_upd_bad ""
+    echo "invalid $(wc -l < "$BK_UPD_BAD" | tr -cd '0-9')"
+    printf 'garbage line here\n\n' >> "$BK_UPD_BAD"
+    if bk_upd_is_bad "$(s 5)"; then echo "damaged5 yes"; else echo "damaged5 no"; fi
+    if bk_upd_is_bad "garbage"; then echo "damagedg yes"; else echo "damagedg no"; fi
+    if bk_upd_is_bad ""; then echo "empty yes"; else echo "empty no"; fi
+) > $OUT/wbadl.txt 2>&1
+rm -f /tmp/badl.sh /tmp/badl.refused
 reset_upd
+offer good "$(usha good)" 9.9.9
 urun wconf0
 printf '200\n{"status":"ok"}\n' > /tmp/upd-resp.json
 urun wconf1

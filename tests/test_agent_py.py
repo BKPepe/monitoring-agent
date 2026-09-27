@@ -22,6 +22,7 @@ import tempfile
 import time
 import types
 import unittest
+import unittest.mock
 import uuid
 
 AGENT_SRC = os.environ.get("BK_AGENT_PY") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vps-agent", "agent.py")
@@ -318,13 +319,25 @@ class SelfUpdate(AgentTestCase):
         self.assert_untouched()
         self.assertTrue(any("vypršel čas" in m for m in self.logs))
 
-    def test_a_refused_file_is_not_downloaded_again_for_a_day(self):
+    def test_a_refused_file_is_never_downloaded_again(self):
         cut = fake_agent_source("9.9.9")[:-5]
         self.assertFalse(self.agent.self_update(self.offer(cut, "9.9.9")))
         self.assertFalse(self.agent.self_update(self.offer(cut, "9.9.9")))
         self.assertEqual(self.downloads, 1)
         with open(self.agent.REFUSED_FILE) as f:
             self.assertEqual(f.read().split()[0], hashlib.sha256(cut).hexdigest())
+        # Two days on (a fake clock): the verdict has no expiry.
+        with unittest.mock.patch("time.time", return_value=time.time() + 2 * 86400):
+            self.assertFalse(self.agent.self_update(self.offer(cut, "9.9.9")))
+        self.assertEqual(self.downloads, 1)
+
+    def test_a_timed_out_selfcheck_is_remembered_too(self):
+        self.agent.SELFCHECK_TIMEOUT_S = 1
+        slow = fake_agent_source("9.9.9", extra="import time\ntime.sleep(30)\n")
+        self.assertFalse(self.agent.self_update(self.offer(slow, "9.9.9")))
+        self.assertFalse(self.agent.self_update(self.offer(slow, "9.9.9")))
+        self.assertEqual(self.downloads, 1)
+        self.assertTrue(self.agent._is_refused(hashlib.sha256(slow).hexdigest()))
 
     def test_a_sha_mismatch_is_not_remembered(self):
         src = fake_agent_source("9.9.9")
@@ -332,16 +345,59 @@ class SelfUpdate(AgentTestCase):
         self.assertFalse(os.path.exists(self.agent.REFUSED_FILE))
         self.assertTrue(self.agent.self_update(self.offer(src, "9.9.9")))
 
-    def test_a_rolled_back_file_is_not_reinstalled_for_a_day(self):
+    def test_a_rolled_back_file_is_never_reinstalled(self):
         src = fake_agent_source("9.9.9")
         sha = hashlib.sha256(src).hexdigest()
         with open(self.agent.REFUSED_FILE, "w") as f:
             f.write(f"{sha} {int(time.time()) - 3600}\n")
         self.assertFalse(self.agent.self_update(self.offer(src, "9.9.9")))
-        self.assertEqual(self.downloads, 0)
+        # A verdict from two days ago (the old limit was one day), and the
+        # same with the clock moved on instead.
         with open(self.agent.REFUSED_FILE, "w") as f:
-            f.write(f"{sha} {int(time.time()) - 90000}\n")
-        self.assertTrue(self.agent.self_update(self.offer(src, "9.9.9")))
+            f.write(f"{sha} {int(time.time()) - 2 * 86400}\n")
+        self.assertFalse(self.agent.self_update(self.offer(src, "9.9.9")))
+        with unittest.mock.patch("time.time", return_value=time.time() + 30 * 86400):
+            self.assertFalse(self.agent.self_update(self.offer(src, "9.9.9")))
+        self.assertEqual(self.downloads, 0)
+        self.assert_untouched()
+
+    def test_a_new_sha_of_the_same_version_is_taken(self):
+        bad = fake_agent_source("9.9.9")
+        self.agent._refuse_sha(hashlib.sha256(bad).hexdigest())
+        fixed = fake_agent_source("9.9.9", extra="# republished with a fix\n")
+        self.assertTrue(self.agent.self_update(self.offer(fixed, "9.9.9")))
+        with open(self.agent.SELF_PATH, "rb") as f:
+            self.assertEqual(f.read(), fixed)
+        self.assertTrue(self.agent._is_refused(hashlib.sha256(bad).hexdigest()))
+
+    def test_the_list_keeps_the_last_eight_newest_last(self):
+        shas = [hashlib.sha256(str(i).encode()).hexdigest() for i in range(10)]
+        for sha in shas:
+            self.agent._refuse_sha(sha)
+        def listed():
+            with open(self.agent.REFUSED_FILE) as f:
+                return [line.split()[0] for line in f.read().splitlines()]
+        self.assertEqual(listed(), shas[2:])
+        self.assertFalse(self.agent._is_refused(shas[0]))
+        self.assertTrue(self.agent._is_refused(shas[2]))
+        # Refused again: moved to the end, never twice.
+        self.agent._refuse_sha(shas[4])
+        self.assertEqual(listed(), shas[2:4] + shas[5:] + [shas[4]])
+        # Not a sha: nothing written, nothing matched.
+        self.agent._refuse_sha("not-a-sha")
+        self.agent._refuse_sha(None)
+        self.assertEqual(len(listed()), 8)
+        self.assertFalse(self.agent._is_refused(""))
+        self.assertFalse(self.agent._is_refused(None))
+
+    def test_a_damaged_list_refuses_only_exact_shas(self):
+        sha = hashlib.sha256(b"x").hexdigest()
+        with open(self.agent.REFUSED_FILE, "wb") as f:
+            f.write(b"garbage \xff\xfe line\n\n   \n" + sha.encode() + b"\n")
+        self.assertTrue(self.agent._is_refused(sha))
+        self.assertFalse(self.agent._is_refused("garbage"))
+        self.agent._refuse_sha(hashlib.sha256(b"y").hexdigest())
+        self.assertTrue(self.agent._is_refused(sha))
 
 
 class Probation(AgentTestCase):
@@ -398,6 +454,7 @@ class Probation(AgentTestCase):
         self.assertFalse(os.path.exists(self.agent.PROBATION_FILE))
         with open(self.agent.REFUSED_FILE) as f:
             self.assertEqual(f.read().split()[0], "abcdef")
+        self.assertTrue(any("se už znovu nestáhne" in m for m in self.logs))
         self.assertEqual(self.execs[0][1], self.agent.SELF_PATH)
 
     def test_thirty_runs_without_a_report_roll_back(self):

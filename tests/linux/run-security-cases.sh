@@ -97,7 +97,8 @@ facts() {
         echo "new_exists=$([ -e "$f.new" ] && echo 1 || echo 0)"
         echo "probation=$(cat "$f.probation" 2>/dev/null)"
         echo "last_ok=$(cat "$f.last-ok" 2>/dev/null)"
-        echo "refused=$(cat "$f.refused" 2>/dev/null)"
+        # The list on one line, entries joined by ",".
+        echo "refused=$(tr '\n' ',' 2>/dev/null < "$f.refused" | sed 's/,$//')"
         echo "pwned=$([ -e /tmp/pwned ] && echo 1 || echo 0)"
         echo "restarts=$(cat /tmp/bkfake.log 2>/dev/null | wc -l)"
         echo "files=$(cd "$d" && ls -A | tr '\n' ' ')"
@@ -128,15 +129,19 @@ variant() {
         # The agent.py release that went silent for 17 days: a NameError in
         # main() that py_compile does not see.
         nameerror) sed -i 's/^    cpu, cpu_steal, iowait = get_cpu_usage()$/    _bk_probe = name_that_does_not_exist\n&/' "$out" ;;
+        # The same release published again with a fix: other bytes, the same
+        # version and end sentinel.
+        fixed) sed -i '$i # republished with a fix' "$out" ;;
     esac
     # A variant that did not take its mutation would make its case pass
     # for the wrong reason.
-    if [ -z "$mut" ] || [ "$mut" = badjson ] || [ "$mut" = nameerror ]; then
+    if [ -z "$mut" ] || [ "$mut" = badjson ] || [ "$mut" = nameerror ] || [ "$mut" = fixed ]; then
         [ "$(tail -n 1 "$out")" = "# bk-agent-end $ver" ] || { echo "harness: variant $name has no sentinel" >&2; exit 1; }
     fi
     case "$mut" in
         badjson) grep -q '^  "agent_type": "bash"$' "$out" || { echo "harness: badjson not applied" >&2; exit 1; } ;;
         nameerror) grep -q 'name_that_does_not_exist' "$out" || { echo "harness: nameerror not applied" >&2; exit 1; } ;;
+        fixed) grep -q '^# republished with a fix$' "$out" || { echo "harness: fixed not applied" >&2; exit 1; } ;;
     esac
     sha_of "$out"
 }
@@ -272,8 +277,8 @@ for kind in sh py; do
                 scenario "{\"update\":{\"agent_type\":\"$atype\",\"version\":\"$cur\",\"file\":\"$kind-$c\",\"force\":true}}" ;;
         esac
         run_agent "$kind" "$d" "$kind-upd-$c"
-        # A file refused for what its bytes are is not fetched again for a
-        # day: the second run must not download (or log) it once more.
+        # A file refused for what its bytes are is never fetched again: the
+        # second run must not download (or log) it once more.
         [ "$c" = nosentinel ] && run_agent "$kind" "$d" "$kind-upd-$c-again"
         facts "$kind" "$d" "$kind-upd-$c"
     done
@@ -336,6 +341,19 @@ for kind in sh py; do
         run_agent "$kind" "$d" "$kind-rb-rejected-$i"
         facts "$kind" "$d" "$kind-rb-rejected-$i"
     done
+    # Two days later (the verdict dated back 48 h; the limit used to be a
+    # day): the same offer is still not downloaded.
+    printf '%s %s\n' "$bad_sha" "$(( $(date +%s) - 172800 ))" > "$d/$f.refused"
+    : > "$API/gets.log"; : > "$API/posts.jsonl"
+    run_agent "$kind" "$d" "$kind-rb-rejected-7"
+    facts "$kind" "$d" "$kind-rb-rejected-7"
+    # The same version published again as other bytes: a new sha, taken.
+    fixed_sha=$(variant "$kind" 9.9.8 "$kind-refused-fixed" fixed)
+    echo "fixed_sha=$fixed_sha" >> "$OUT/$kind-orig.facts"
+    scenario "{\"update\":{\"agent_type\":\"$atype\",\"version\":\"9.9.8\",\"file\":\"$kind-refused-fixed\"}}"
+    : > "$API/gets.log"; : > "$API/posts.jsonl"
+    run_agent "$kind" "$d" "$kind-rb-fixed"
+    facts "$kind" "$d" "$kind-rb-fixed"
 
     # Thirty runs without one accepted report (an agent whose transport
     # broke): taken back as well. The probation is seeded at the limit.
@@ -364,6 +382,25 @@ done
 {
     eval "$(sed -n '/^bk_valid_service_name() {/,/^}/p' "$SRC/agent.sh")"
     eval "$(sed -n '/^bk_version_newer() {/,/^}/p' "$SRC/agent.sh")"
+    # The list of refused files: ten verdicts keep the last eight, newest
+    # last; one refused again moves to the end once; a damaged line or a
+    # non-hex sha refuses nothing.
+    eval "$(sed -n -e '/^bk_now() {/p' -e '/^BK_REFUSED_MAX=/p' -e '/^bk_refuse_sha() {/,/^}/p' -e '/^bk_sha_refused() {/,/^}/p' "$SRC/agent.sh")"
+    BK_REFUSED=/tmp/refused-list; rm -f "$BK_REFUSED"
+    rs() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+    for i in 0 1 2 3 4 5 6 7 8 9; do bk_refuse_sha "$(rs "$i")"; done
+    echo "list after10 $(cut -d' ' -f1 "$BK_REFUSED" | tr '\n' ' ')"
+    echo "list tsok $(awk 'NF == 2 && $2 ~ /^[0-9]+$/' "$BK_REFUSED" | wc -l)"
+    for i in 0 2 9; do if bk_sha_refused "$(rs "$i")"; then echo "list is$i yes"; else echo "list is$i no"; fi; done
+    bk_refuse_sha "$(rs 4)"
+    echo "list readd $(cut -d' ' -f1 "$BK_REFUSED" | tr '\n' ' ')"
+    bk_refuse_sha "not-a-sha"; bk_refuse_sha ""
+    echo "list invalid $(wc -l < "$BK_REFUSED")"
+    printf 'garbage line here\n\n' >> "$BK_REFUSED"
+    if bk_sha_refused "$(rs 4)"; then echo "list damaged4 yes"; else echo "list damaged4 no"; fi
+    if bk_sha_refused garbage; then echo "list damagedg yes"; else echo "list damagedg no"; fi
+    if bk_sha_refused ""; then echo "list empty yes"; else echo "list empty no"; fi
+    rm -f "$BK_REFUSED"
     for n in nginx nginx.service openvpn@server 'MSSQL$SQLEXPRESS' _x a-b.c 9 \
              "$(printf 'a%.0s' $(seq 1 128))"; do
         if bk_valid_service_name "$n"; then echo "svc ok $n"; else echo "svc refused $n"; fi

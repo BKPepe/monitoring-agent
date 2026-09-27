@@ -98,7 +98,7 @@ $SelfPath = $MyInvocation.MyCommand.Path
 $PrevFile = "$SelfPath.prev"            # the version before the last update
 $PendingFile = "$SelfPath.probation"    # JSON: an update still on probation
 $LastOkFile = "$SelfPath.last-ok"       # "<version> <unix ts>" of the last accepted report
-$RejectedFile = "$SelfPath.rejected"    # "<sha256> <version> <unix ts>" of a file refused or rolled back
+$RejectedFile = "$SelfPath.rejected"    # "<sha256> <version> <unix ts>" per file refused or rolled back, newest last
 $NonceFile = "$SelfPath.nonces"         # "<unix ts> <nonce>" per signed action let through
 # Windows PowerShell 5.1 writes a BOM with -Encoding UTF8; these files are read
 # back by this script only, but a BOM would glue itself to the first field.
@@ -111,9 +111,15 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 # outage right after an update is not the new version's fault.
 $ROLLBACK_AFTER_REFUSED = 3
 $ROLLBACK_AFTER_RUNS = 30
-# A rolled-back file is not taken again for this long. A later fix published
-# under the same version has another sha256 and is taken at once.
-$REJECTED_SHA_HOURS = 24
+# A file refused for its bytes or rolled back is never taken again. With a
+# time limit a server that kept offering a bad file had every host download
+# it again, and a rolled-back one installed and on probation again, once a
+# day. A fix published under the same version has another sha256 and is
+# taken at once; that is also how a false verdict (a server outage through a
+# whole probation) is lifted - publish the file again with other bytes, or
+# delete agent.ps1.rejected by hand. The list keeps the last this many files;
+# the version and the time in each line are for a human reading it.
+$REJECTED_SHA_KEEP = 8
 # The downloaded copy's -SelfCheck runs the whole collection; Windows
 # PowerShell 5.1 start plus the CIM queries take several seconds on a small VM.
 $SELFCHECK_TIMEOUT_SEC = 60
@@ -159,6 +165,37 @@ function Save-StateText {
     $tmp = "$Path.tmp"
     [System.IO.File]::WriteAllText($tmp, $Text, $Utf8NoBom)
     Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+}
+
+# The lines of the list of refused files, oldest first. A damaged or
+# hand-grown file is read no further than a full list could reach.
+function Get-RejectedLines {
+    param([string]$Path = $RejectedFile)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return @() }
+        return @([System.IO.File]::ReadAllLines($Path) | Select-Object -First 64 | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } catch { return @() }
+}
+
+# True when exactly this sha256 was refused or rolled back on this host.
+function Test-RejectedSha {
+    param([string]$Sha, [string]$Path = $RejectedFile)
+    if ($Sha -cnotmatch '^[0-9a-f]+\z') { return $false }
+    foreach ($line in (Get-RejectedLines -Path $Path)) {
+        if (($line -split ' ')[0] -ceq $Sha) { return $true }
+    }
+    return $false
+}
+
+# Remembers a file for good: the last $REJECTED_SHA_KEEP, newest last; a sha
+# refused again moves to the end.
+function Add-RejectedSha {
+    param([string]$Sha, [string]$Version, [string]$Path = $RejectedFile)
+    if ($Sha -cnotmatch '^[0-9a-f]+\z') { return }
+    $keep = @(Get-RejectedLines -Path $Path | Where-Object { ($_ -split ' ')[0] -cne $Sha })
+    if ($keep.Count -gt ($REJECTED_SHA_KEEP - 1)) { $keep = @($keep[($keep.Count - $REJECTED_SHA_KEEP + 1)..($keep.Count - 1)]) }
+    $keep += "$Sha $Version $(Get-UnixNow)"
+    try { Save-StateText -Path $Path -Text (($keep -join "`n") + "`n") } catch {}
 }
 
 # 1 when $A is newer than $B, 0 when equal, -1 when older, $null when either
@@ -393,8 +430,8 @@ function Invoke-UpdateProbation {
         }
     }
     Remove-Item -LiteralPath $PendingFile -Force -ErrorAction SilentlyContinue
-    try { Save-StateText -Path $RejectedFile -Text "$badSha $AGENT_VERSION $(Get-UnixNow)`n" } catch {}
-    Write-AgentLog "CHYBA UPDATE: Verze $AGENT_VERSION nedoručila hlášení ($refused odmítnuto serverem, $($runs - 1) běhů bez přijetí). Vrácena předchozí verze $($p.from); tento soubor se $REJECTED_SHA_HOURS h znovu nestáhne."
+    Add-RejectedSha -Sha $badSha -Version $AGENT_VERSION
+    Write-AgentLog "CHYBA UPDATE: Verze $AGENT_VERSION nedoručila hlášení ($refused odmítnuto serverem, $($runs - 1) běhů bez přijetí). Vrácena předchozí verze $($p.from); tento soubor (sha $badSha) se už znovu nestáhne."
     exit 1
 }
 
@@ -418,14 +455,11 @@ function Invoke-SelfUpdate {
         return
     }
     # A file this agent rolled back, or refused for what its bytes are (no
-    # end line, no parse, a failed self-check), in the last day is not
-    # fetched again: a broken release would otherwise be downloaded and
-    # self-checked on every run.
-    $rej = ""
-    try { if (Test-Path -LiteralPath $RejectedFile) { $rej = ([System.IO.File]::ReadAllText($RejectedFile)).Trim() } } catch {}
-    $rf = $rej.Split(' ')
-    if ($rf.Count -eq 3 -and $rf[0] -ceq $expectedSha -and $rf[2] -cmatch '^[0-9]{1,18}\z' -and ((Get-UnixNow) - [long]$rf[2]) -lt ($REJECTED_SHA_HOURS * 3600)) {
-        Write-Verbose "Verze $latestVersion ($expectedSha) byla odmítnuta, do $REJECTED_SHA_HOURS h ji znovu nestahuji."
+    # end line, no parse, a failed or hung self-check), is never fetched
+    # again: a broken release would otherwise be downloaded and self-checked
+    # over and over.
+    if (Test-RejectedSha -Sha $expectedSha) {
+        Write-Verbose "Verze $latestVersion ($expectedSha) tu už byla odmítnuta nebo vrácena zpět, znovu ji nestahuji."
         return
     }
     # The download sits next to the script until the rename: room for twice
@@ -481,8 +515,8 @@ function Invoke-SelfUpdate {
     }
     Remove-Item -LiteralPath $newFile -Force -ErrorAction SilentlyContinue
     if ($refusal -and $badBytes) {
-        try { Save-StateText -Path $RejectedFile -Text "$expectedSha $latestVersion $(Get-UnixNow)`n" } catch {}
-        Write-AgentLog "CHYBA UPDATE: $refusal. Aktualizace zrušena; tento soubor se $REJECTED_SHA_HOURS h znovu nestáhne."
+        Add-RejectedSha -Sha $expectedSha -Version $latestVersion
+        Write-AgentLog "CHYBA UPDATE: $refusal. Aktualizace zrušena; tento soubor se už znovu nestáhne."
     } elseif ($refusal) {
         Write-AgentLog "CHYBA UPDATE: $refusal. Aktualizace zrušena."
     } else {

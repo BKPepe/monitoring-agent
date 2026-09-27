@@ -6,6 +6,7 @@ a failing check means a parser in agent_openwrt.sh reads the wrong column,
 fabricates a value, or emits invalid JSON."""
 import collections
 import glob
+import hashlib
 import ipaddress
 import json
 import os
@@ -1101,8 +1102,9 @@ upd_curl = by_run("upd_curl.log")
 upd_fix = dict(l.split() for l in (text("upd_fixtures.txt") or "").splitlines() if len(l.split()) == 2)
 def upd(tag):
     """What an update run left: exit code, the target (old/new/other), its
-    .prev (old/other/none), the agent directory, the private state
-    (probation, bad, lastok), leftovers, the download calls, its log."""
+    .prev (old/other/none), the agent directory, the state (probation, the
+    remembered shas from the flash joined by ",", lastok), leftovers, the
+    download calls, its log."""
     return {
         "rc": text(f"{tag}_rc.txt"), "target": text(f"{tag}_target.txt"), "prev": text(f"{tag}_prev.txt"),
         "dir": (text(f"{tag}_dir.txt") or "").splitlines(),
@@ -1111,17 +1113,27 @@ def upd(tag):
         "mark": text(f"{tag}_mark.txt"),
     }
 U = {t: upd(t) for t in ["wupd3", "wupd4", "wupd5", "wupd5b", "wupd6", "wupd7", "wupd8", "wupd9", "wupd9b",
-                          "wupd11", "wprob1", "wprob2", "wprob3", "wprob5", "wprob6", "wprob7",
+                          "wupd11", "wprob1", "wprob2", "wprob3", "wprob5", "wprob6", "wprob7", "wbad1", "wbad2",
                           "wconf0", "wconf1", "wconf2", "wlim0", "wlim1",
                           "wreb0", "wreb1", "wreb2", "wreb3", "wreb4", "wreb5"]}
 DIR_ONLY = ["agent_openwrt.cfg", "agent_openwrt.sh"]
+# A file refused for its bytes is remembered on the flash, next to the agent.
+DIR_REFUSED = DIR_ONLY + ["agent_openwrt.sh.refused"]
 def state(u, i):
     return u["state"][i] if len(u["state"]) > i else None
-def untouched(u):
-    """Refused: the agent is byte-identical, nothing else next to it, no
-    probation started, no download or check file left in the tmpfs."""
-    return u["target"] == "old" and u["dir"] == DIR_ONLY and state(u, 0) == "none" and u["leftover"] == ""
+def untouched(u, remembered=False):
+    """Refused: the agent is byte-identical, nothing else next to it (but the
+    list of refused files when the verdict is about the bytes), no probation
+    started, no download or check file left in the tmpfs."""
+    return (u["target"] == "old" and u["dir"] == (DIR_REFUSED if remembered else DIR_ONLY)
+            and state(u, 0) == "none" and u["leftover"] == "")
+def remembered(u, name):
+    """The list on the flash holds exactly the sha of fixture NAME."""
+    return [e.split()[:1] for e in (state(u, 1) or "").split(",")] == [[upd_fix.get(name)]]
 good_sha = upd_fix.get("good", "")
+good2_sha = upd_fix.get("good2", "")
+badl = dict(l.split(" ", 1) for l in (text("wbadl.txt") or "").splitlines() if " " in l)
+badl_sha = {i: hashlib.sha256(str(i).encode()).hexdigest() for i in range(1, 11)}
 agent_version = re.search(r'^AGENT_VERSION="([^"]+)"$', agent_src, re.M)
 agent_version = agent_version.group(1) if agent_version else None
 agent_lines = agent_src.split("\n")
@@ -1133,18 +1145,22 @@ checks.update({
         untouched(U["wupd3"]) and U["wupd3"]["curl"] == [] and "neni novejsi" in U["wupd3"]["err"],
     "update: the same version offered is refused before any download (wupd4)":
         untouched(U["wupd4"]) and U["wupd4"]["curl"] == [] and "neni novejsi" in U["wupd4"]["err"],
-    "update: a download cut short (its sha matching) has no end mark - refused, byte-identical (wupd5)":
-        untouched(U["wupd5"]) and U["wupd5"]["curl"] == ["http://upd.test/cut.sh"]
+    "update: a download cut short (its sha matching) has no end mark - refused, byte-identical, its sha remembered on the flash (wupd5)":
+        untouched(U["wupd5"], remembered=True) and U["wupd5"]["curl"] == ["http://upd.test/cut.sh"]
         and "nekonci radkem '# bk-agent-end 9.9.9'" in U["wupd5"]["err"]
-        and (state(U["wupd5"], 1) or "").split()[:1] == [upd_fix.get("cut")],
-    "update: a file refused after its checks is not downloaded again for a day (wupd5b)":
-        untouched(U["wupd5b"]) and U["wupd5b"]["curl"] == [] and "neprosla" in U["wupd5b"]["err"],
-    "update: an end mark of another version than the one offered is refused (wupd6)":
-        untouched(U["wupd6"]) and U["wupd6"]["curl"] == ["http://upd.test/wrongend.sh"] and "bk-agent-end 9.9.9" in U["wupd6"]["err"],
-    "update: a self-check that answers as another agent type is refused, byte-identical, no .new left (wupd7)":
-        untouched(U["wupd7"]) and "vlastni kontrolou" in U["wupd7"]["err"] and "neni od OpenWrt agenta" in U["wupd7"]["err"],
-    "update: a self-check that hangs is killed after 10 s with what it started, and refused (wupd8)":
-        untouched(U["wupd8"]) and "neodpovedela do 10 s" in U["wupd8"]["err"] and text("wupd8_procs.txt") == "0",
+        and remembered(U["wupd5"], "cut"),
+    "update: a file refused after its checks is not downloaded again (wupd5b)":
+        untouched(U["wupd5b"], remembered=True) and U["wupd5b"]["curl"] == [] and "neprosla" in U["wupd5b"]["err"]
+        and remembered(U["wupd5b"], "cut"),
+    "update: an end mark of another version than the one offered is refused and remembered (wupd6)":
+        untouched(U["wupd6"], remembered=True) and U["wupd6"]["curl"] == ["http://upd.test/wrongend.sh"] and "bk-agent-end 9.9.9" in U["wupd6"]["err"]
+        and remembered(U["wupd6"], "wrongend"),
+    "update: a self-check that answers as another agent type is refused, byte-identical, no .new left, remembered (wupd7)":
+        untouched(U["wupd7"], remembered=True) and "vlastni kontrolou" in U["wupd7"]["err"] and "neni od OpenWrt agenta" in U["wupd7"]["err"]
+        and remembered(U["wupd7"], "badtype"),
+    "update: a self-check that hangs is killed after 10 s with what it started, refused, and remembered like any other verdict (wupd8)":
+        untouched(U["wupd8"], remembered=True) and "neodpovedela do 10 s" in U["wupd8"]["err"] and text("wupd8_procs.txt") == "0"
+        and remembered(U["wupd8"], "hang"),
     "update: a sha mismatch is refused and NOT remembered - the next offer downloads again (wupd9, wupd9b)":
         untouched(U["wupd9"]) and untouched(U["wupd9b"]) and "Checksum nesouhlasi" in U["wupd9"]["err"]
         and U["wupd9b"]["curl"] == ["http://upd.test/good.sh"] and state(U["wupd9b"], 1) == "none",
@@ -1168,22 +1184,38 @@ checks.update({
         U["wprob3"]["target"] == "new" and state(U["wprob3"], 0) == f"9.9.9 {good_sha} 3 1"
         and U["wprob5"]["target"] == "new" and U["wprob5"]["prev"] == "old" and state(U["wprob5"], 0) == f"9.9.9 {good_sha} 5 3",
     "update: the run after the third refusal puts the old version back, byte-identical, and remembers the sha (wprob6)":
-        U["wprob6"]["target"] == "old" and U["wprob6"]["prev"] == "none" and U["wprob6"]["dir"] == DIR_ONLY
-        and state(U["wprob6"], 0) == "none" and (state(U["wprob6"], 1) or "").split()[:1] == [good_sha]
+        U["wprob6"]["target"] == "old" and U["wprob6"]["prev"] == "none" and U["wprob6"]["dir"] == DIR_REFUSED
+        and state(U["wprob6"], 0) == "none" and remembered(U["wprob6"], "good")
         and "vracena predchozi verze" in U["wprob6"]["err"] and "odmitl 3" in U["wprob6"]["err"],
     "update: a reboot inside the probation (tmpfs gone after one refusal) restarts the count from the flash mark, and three refusals after it still roll back (wreb0..5)":
         U["wreb0"]["target"] == "new" and U["wreb0"]["mark"] == f"9.9.9 {good_sha}"
         and state(U["wreb1"], 0) == f"9.9.9 {good_sha} 1 1"
         and [state(U[f"wreb{i}"], 0) for i in (2, 3, 4)] == [f"9.9.9 {good_sha} {n} {n}" for n in (1, 2, 3)]
         and all(U[f"wreb{i}"]["target"] == "new" for i in (1, 2, 3, 4))
-        and U["wreb5"]["target"] == "old" and U["wreb5"]["prev"] == "none" and U["wreb5"]["dir"] == DIR_ONLY
+        and U["wreb5"]["target"] == "old" and U["wreb5"]["prev"] == "none" and U["wreb5"]["dir"] == DIR_REFUSED
         and U["wreb5"]["mark"] == "none" and state(U["wreb5"], 0) == "none"
-        and (state(U["wreb5"], 1) or "").split()[:1] == [good_sha] and "odmitl 3" in U["wreb5"]["err"],
+        and remembered(U["wreb5"], "good") and "odmitl 3" in U["wreb5"]["err"],
     "update: 30 runs without one 200, nothing refused, also roll the new version back (wlim0, wlim1)":
-        U["wlim0"]["target"] == "new" and U["wlim1"]["target"] == "old" and U["wlim1"]["dir"] == DIR_ONLY
-        and "za 30 behu" in U["wlim1"]["err"] and (state(U["wlim1"], 1) or "").split()[:1] == [good_sha],
-    "update: the old version is not handed the rolled-back file again (wprob7)":
-        untouched(U["wprob7"]) and U["wprob7"]["curl"] == [] and U["wprob7"]["rc"] == "0",
+        U["wlim0"]["target"] == "new" and U["wlim1"]["target"] == "old" and U["wlim1"]["dir"] == DIR_REFUSED
+        and "za 30 behu" in U["wlim1"]["err"] and remembered(U["wlim1"], "good"),
+    "update: after a reboot the old version is still not handed the rolled-back file (wprob7)":
+        untouched(U["wprob7"], remembered=True) and U["wprob7"]["curl"] == [] and U["wprob7"]["rc"] == "0"
+        and remembered(U["wprob7"], "good"),
+    "update: a remembered file has no expiry - two days after the verdict it is still not downloaded (wbad1)":
+        untouched(U["wbad1"], remembered=True) and U["wbad1"]["curl"] == [] and U["wbad1"]["rc"] == "0"
+        and "neprosla" in U["wbad1"]["err"] and remembered(U["wbad1"], "good"),
+    "update: the same version republished as other bytes (a new sha) is downloaded and taken; the old verdict stays (wbad2)":
+        good2_sha not in ("", good_sha) and U["wbad2"]["rc"] == "0" and U["wbad2"]["curl"] == ["http://upd.test/good2.sh"]
+        and U["wbad2"]["target"] == "other" and U["wbad2"]["prev"] == "old" and U["wbad2"]["mark"] == f"9.9.9 {good2_sha}"
+        and state(U["wbad2"], 0) == f"9.9.9 {good2_sha} 0 0" and remembered(U["wbad2"], "good")
+        and U["wbad2"]["dir"] == ["agent_openwrt.cfg", "agent_openwrt.sh", "agent_openwrt.sh.prev", "agent_openwrt.sh.probation", "agent_openwrt.sh.refused"]
+        and "Agent aktualizovan na verzi 9.9.9" in U["wbad2"]["err"],
+    "update: the list of refused files keeps the last 8, newest last, each sha once; a damaged line or a non-hex sha refuses nothing (wbadl)":
+        badl.get("after10", "").split() == [badl_sha[i] for i in range(3, 11)] and badl.get("tsok") == "8"
+        and [badl.get(f"is{i}") for i in (1, 2, 3, 10)] == ["no", "no", "yes", "yes"]
+        and badl.get("readd", "").split() == [badl_sha[i] for i in (3, 4, 6, 7, 8, 9, 10, 5)]
+        and badl.get("invalid") == "8" and badl.get("damaged5") == "yes"
+        and badl.get("damagedg") == "no" and badl.get("empty") == "no",
     "update: the first accepted report ends the probation - update.lastok, .prev removed; later reports change nothing (wconf0..2)":
         U["wconf0"]["target"] == "new" and U["wconf0"]["prev"] == "old"
         and U["wconf1"]["target"] == "new" and U["wconf1"]["prev"] == "none" and state(U["wconf1"], 0) == "none"

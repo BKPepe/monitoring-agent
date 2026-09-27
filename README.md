@@ -91,24 +91,33 @@ In this order:
    which also keeps the old file's ACL on the new one.
 
 A refusal at any step leaves the running script byte-identical. A file
-refused for what its bytes are (end line, parse, self-check) is not fetched
-again for 24 hours. A sha mismatch is retried on the next run.
+refused for what its bytes are (end line, parse, a failed or hung self-check)
+is never fetched again: its sha256 goes on a short list next to the agent
+(the last 8, newest last), with no expiry, so a server that keeps offering a
+bad file no longer has every host download it again each day. A file with
+another sha is tried as usual, even under the same version. A sha mismatch is
+retried on the next run.
 
 **Probation and rollback.** The updater writes a probation marker just before
 the swap. Every run of the new version counts. Its first report the server
 accepts (HTTP 2xx) writes the last-ok stamp (`<version> <unix time>`) and
 ends the probation. If the server refused (HTTP 4xx) three of the new
 version's reports, or 30 runs passed without one accepted, the next run puts
-`.prev` back and exits. That file is not taken again for 24 hours; a fixed
-file published under the same version has another sha256 and is taken at
-once. A network outage alone does not roll back after a few minutes. A
-marker naming another version than the running one (a swap undone by hand) is
-dropped. `agent.ps1` keeps this state next to itself as `agent.ps1.prev`,
-`.probation` (JSON), `.last-ok`, `.rejected` and `.nonces`; `agent.sh` and
-`agent.py` keep similar files next to the script (their header comments list
-them), and the OpenWrt agent keeps them in its private directory (tmpfs),
-plus a one-line `agent_openwrt.sh.probation` next to `.prev` on the flash:
-a reboot inside the probation restarts the count instead of ending it.
+`.prev` back and exits. That file goes on the same list and is never taken
+again; a fixed file published under the same version has another sha256 and
+is taken at once. A network outage alone does not roll back after a few
+minutes, but one that lasts the whole probation (30 runs) does, and the
+list then holds a good file. To lift such a verdict, publish the file again
+with other bytes (any change gives another sha), or delete the list on the
+host. A marker naming another version than the running one (a swap undone by
+hand) is dropped. `agent.ps1` keeps this state next to itself as
+`agent.ps1.prev`, `.probation` (JSON), `.last-ok`, `.rejected` and
+`.nonces`; `agent.sh` and `agent.py` keep similar files next to the script,
+the list as `.refused` (their header comments list them). The OpenWrt agent
+keeps its counters in its private directory (tmpfs) and, next to `.prev` on
+the flash, `agent_openwrt.sh.probation` (a reboot inside the probation
+restarts the count instead of ending it) and the list
+`agent_openwrt.sh.refused` (a reboot does not forget a verdict).
 
 **Remote actions**, whatever the agent:
 

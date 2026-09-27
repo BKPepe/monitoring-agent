@@ -121,9 +121,10 @@ BK_LOCK_FILE="$ScriptPath/.agent.lock"
 #   .probation  "<new> <old> <sha256> <runs> <rejected>" from the swap until
 #               the new version's first accepted report
 #   .last-ok    "<version> <unix time>" of the last accepted report
-#   .refused    "<sha256> <unix time>" of a file this host took back or
-#               refused for what its bytes are (no end sentinel, bad syntax,
-#               failed self-check): not downloaded again for 24 h
+#   .refused    one line "<sha256> <unix time>" per file this host took
+#               back or refused for what its bytes are (no end sentinel, bad
+#               syntax, failed or hung self-check), the last 8, newest last:
+#               never downloaded again (the time is only for a human)
 #   .nonces     remote-action nonces already used
 BK_SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 BK_PROBATION="$BK_SELF.probation"
@@ -278,10 +279,32 @@ fi
 bk_now() { printf '%(%s)T' -1 2>/dev/null || date +%s; }
 now_ts=$(bk_now)
 
-# Remembers a file (by its sha256) this host will not install for a day.
-bk_refuse_sha() {
-    printf '%s %s\n' "$1" "$(bk_now)" > "$BK_REFUSED.tmp" 2>/dev/null \
+# Remembers a file (by its sha256) this host will never install. With a
+# time limit a server that kept offering a bad file had every host download
+# it again, and a rolled-back one installed and on probation again, once a
+# day. Another sha, even under the same version, is tried as usual: that is
+# how a fix arrives, and how a false verdict (a server outage through a whole
+# probation) is lifted - publish the file again with other bytes, or delete
+# the .refused file by hand. The last BK_REFUSED_MAX files, newest last; a
+# sha refused again moves to the end.
+BK_REFUSED_MAX=8
+bk_refuse_sha() { # SHA
+    case "$1" in ''|*[!0-9a-f]*) return 0 ;; esac
+    { awk -v s="$1" '$1 != s' "$BK_REFUSED" 2>/dev/null | tail -n $((BK_REFUSED_MAX - 1))
+      printf '%s %s\n' "$1" "$(bk_now)"; } > "$BK_REFUSED.tmp" 2>/dev/null \
         && mv -f "$BK_REFUSED.tmp" "$BK_REFUSED" 2>/dev/null
+}
+# 0 when this sha is remembered. A damaged or hand-grown file is read no
+# further than a full list could reach; only an exact sha refuses anything.
+bk_sha_refused() { # SHA
+    local rf_sha n=0
+    case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
+    [ -f "$BK_REFUSED" ] || return 1
+    while [ "$n" -lt 64 ] && read -r rf_sha _; do
+        [ "$rf_sha" = "$1" ] && return 0
+        n=$((n + 1))
+    done 2>/dev/null < "$BK_REFUSED"
+    return 1
 }
 
 # --- Probation of a freshly installed version ------------------------------
@@ -290,9 +313,9 @@ bk_refuse_sha() {
 # transport that no longer connects. Until the first accepted report the
 # updater's .probation file counts this version's runs and refusals; past the
 # limits the previous version (.prev) comes back and runs at once, and the
-# refused file is remembered for a day so the same offer does not reinstall
-# it straight away. This runs before any collection, so a version that fails
-# later in the run still reaches it. A dry run is not a report run.
+# refused file is remembered for good, so the same offer never reinstalls it.
+# This runs before any collection, so a version that fails later in the run
+# still reaches it. A dry run is not a report run.
 bk_probation_save() { # RUNS REJECTED
     printf '%s %s %s %s %s\n' "$pb_new" "$pb_old" "$pb_sha" "$1" "$2" > "$BK_PROBATION.tmp" 2>/dev/null \
         && mv -f "$BK_PROBATION.tmp" "$BK_PROBATION" 2>/dev/null
@@ -325,7 +348,7 @@ bk_probation_check() {
         return 0
     fi
     bk_refuse_sha "$pb_sha"
-    log_message "VAROVÁNÍ: Verze $AGENT_VERSION nedoručila žádný report ($pb_runs běhů, $pb_rej odmítnutí serverem), vrácena předchozí verze $pb_old."
+    log_message "VAROVÁNÍ: Verze $AGENT_VERSION nedoručila žádný report ($pb_runs běhů, $pb_rej odmítnutí serverem), vrácena předchozí verze $pb_old. Tento soubor (sha $pb_sha) se už znovu nestáhne."
     # The restored script takes over this run. exec keeps fd 9, and its own
     # `exec 9>` reopens the lock file, which drops and retakes the lock.
     exec bash "$BK_SELF" "${BK_ARGS[@]}"
@@ -1625,7 +1648,7 @@ bk_update_refused() { # MESSAGE [SHA to remember]
 
 bk_self_update() {
     local update_available update_url update_sha latest_version new actual_sha last_line
-    local self_kb self_mode free_kb need_kb rb_sha rb_ts sc_dir sc_rc sc_why download_ok
+    local self_kb self_mode free_kb need_kb sc_dir sc_rc sc_why download_ok
     update_available=$(echo "$body" | grep -o '"update_available":[a-z]*' | cut -d: -f2)
     [ "$update_available" = "true" ] || return 0
     update_url=$(echo "$body" | sed -n 's/.*"update_url":"\([^"]*\)".*/\1/p' | sed 's,\\/,/,g')
@@ -1639,15 +1662,9 @@ bk_self_update() {
         log_debug "Aktualizace na '$latest_version' odmítnuta: není novější než $AGENT_VERSION."
         return 0
     fi
-    if [ -f "$BK_REFUSED" ]; then
-        rb_sha=""; rb_ts=""
-        read -r rb_sha rb_ts < "$BK_REFUSED" 2>/dev/null
-        case "$rb_ts" in ''|*[!0-9]*) rb_ts=0 ;; esac
-        [ "${#rb_ts}" -le 18 ] || rb_ts=0
-        if [ "$rb_sha" = "$update_sha" ] && [ $((now_ts - 10#$rb_ts)) -lt 86400 ]; then
-            log_debug "Aktualizace na $latest_version odložena: tento soubor byl na tomto stroji odmítnut nebo vrácen zpět před méně než 24 h."
-            return 0
-        fi
+    if bk_sha_refused "$update_sha"; then
+        log_debug "Aktualizace na $latest_version odmítnuta: tento soubor (sha $update_sha) byl na tomto stroji už odmítnut nebo vrácen zpět a znovu se nestahuje."
+        return 0
     fi
     # The self-check below must not be able to hang the agent for good.
     if ! command -v timeout >/dev/null 2>&1; then

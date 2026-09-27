@@ -65,7 +65,8 @@ try {
 # The functions are taken out of agent.ps1's own syntax tree, so the unit tests
 # exercise the shipped code, not a copy.
 foreach ($fn in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
-    if ($fn.Name -in @("Test-ServiceName", "Compare-AgentVersion", "Test-AgentSentinel")) {
+    if ($fn.Name -in @("Test-ServiceName", "Compare-AgentVersion", "Test-AgentSentinel", "Get-UnixNow", "Save-StateText",
+            "Get-RejectedLines", "Test-RejectedSha", "Add-RejectedSha")) {
         . ([scriptblock]::Create($fn.Extent.Text))
     }
 }
@@ -95,6 +96,26 @@ Check "sentinel unit: other version refused" ((Test-AgentSentinel -Path $sp -Ver
 Check "sentinel unit: not the last line refused" ((Test-AgentSentinel -Path $sp -Version "1.2.3") -ne "")
 [System.IO.File]::WriteAllText($sp, "")
 Check "sentinel unit: empty file refused" ((Test-AgentSentinel -Path $sp -Version "1.2.3") -ne "")
+
+# The list of refused files: the last $REJECTED_SHA_KEEP (from the agent's own
+# line), newest last, each sha once; a damaged line or a non-hex sha refuses
+# nothing. No expiry is tested end to end below (a verdict two days old).
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$REJECTED_SHA_KEEP = [int][regex]::Match($SrcText, '(?m)^\$REJECTED_SHA_KEEP = ([0-9]+)').Groups[1].Value
+$rl = Join-Path $sentDir "agent.ps1.rejected"
+$rs = @(0..9 | ForEach-Object { ([BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$_)))).Replace("-", "").ToLowerInvariant() })
+foreach ($h in $rs) { Add-RejectedSha -Sha $h -Version "9.9.9" -Path $rl }
+$listed = { @(Get-Content $rl | ForEach-Object { ($_ -split ' ')[0] }) }
+Check "rejected list: keeps the last 8 of 10, newest last" ($REJECTED_SHA_KEEP -eq 8 -and ((& $listed) -join ",") -eq ($rs[2..9] -join ",")) ((& $listed) -join ",")
+Check "rejected list: each line is sha, version, unix time" (@(Get-Content $rl | Where-Object { $_ -cmatch '^[0-9a-f]{64} 9\.9\.9 [0-9]+$' }).Count -eq 8)
+Check "rejected list: a dropped sha is no longer refused, a kept one is" (-not (Test-RejectedSha -Sha $rs[0] -Path $rl) -and (Test-RejectedSha -Sha $rs[2] -Path $rl) -and (Test-RejectedSha -Sha $rs[9] -Path $rl))
+Add-RejectedSha -Sha $rs[4] -Version "9.9.9" -Path $rl
+Check "rejected list: a sha refused again moves to the end, once" (((& $listed) -join ",") -eq ((@($rs[2], $rs[3]) + $rs[5..9] + @($rs[4])) -join ","))
+Add-RejectedSha -Sha "not-a-sha" -Version "9.9.9" -Path $rl
+Add-RejectedSha -Sha "" -Version "9.9.9" -Path $rl
+Check "rejected list: a non-hex sha is not written" (@(Get-Content $rl).Count -eq 8)
+[System.IO.File]::AppendAllText($rl, "garbage line here`n`n")
+Check "rejected list: a damaged line refuses nothing and hides nothing" ((Test-RejectedSha -Sha $rs[4] -Path $rl) -and -not (Test-RejectedSha -Sha "garbage" -Path $rl) -and -not (Test-RejectedSha -Sha "" -Path $rl))
 
 # --------------------------------------------------------------- helpers ---
 function New-Sandbox {
@@ -418,6 +439,8 @@ Check "update, self-check hangs: refused at the time limit ($([int]$sw.Elapsed.T
 Check-Untouched "update, self-check hangs" $x.Sb $srcSha
 $left = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match "agent-update\.ps1" })
 Check "update, self-check hangs: child killed" ($left.Count -eq 0)
+# A hang counts as a verdict on the file, like any other refused self-check.
+Check "update, self-check hangs: its sha remembered" ((Get-Content -Raw (Join-Path $x.Sb "agent.ps1.rejected") -ErrorAction SilentlyContinue) -match "^$(Get-Sha (Join-Path (Join-Path $MockDir "files") "hang.ps1")) 9\.9\.9 [0-9]+")
 
 # Exits 0 at once, but leaves a process holding its stdout: the reads of that
 # pipe are bounded too, or this run (and every later one, IgnoreNew) would
@@ -468,6 +491,12 @@ Reset-MockLogs
 Set-Response 200 (New-UpdateAnswer "good-lf.ps1" "9.9.9")
 $r = Invoke-Agent $sb
 Check "rollback: the same file is not taken again" ($r.Code -eq 0 -and (Get-Downloads).Count -eq 0 -and (Get-Sha (Join-Path $sb "agent.ps1")) -eq $srcSha)
+# Two days later (the verdict dated back 48 h; the old limit was 24 h): still
+# not taken - a remembered file has no expiry.
+[System.IO.File]::WriteAllText((Join-Path $sb "agent.ps1.rejected"), "$goodSha 9.9.9 $((Now) - 172800)`n")
+Reset-MockLogs
+$r = Invoke-Agent $sb
+Check "rollback: two days later the same file is still not taken" ($r.Code -eq 0 -and (Get-Downloads).Count -eq 0 -and (Get-Sha (Join-Path $sb "agent.ps1")) -eq $srcSha)
 # A fixed file under the same version (another sha) is taken.
 New-UpdateFile "fixed.ps1" "9.9.9" -Transform { param($t) $t + "`n# fixed`n" } | Out-Null
 Reset-MockLogs

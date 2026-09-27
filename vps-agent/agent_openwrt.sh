@@ -1045,9 +1045,8 @@ trap bk_run_end EXIT
 # one 200 (a version that dies before its POST gets no answer at all). A
 # server that is simply out of reach answers nothing and refuses nothing: an
 # outage right after an update does not roll it back within minutes. The
-# sha of a rolled-back file is remembered for a day (update.bad), so the old
-# version does not download it again every minute. The four agents share
-# these numbers.
+# sha of a rolled-back file is remembered for good (<agent>.refused), so the
+# old version never downloads it again. The four agents share these numbers.
 #
 # The counters live in the tmpfs (a flash write every minute is what this
 # agent avoids), but that a probation is ON must outlive a reboot: .prev is on
@@ -1065,27 +1064,39 @@ trap bk_run_end EXIT
 BK_UPD_PROBATION="$BK_PRIVATE_DIR/update.probation"
 BK_UPD_MARK="$0.probation"
 BK_UPD_LASTOK="$BK_PRIVATE_DIR/update.lastok"
-BK_UPD_BAD="$BK_PRIVATE_DIR/update.bad"
+BK_UPD_BAD="$0.refused"
+BK_UPD_BAD_MAX=8
 BK_UPD_REFUSED_MAX=3
 BK_UPD_RUNS_MAX=30
 # The sha of a file this router refused after it had checked the download
-# (no end mark, no valid syntax, a failed self-check) or rolled back: the
-# verdict belongs to those bytes, so the old version does not fetch them
-# again every minute - 224 kB of data and a flash write each time. For a
-# day only, in the tmpfs (a reboot forgets it too): a false verdict, such as
-# a server outage during the probation, then costs a day, not the fleet.
+# (no end mark, no valid syntax, a failed or hung self-check) or rolled back:
+# the verdict belongs to those bytes, so they are never fetched again. With a
+# time limit a server that kept offering a bad file had every router
+# download it again (224 kB and a flash write), and a rolled-back one
+# installed and on probation again, once a day. Another sha, even under the
+# same version, is tried as usual: that is how a fix arrives, and how a false
+# verdict (a server outage through a whole probation) is lifted - publish
+# the file again with other bytes, or delete <agent>.refused by hand.
+# On the flash next to .prev, because a reboot must not forget it; written
+# only when a verdict falls. One line "<sha> <unix time>" per file, newest
+# last, the last BK_UPD_BAD_MAX of them; the time is for a human reading it.
 bk_upd_bad() { # SHA
     case "$1" in ''|*[!a-f0-9]*) return 0 ;; esac
-    printf '%s %s\n' "$1" "$(date +%s)" > "$BK_UPD_BAD" 2>/dev/null
+    { awk -v s="$1" '$1 != s' "$BK_UPD_BAD" 2>/dev/null | tail -n $((BK_UPD_BAD_MAX - 1))
+      printf '%s %s\n' "$1" "$(date +%s)"; } > "$BK_UPD_BAD.tmp" 2>/dev/null \
+        && mv -f "$BK_UPD_BAD.tmp" "$BK_UPD_BAD" 2>/dev/null
     return 0
 }
-bk_upd_is_bad() { # SHA -> 0 while that sha is remembered
-    _bd_sha=""; _bd_ts=""
-    read -r _bd_sha _bd_ts 2>/dev/null < "$BK_UPD_BAD"
-    [ -n "$1" ] && [ "$_bd_sha" = "$1" ] || return 1
-    case "$_bd_ts" in ''|*[!0-9]*) return 1 ;; esac
-    _bd_now=$(date +%s)
-    [ "$_bd_now" -ge "$_bd_ts" ] && [ $((_bd_now - _bd_ts)) -lt 86400 ]
+bk_upd_is_bad() { # SHA -> 0 when that sha is remembered
+    case "$1" in ''|*[!a-f0-9]*) return 1 ;; esac
+    _bd_n=0
+    # A damaged or hand-grown file is read no further than a full list could
+    # reach; nothing in it but an exact sha refuses anything.
+    while [ "$_bd_n" -lt 64 ] && read -r _bd_sha _bd_ts; do
+        [ "$_bd_sha" = "$1" ] && return 0
+        _bd_n=$((_bd_n + 1))
+    done 2>/dev/null < "$BK_UPD_BAD"
+    return 1
 }
 # The probation file as _pb_v _pb_sha _pb_runs _pb_ref; 1 when it is not
 # this version's (written for another one: the swap failed after it, or the
@@ -1129,7 +1140,7 @@ bk_upd_probation() {
     # name at every moment, as in bk_self_replace.
     if [ -f "$0.prev" ] && mv -f "$0.prev" "$0" 2>/dev/null; then
         bk_upd_bad "$_pb_sha"
-        log_message "CHYBA UPDATE: Verze $AGENT_VERSION neobstala ($_pb_why) - vracena predchozi verze z $0.prev. Stejny soubor agent znovu zkusi nejdriv za 24 h."
+        log_message "CHYBA UPDATE: Verze $AGENT_VERSION neobstala ($_pb_why) - vracena predchozi verze z $0.prev. Tento soubor (sha $_pb_sha) uz agent znovu nestahne, oprava musi prijit jako jiny soubor."
         # The shell still reads the unlinked new file; nothing more of it runs.
         exit 1
     fi
@@ -6131,11 +6142,11 @@ if [ "$http_code" = "200" ]; then
                 log_debug "Server nabizi verzi '$latest_version', ktera neni novejsi nez $AGENT_VERSION - aktualizace odmitnuta."
                 update_url=""
             fi
-            # A file this router has already refused or rolled back is not
-            # fetched again for a day (see bk_upd_bad): the verdict is about
-            # these exact bytes, and a republished file has another sha.
+            # A file this router has already refused or rolled back is never
+            # fetched again (see bk_upd_bad): the verdict is about these
+            # exact bytes, and a republished file has another sha.
             if [ -n "$update_url" ] && [ -f "$BK_UPD_BAD" ] && bk_upd_is_bad "$update_sha"; then
-                log_debug "Verze $latest_version (sha $update_sha) uz tu neprosla, znovu se zkusi nejdriv 24 h od te chvile."
+                log_debug "Verze $latest_version (sha $update_sha) uz tu neprosla, tento soubor se znovu nestahuje."
                 update_url=""
             fi
 

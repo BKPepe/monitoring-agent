@@ -3,6 +3,7 @@
 (run-security-cases.sh): remote actions, the --selfcheck gate, self-update
 refusals and the rollback. Reads OUT/sec/*.facts, *.posts.jsonl, *.gets and
 *.log; usage: assert_security.py OUT."""
+import hashlib
 import json
 import os
 import sys
@@ -208,6 +209,20 @@ for kind in ("sh", "py"):
     check(f"{kind}: rollback case: the same offer is not reinstalled",
           f6.get("agent_sha") == orig.get("orig_sha") and reps[-1] == cur
           and text(f"{kind}-rb-rejected-6", "gets").count("/files/") == 1)
+    f7 = facts(f"{kind}-rb-rejected-7")
+    reps, _ = posts(f"{kind}-rb-rejected-7")
+    check(f"{kind}: rollback case: two days after the verdict the same offer is still not downloaded (no expiry)",
+          f7.get("agent_sha") == orig.get("orig_sha") and reps == [cur] and f7.get("probation") == ""
+          and text(f"{kind}-rb-rejected-7", "gets").count("/files/") == 0
+          and f7.get("refused", "").split()[:1] == [orig.get("refused_sha")])
+    ff = facts(f"{kind}-rb-fixed")
+    check(f"{kind}: rollback case: the same version republished as other bytes (a new sha) is taken",
+          orig.get("fixed_sha") not in (None, "", orig.get("refused_sha"))
+          and ff.get("agent_sha") == orig.get("fixed_sha") and ff.get("agent_version") == "9.9.8"
+          and ff.get("probation", "").split() == ["9.9.8", cur, orig.get("fixed_sha"), "0", "0"]
+          and ff.get("prev_sha") == orig.get("orig_sha")
+          and text(f"{kind}-rb-fixed", "gets").count("/files/") == 1
+          and ff.get("refused", "").split()[:1] == [orig.get("refused_sha")])
 
     f = facts(f"{kind}-rb-runs")
     reps, _ = posts(f"{kind}-rb-runs")
@@ -230,6 +245,16 @@ check("sh: service-name rule refuses traversal, leading dot/dash, separators, 12
       all(f"svc refused {n}".rstrip() in [r.rstrip() for r in rules] for n in refuse))
 newer = ["0.1.4 0.1.3", "0.1.10 0.1.9", "1.0 0.9.9", "0.2 0.1.99", "1.0.1 1.0"]
 notnewer = ["0.1.3 0.1.3", "0.1.2 0.1.3", "1.0 1.0.0", "0.1.4-rc1 0.1.3", "0.1..4 0.1.3", ".1 0.0", "abc 0.1"]
+lst = {l.split(" ", 2)[1]: (l.split(" ", 2) + [""])[2].strip() for l in rules if l.startswith("list ")}
+rsha = [hashlib.sha256(str(i).encode()).hexdigest() for i in range(10)]
+check("sh: the list of refused files keeps the last 8, newest last, a timestamp each",
+      lst.get("after10", "").split() == rsha[2:] and lst.get("tsok") == "8")
+check("sh: a dropped sha is no longer refused, kept ones are",
+      [lst.get(f"is{i}") for i in (0, 2, 9)] == ["no", "yes", "yes"])
+check("sh: a sha refused again moves to the end, once; a non-hex sha is not written",
+      lst.get("readd", "").split() == rsha[2:4] + rsha[5:] + [rsha[4]] and lst.get("invalid") == "8")
+check("sh: a damaged line refuses nothing and hides nothing",
+      [lst.get(k) for k in ("damaged4", "damagedg", "empty")] == ["yes", "no", "no"])
 check("sh: version order: only strictly newer dotted numbers pass",
       all(f"ver newer {p}" in rules for p in newer)
       and all(f"ver notnewer {p}" in rules for p in notnewer))
