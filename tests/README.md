@@ -404,6 +404,71 @@ key, stale when the CORE check passes. There is one:
   should be null or be read from `/proc`; that is an open finding for the
   agent, not something this harness hides.
 
+### Golden payloads
+
+`golden/openwrt.json`, `golden/linux-bash.json` and `golden/linux-python.json`
+pin the shape of what each agent prints: one plain payload each, as the agent
+prints it, with identifiers masked (`agent_key` empty, `hostname`
+`golden-openwrt`/`golden-linux`, `kernel` `6.6.0`, WAN addresses from
+192.0.2.0/24, fixed epoch times). The monitoring repo POSTs them to its real
+API as they are, so a key the server would drop, or a value it would refuse,
+shows there as well. `golden.py` does the work:
+
+- **`check`**: every payload run of a harness against its agent's golden
+  file. The top-level keys must be exactly the golden's: a new key or a
+  missing one fails, and the message names the update command. Types are
+  JSON types (an int and a float are both a number). **Only null means null**:
+  null passes wherever a value is pinned (an unmeasured value is null), and a
+  golden null pins no type - such keys are listed as unpinned, not failed.
+  `[]`, `{}` and `""` are values like any other. An object outside an array
+  keeps the golden object's keys unless it is a dynamic map (`MAPS` in
+  `golden.py`: `service_restarts`, whose keys are service names); an array item
+  is compared with all golden items at that path merged (a SATA and an NVMe
+  disk carry different SMART keys).
+- **Which files.** Each harness lists its payloads in `out/payload_runs.txt`
+  (`AGENT TAG`, or `AGENT -TAG` for a run that must print nothing: a lock held,
+  a rollback). The stub harness writes it with `pl TAG` before each run. There
+  is no glob: `out/` holds kept copies and planted files too, and a listed
+  payload that does not parse fails.
+- It runs at the end of `run_openwrt_e2e.sh`, `run_linux_e2e.sh`,
+  `run_openwrt_real.sh` and `run_linux_distros.sh`; `golden.py selftest`
+  (the rules on their own samples) runs in `lint`.
+
+The shape check and the real-image checks catch different things: a
+collector that silently goes null passes the shape (null is allowed) and fails
+the real images, where every key must be measured unless `NULL_OK` or
+`VARIES` names it; a value that changes type or a key that disappears fails
+the shape.
+
+**When an agent change adds, removes or retypes a key**, renew the golden
+files and commit their diff with the agent change:
+
+```
+bash tests/update_golden.sh openwrt     # the stub harness, then the real images (~12 min)
+bash tests/update_golden.sh linux       # Debian, then the three distros (~6 min)
+bash tests/update_golden.sh linux --accept KEY    # KEY retyped or dropped on purpose
+python3 tests/golden.py update openwrt DIR...   # from passed runs already kept (BK_E2E_KEEP)
+```
+
+The harnesses must still pass everything else (`BK_GOLDEN_CHECK=0` skips only
+the golden check). Each writes `out/.passed` once its own checks passed -
+before the golden check, since a new key fails that one and is the very run to
+renew from - and `BK_E2E_KEEP` drops an older `.passed` before it copies.
+`update` refuses a kept directory without it, and a payload file unless
+`--unverified`. `update` takes the sources in the order given, and a
+harness's list in its own order (second runs first): all of them must print
+the same keys, or it stops and names the difference. A golden value still
+compatible with every source is kept, so the file does not churn; a golden
+null takes the first measured value, `version` follows the agent, a new or
+retyped key takes the first non-null value, arrays take items from later
+sources that add item keys (up to 6), and a key no longer printed goes. It
+prints `added / changed / retyped / dropped / unpinned` for the review
+(`changed` is `version` and golden nulls or arrays that got a value). A
+retyped or dropped key is refused, and the golden file left alone, unless
+`--accept KEY` names it: `--accept` says the agent change intends it, and the
+golden diff goes into that same commit. It never writes a public address into
+the repo.
+
 ### CI
 
 `.github/workflows/test.yml` runs on pull requests, on pushes to branches
@@ -413,7 +478,7 @@ published by the monitoring repo from its submodule gitlink, and a release is
 a commit on `main` that passed this workflow. Four jobs:
 
 - `lint`: `bash -n agent.sh`, `dash -n agent_openwrt.sh`, `py_compile
-  agent.py`, PowerShell's parser on `agent.ps1`; ShellCheck 0.11.0 (pinned
+  agent.py`, PowerShell's parser on `agent.ps1`; `golden.py selftest`; ShellCheck 0.11.0 (pinned
   image) at warning level on exactly the two shell agents, both clean today
   (fewer files found fails the step instead of passing on nothing); every
   agent's last line equals `# bk-agent-end <AGENT_VERSION>`;

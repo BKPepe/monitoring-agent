@@ -8,6 +8,8 @@ OUT=/work/out
 PRIV=/var/run/status-agent-openwrt
 OLD_ID=/tmp/status-agent-openwrt-identity.cache
 OLD_PAYLOAD=/tmp/status-agent-openwrt-last-payload.json
+# The payload list of the golden check, as in run-in-container.sh.
+pl() { echo "openwrt $1" >> "$OUT/payload_runs.txt"; }
 
 # run-in-container.sh has put the payload runs' call logs aside and removed
 # the private directory; the first seed below needs it back.
@@ -20,13 +22,16 @@ mkdir -p "$PRIV"
 [ -s /tmp/status-agent-openwrt-version.stamp ] || { echo "no version stamp before the G28 runs" >&2; exit 1; }
 printf "ow_hostname=\$(touch $OUT/PWNED)\now_model=\`touch $OUT/PWNED\`\n" > "$OLD_ID"
 cp "$OLD_ID" "$PRIV/identity.cache"
+pl w17a
 sh agent_openwrt.sh --dry-run > $OUT/w17a.json 2>$OUT/w17a.err
 # A file in the agent's own format whose VALUES are shell code: they must
 # arrive as text.
 { date +%s; echo "\$(touch $OUT/PWNED)"; echo k; echo "\`touch $OUT/PWNED\`"; echo b; echo d; echo v; echo end; } > "$PRIV/identity.cache"
+pl w17b
 sh agent_openwrt.sh --dry-run > $OUT/w17b.json 2>$OUT/w17b.err
 # 25 hours old: read again from ubus.
 { echo $(( $(date +%s) - 90000 )); echo stale; echo k; echo stale; echo b; echo d; echo v; echo end; } > "$PRIV/identity.cache"
+pl w17c
 sh agent_openwrt.sh --dry-run > $OUT/w17c.json 2>$OUT/w17c.err
 rm -f "$OLD_ID"
 
@@ -71,6 +76,7 @@ done
 echo "STALE-0.0.0" > /tmp/status-agent-librespeed.state
 echo "0.0.0" > /tmp/status-agent-openwrt-version.stamp
 write_cfg SECRETKEY123
+pl w18
 sh agent_openwrt.sh --dry-run > $OUT/w18.json 2>$OUT/w18.err
 last_payload_facts w18
 if [ -e /tmp/status-agent-openwrt-private/identity.cache ]; then echo yes; else echo no; fi > $OUT/w23_fallback.txt
@@ -79,6 +85,7 @@ cat /tmp/status-agent-openwrt-version.stamp > $OUT/w23_stamp.txt 2>/dev/null || 
 # A key with a quote in it: cutting the key out by pattern would stop at the
 # escaped quote and leave the rest of the key in the file.
 write_cfg 'abc"SECRETKEY123'
+pl w18b
 sh agent_openwrt.sh --dry-run > $OUT/w18b.json 2>$OUT/w18b.err
 last_payload_facts w18b
 
@@ -101,6 +108,7 @@ action_run() {
     echo "# $_tag" >> $OUT/action_calls.log
     echo "# $_tag" >> $OUT/action_results.log
     echo "# $_tag ts=$_ts" >> $OUT/openssl_calls.log
+    pl "$_tag"
     STATUS_TEST_RESPONSE="$_resp" sh agent_openwrt.sh --dry-run > "$OUT/$_tag.json" 2>"$OUT/$_tag.err"
     cat "$_resp.results" >> $OUT/action_results.log 2>/dev/null || true
 }
@@ -134,6 +142,7 @@ write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 ALLOWED_ACTIONS=restart_wan
 printf '200\n{"success":true,"pending_action":{"action_id":10,"action":"restart_wan","timestamp":12abc,"nonce":"a1b2c3d4e5f60010","signature":"%s"}}\n' "$SIG" > $OUT/w19_10.resp
 for _log in action_calls action_results openssl_calls; do echo "# w19_10" >> $OUT/$_log.log; done
 _rc=0
+pl w19_10
 STATUS_TEST_RESPONSE="$OUT/w19_10.resp" sh agent_openwrt.sh --dry-run > $OUT/w19_10.json 2>$OUT/w19_10.err || _rc=$?
 echo "$_rc" > $OUT/w19_10_exit.txt
 cat $OUT/w19_10.resp.results >> $OUT/action_results.log 2>/dev/null || true
@@ -154,6 +163,7 @@ write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 ALLOWED_ACTIONS=restart_wan
 printf '200\n{"success":true,"pending_action":{"action_id":16,"action":"restart_wan","timestamp":1234567890123456789,"nonce":"a1b2c3d4e5f60016","signature":"%s"}}\n' "$SIG" > $OUT/w19_16.resp
 for _log in action_calls action_results openssl_calls; do echo "# w19_16" >> $OUT/$_log.log; done
 _rc=0
+pl w19_16
 STATUS_TEST_RESPONSE="$OUT/w19_16.resp" sh agent_openwrt.sh --dry-run > $OUT/w19_16.json 2>$OUT/w19_16.err || _rc=$?
 echo "$_rc" > $OUT/w19_16_exit.txt
 cat $OUT/w19_16.resp.results >> $OUT/action_results.log 2>/dev/null || true
@@ -166,6 +176,7 @@ lz_run() {
     printf '200\n{"success":true,"pending_action":{"action_id":%s,"action":"restart_wan","timestamp":%s,"nonce":"a1b2c3d4e5f600%s","signature":"%s"}}\n' "$2" "$3" "${1#w19_}" "$SIG" > "$OUT/$1.resp"
     for _log in action_calls action_results openssl_calls; do echo "# $1" >> "$OUT/$_log.log"; done
     _rc=0
+    pl "$1"
     STATUS_TEST_RESPONSE="$OUT/$1.resp" sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2>"$OUT/$1.err" || _rc=$?
     echo "$_rc" > "$OUT/$1_exit.txt"
     cat "$OUT/$1.resp.results" >> $OUT/action_results.log 2>/dev/null || true
@@ -181,6 +192,7 @@ rm -rf "$PRIV" /tmp/status-agent-openwrt-private
 mkdir -p $OUT/planted
 ln -s $OUT/planted "$PRIV"
 ln -s $OUT/planted /tmp/status-agent-openwrt-private
+pl wpriv
 sh agent_openwrt.sh --dry-run > $OUT/wpriv.json 2>$OUT/wpriv.err
 ls -ld /tmp/status-agent-openwrt-private | cut -c1-10 > $OUT/wpriv_dirmode.txt
 ls -l /tmp/status-agent-openwrt-private/last-payload.json 2>/dev/null | cut -c1-10 > $OUT/wpriv_mode.txt

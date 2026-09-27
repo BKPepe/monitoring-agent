@@ -19,7 +19,9 @@ esac
 work="$(mktemp -d)"
 . "$here/e2e_cleanup.sh"
 keep_out() {
-    [ -z "${BK_E2E_KEEP:-}" ] || { mkdir -p "$BK_E2E_KEEP" && cp -R "$work/out/." "$BK_E2E_KEEP/"; }
+    # A .passed left there by an earlier run must not vouch for this one.
+    [ -z "${BK_E2E_KEEP:-}" ] || { mkdir -p "$BK_E2E_KEEP" && rm -f "$BK_E2E_KEEP/.passed" &&
+        cp -R "$work/out/." "$BK_E2E_KEEP/"; }
 }
 prefix="${BK_E2E_NAME:-bk-linux-distro-$$}"
 cleanup_img="bk-distro-ubuntu"
@@ -35,6 +37,14 @@ for d in $distros; do
     cleanup_img="bk-distro-$d"
     docker run --rm --name "$prefix-$d" -v "$work:/work" -v "$here/linux-distros:/harness:ro" \
         "bk-distro-$d" sh /harness/run-in-container.sh "$d"
+    printf 'linux-bash %s\n' "${d}_sh2" "${d}_sh1" >> "$work/out/payload_runs.txt"
+    printf 'linux-python %s\n' "${d}_py2" "${d}_py1" >> "$work/out/payload_runs.txt"
     python3 "$here/assert_real_payload.py" "$d" "$work/out" || rc=1
 done
+# Its own checks passed: golden.py update takes a kept out/ only with this
+# (before the golden check: a new key fails that one, and this is the run
+# the golden file is renewed from).
+[ "$rc" != 0 ] || touch "$work/out/.passed"
+# The shape against golden/linux-*.json (BK_GOLDEN_CHECK=0: update_golden.sh).
+[ "${BK_GOLDEN_CHECK:-1}" = 0 ] || python3 "$here/golden.py" check "$work/out" || rc=1
 exit "$rc"

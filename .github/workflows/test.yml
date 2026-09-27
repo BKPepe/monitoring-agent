@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   # Seconds, no Docker: syntax of all four agents, ShellCheck, the end-of-file
-  # sentinel, the Worker's unit tests.
+  # sentinel, the Worker's unit tests, the golden payload rules.
   lint:
     name: Syntax, ShellCheck, sentinel, Worker units
     runs-on: ubuntu-latest
@@ -100,6 +100,11 @@ jobs:
           node-version: '22'
       - name: Worker unit tests
         run: node --test tests/*.test.mjs
+
+      # The shape rules of the golden payloads on their own samples; the
+      # harnesses below apply them to every payload they print.
+      - name: Golden payload rules (golden.py selftest)
+        run: python3 tests/golden.py selftest
 
   # The agents run for real in containers, each against its harness. One job,
   # three steps: the account shares 20 concurrent jobs with the OpenWrt

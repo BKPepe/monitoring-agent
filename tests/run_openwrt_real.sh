@@ -28,7 +28,9 @@ esac
 work="$(mktemp -d)"
 . "$here/e2e_cleanup.sh"
 keep_out() {
-    [ -z "${BK_E2E_KEEP:-}" ] || { mkdir -p "$BK_E2E_KEEP" && cp -R "$work/out/." "$BK_E2E_KEEP/"; }
+    # A .passed left there by an earlier run must not vouch for this one.
+    [ -z "${BK_E2E_KEEP:-}" ] || { mkdir -p "$BK_E2E_KEEP" && rm -f "$BK_E2E_KEEP/.passed" &&
+        cp -R "$work/out/." "$BK_E2E_KEEP/"; }
 }
 prefix="${BK_E2E_NAME:-bk-owrt-real-$$}"
 cleanup_img="$img_2410"
@@ -51,6 +53,13 @@ for ver in $vers; do
         "$img" /bin/sh /harness/run-in-container.sh "$ver"
     # Which snapshot a red master run was, for the pin.
     echo "  image $(docker image inspect -f '{{join .RepoDigests " "}}' "$img" 2>/dev/null || echo '?')"
+    printf 'openwrt %s\n' "${ver}_r2" "${ver}_r1" >> "$work/out/payload_runs.txt"
     python3 "$here/assert_real_payload.py" "openwrt-$ver" "$work/out" || rc=1
 done
+# Its own checks passed: golden.py update takes a kept out/ only with this
+# (before the golden check: a new key fails that one, and this is the run
+# the golden file is renewed from).
+[ "$rc" != 0 ] || touch "$work/out/.passed"
+# The shape against golden/openwrt.json (BK_GOLDEN_CHECK=0: update_golden.sh).
+[ "${BK_GOLDEN_CHECK:-1}" = 0 ] || python3 "$here/golden.py" check "$work/out" || rc=1
 exit "$rc"
