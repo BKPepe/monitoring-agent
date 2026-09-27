@@ -5,10 +5,27 @@ param(
     [alias("h")][switch]$Help,
     [alias("v")][switch]$Version,
     [switch]$Update,
-    [alias("Print")][switch]$DryRun
+    [alias("Print")][switch]$DryRun,
+    [switch]$SelfCheck
 )
 
 $AGENT_VERSION = "0.1.0"
+
+# -SelfCheck is the self-update's behaviour gate: before a downloaded copy may
+# replace this file, the updater runs it with -SelfCheck, and it has to collect,
+# build its JSON payload and say which agent and version it is (see
+# Invoke-AgentSelfCheck). A parse check alone let a release through that failed
+# only at run time. Honoured only with BK_UPDATE_SELFCHECK=1, which only the
+# updater sets: a task line or a person typing -SelfCheck gets an error, not an
+# agent that quietly stopped reporting.
+$SelfCheckMode = $false
+if ($SelfCheck) {
+    if ($env:BK_UPDATE_SELFCHECK -ne "1") {
+        [Console]::Error.WriteLine("-SelfCheck is for the agent's own updater only (BK_UPDATE_SELFCHECK=1).")
+        exit 2
+    }
+    $SelfCheckMode = $true
+}
 
 if ($Help) {
     Write-Host "Windows PowerShell Status Agent v$AGENT_VERSION"
@@ -74,9 +91,38 @@ if (Test-Path $CfgPath) {
 
 $LogFile = Join-Path $ScriptPath "agent.log"
 $NetStateFile = Join-Path $ScriptPath "agent_net.state"
+$SelfPath = $MyInvocation.MyCommand.Path
+# Self-update and remote-action state, next to the script and named after it
+# (as agent.sh and agent.py do): the rename that swaps in a new version is
+# only atomic inside one directory, on one volume.
+$PrevFile = "$SelfPath.prev"            # the version before the last update
+$PendingFile = "$SelfPath.probation"    # JSON: an update still on probation
+$LastOkFile = "$SelfPath.last-ok"       # "<version> <unix ts>" of the last accepted report
+$RejectedFile = "$SelfPath.rejected"    # "<sha256> <version> <unix ts>" of a file refused or rolled back
+$NonceFile = "$SelfPath.nonces"         # "<unix ts> <nonce>" per signed action let through
+# Windows PowerShell 5.1 writes a BOM with -Encoding UTF8; these files are read
+# back by this script only, but a BOM would glue itself to the first field.
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+# Probation: an update is proven by the new version's first accepted report.
+# Until then every run counts, and the previous version comes back when the
+# server has refused (HTTP 4xx) this many reports, or when this many runs have
+# passed without one accepted. The second limit is large on purpose: a network
+# outage right after an update is not the new version's fault.
+$ROLLBACK_AFTER_REFUSED = 3
+$ROLLBACK_AFTER_RUNS = 30
+# A rolled-back file is not taken again for this long. A later fix published
+# under the same version has another sha256 and is taken at once.
+$REJECTED_SHA_HOURS = 24
+# The downloaded copy's -SelfCheck runs the whole collection; Windows
+# PowerShell 5.1 start plus the CIM queries take several seconds on a small VM.
+$SELFCHECK_TIMEOUT_SEC = 60
 
 function Write-AgentLog {
     param([string]$Message)
+    # A self-check prints exactly one JSON object; any other line would make
+    # the updater refuse the file.
+    if ($SelfCheckMode) { return }
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "$ts - $Message"
     # In -DryRun stdout is the JSON payload; keep the chatter on the host stream.
@@ -99,10 +145,359 @@ function Write-AgentLog {
     }
 }
 
-if ($AGENT_KEY -eq "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE" -and -not $DryRun) {
+# The functions below that RETURN a value never call Write-AgentLog: in
+# PowerShell a log line written inside such a function becomes part of its
+# return value (and a non-empty "reason" out of nothing).
+
+function Get-UnixNow { return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+
+# A small state file through a temporary name and a rename: a run killed
+# mid-write leaves the old content, not half a line. Throws on failure; the
+# caller decides whether that refuses something (the nonce store does).
+function Save-StateText {
+    param([string]$Path, [string]$Text)
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $Text, $Utf8NoBom)
+    Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+}
+
+# 1 when $A is newer than $B, 0 when equal, -1 when older, $null when either
+# is not plain dotted digits. Such an offer is refused, never guessed at.
+function Compare-AgentVersion {
+    param([string]$A, [string]$B)
+    $re = '^[0-9]{1,9}(\.[0-9]{1,9}){0,5}\z'
+    if ($A -cnotmatch $re -or $B -cnotmatch $re) { return $null }
+    $pa = $A.Split('.'); $pb = $B.Split('.')
+    $n = [Math]::Max($pa.Count, $pb.Count)
+    for ($i = 0; $i -lt $n; $i++) {
+        $x = 0; if ($i -lt $pa.Count) { $x = [int]$pa[$i] }
+        $y = 0; if ($i -lt $pb.Count) { $y = [int]$pb[$i] }
+        if ($x -gt $y) { return 1 }
+        if ($x -lt $y) { return -1 }
+    }
+    return 0
+}
+
+# The one service-name rule of all four agents: a letter, digit or "_" first
+# (no leading "-" or ".": no option injection, no ".."), then letters, digits
+# and _ . @ $ - ("$" for instance names such as MSSQL$SQLEXPRESS, "@" for
+# systemd templates), 128 characters at most. Nothing that Restart-Service
+# -Name reads as a wildcard (* ? [ ]) - "*" would restart every service - and
+# no path separator or space. -cmatch: a case-insensitive match lets the Kelvin
+# sign through as "k". \z: "$" would also match before a trailing newline.
+function Test-ServiceName {
+    param([string]$Name)
+    return ($Name -cmatch '^[A-Za-z0-9_][A-Za-z0-9_.@$-]{0,127}\z')
+}
+
+# What a correctly SIGNED action still has to pass: "" when it may run, else
+# the reason. The order of agent_openwrt.sh's bk_action_gate: single use, the
+# allow-list, the service name. Called only after the signature matched, so an
+# unsigned answer learns nothing about the list and burns no nonce. Until now
+# this agent had no replay protection: a signed answer could be replayed for
+# as long as its timestamp held (SEC-09).
+function Get-ActionRefusal {
+    param([string]$Type, [string]$Nonce, [long]$NowTs, [string]$ServiceName)
+    # Single use. A signature is good for 30 s either side of its timestamp,
+    # so at most 60 s after its first use; that long the nonce is remembered.
+    # Written BEFORE the action runs: after a reboot nothing would write it.
+    if ($Nonce -cnotmatch '^[A-Za-z0-9]{1,128}\z') { return "nonce chybí nebo má nepovolené znaky" }
+    $keep = @()
+    if (Test-Path -LiteralPath $NonceFile) {
+        # A store that cannot be read cannot say the nonce is new.
+        try { $lines = [System.IO.File]::ReadAllLines($NonceFile) } catch { return "nonce nejde přečíst z $NonceFile" }
+        foreach ($l in $lines) {
+            $f = $l.Split(' ')
+            if ($f.Count -ne 2 -or $f[0] -cnotmatch '^[0-9]{1,18}\z') { continue }
+            if (($NowTs - [long]$f[0]) -gt 60) { continue }
+            if ($f[1] -ceq $Nonce) { return "nonce už byl použit (opakovaná odpověď)" }
+            $keep += $l
+        }
+    }
+    # A nonce that cannot be remembered could be replayed: refuse.
+    $keep += "$NowTs $Nonce"
+    try { Save-StateText -Path $NonceFile -Text (($keep -join "`n") + "`n") } catch { return "nonce nejde uložit do $ScriptPath" }
+    # The type before the list: a comma inside it would match across two entries.
+    if ($Type -cnotmatch '^[a-z_]{1,64}\z') { return "neplatný typ akce" }
+    $allowed = @($ALLOWED_ACTIONS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($allowed -cnotcontains $Type) { return "akce '$Type' není v ALLOWED_ACTIONS" }
+    if ($Type -ceq "restart_service" -and -not (Test-ServiceName $ServiceName)) { return "neplatný název služby" }
+    return ""
+}
+
+# The last line of every agent file is "# bk-agent-end <version>". A download
+# cut short can still parse - a truncated OpenWrt agent did, and installed
+# itself - but it cannot end with this line. "" or the reason.
+function Test-AgentSentinel {
+    param([string]$Path, [string]$Version)
+    try { $bytes = [System.IO.File]::ReadAllBytes($Path) } catch { return "stažený soubor nejde přečíst" }
+    $take = [Math]::Min($bytes.Length, 512)
+    $tail = [System.Text.Encoding]::UTF8.GetString($bytes, $bytes.Length - $take, $take)
+    # CR too: the same file saved with Windows line ends is still the same file.
+    $tail = $tail.TrimEnd([char[]]@(13, 10, 32, 9))
+    $last = $tail.Substring($tail.LastIndexOf([char]10) + 1).TrimEnd([char]13)
+    if ($last -cne "# bk-agent-end $Version") { return "stažený soubor nekončí řádkem '# bk-agent-end $Version' (neúplný?)" }
+    return ""
+}
+
+# The self-check process and whatever it started. pwsh 7 (.NET Core 3+) has
+# Kill($true) for the whole tree; Windows PowerShell 5.1 (.NET Framework) has
+# not, and taskkill /T does the same there.
+function Stop-SelfCheckTree {
+    param($Proc)
+    try { $Proc.Kill($true); return } catch {}
+    try { & taskkill.exe /T /F /PID $Proc.Id 2>&1 | Out-Null } catch {}
+    try { $Proc.Kill() } catch {}
+}
+
+# Runs the downloaded copy with -SelfCheck under a time limit. It has to exit 0
+# and print one JSON object naming this agent type and the offered version.
+# "" or the reason.
+function Invoke-AgentSelfCheck {
+    param([string]$Path, [string]$Version)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    # The engine of this run: the task runs Windows PowerShell 5.1 or pwsh 7,
+    # and the new file has to work in that one.
+    $psi.FileName = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Path`" -SelfCheck"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["BK_UPDATE_SELFCHECK"] = "1"
+    try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return "self-check nejde spustit: $($_.Exception.Message)" }
+    # Both pipes are drained asynchronously: a child that fills one while we
+    # wait on the other would never exit.
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit($SELFCHECK_TIMEOUT_SEC * 1000)) {
+        Stop-SelfCheckTree $proc
+        return "self-check nedoběhl do $SELFCHECK_TIMEOUT_SEC s"
+    }
+    $proc.WaitForExit()
+    # The reads end at EOF, and EOF comes when the LAST holder of the pipe
+    # closes it: a process the self-check left running keeps it open, and an
+    # unbounded .Result then held this run (and, with IgnoreNew, every later
+    # scheduled run) for as long as that process lived.
+    if (-not $outTask.Wait(5000)) {
+        Stop-SelfCheckTree $proc
+        return "self-check nechal běžet proces, který drží jeho výstup"
+    }
+    [void]$errTask.Wait(5000)
+    if ($proc.ExitCode -ne 0) { return "self-check skončil kódem $($proc.ExitCode)" }
+    $out = ([string]$outTask.Result).Trim()
+    $obj = $null
+    if ($out.StartsWith("{")) { try { $obj = ConvertFrom-Json -InputObject $out -ErrorAction Stop } catch {} }
+    if (-not $obj -or $obj -is [array]) { return "self-check nevypsal jeden JSON objekt" }
+    if ([string]$obj.agent_type -cne "powershell") { return "self-check hlásí agent_type '$($obj.agent_type)'" }
+    if ([string]$obj.agent_version -cne $Version) { return "self-check hlásí verzi '$($obj.agent_version)' místo $Version" }
+    return ""
+}
+
+# The verified download sits in this directory, so the swap is a rename on
+# one volume (IO-07). [IO.File]::Replace (ReplaceFile) turns the current file
+# into .prev and the new one into the script, and the new file keeps the
+# script's own ACL. The old way (Copy-Item .bak, Move-Item) had a window with
+# no agent.ps1 at all, and nothing ever read the .bak. "" or the reason; on
+# failure the script is the old one.
+function Invoke-AgentSwap {
+    param([string]$NewPath)
+    $replaceErr = ""
+    try {
+        [System.IO.File]::Replace($NewPath, $SelfPath, $PrevFile)
+        return ""
+    } catch { $replaceErr = $_.Exception.Message }
+    # A volume without ReplaceFile (some network shares): copy, then move.
+    try {
+        Copy-Item -LiteralPath $SelfPath -Destination $PrevFile -Force -ErrorAction Stop
+        Move-Item -LiteralPath $NewPath -Destination $SelfPath -Force -ErrorAction Stop
+        return ""
+    } catch {
+        # ReplaceFile can fail half way with the old file already under the
+        # backup name: put it back.
+        if (-not (Test-Path -LiteralPath $SelfPath) -and (Test-Path -LiteralPath $PrevFile)) {
+            Copy-Item -LiteralPath $PrevFile -Destination $SelfPath -Force -ErrorAction SilentlyContinue
+        }
+        return "nahrazení $SelfPath selhalo ($replaceErr / $($_.Exception.Message))"
+    }
+}
+
+function Read-PendingUpdate {
+    if (-not (Test-Path -LiteralPath $PendingFile)) { return $null }
+    try { return ([System.IO.File]::ReadAllText($PendingFile) | ConvertFrom-Json) } catch { return $null }
+}
+
+# A report the server read and refused (HTTP 4xx) while an update is on
+# probation: the class of a release whose payload the server rejects (REL-01).
+# Only these count toward the fast rollback; a timeout or DNS failure is not
+# the new version's fault.
+function Register-UpdateRefusal {
+    param($ErrorRecord)
+    $code = 0
+    try { $code = [int]$ErrorRecord.Exception.Response.StatusCode } catch {}
+    if ($code -lt 400 -or $code -gt 499) { return }
+    $p = Read-PendingUpdate
+    if (-not $p -or [string]$p.version -cne $AGENT_VERSION) { return }
+    try {
+        $p.refused = [int]$p.refused + 1
+        Save-StateText -Path $PendingFile -Text ($p | ConvertTo-Json -Compress)
+    } catch {}
+}
+
+# Start of every real run: a version on probation counts this run, and goes
+# back to .prev when it has had its chances (MISS-owrt-bak: the old .bak was
+# never read by anything). Called as a statement, so its log lines reach the
+# task's output.
+function Invoke-UpdateProbation {
+    $p = Read-PendingUpdate
+    if (-not $p) {
+        if (Test-Path -LiteralPath $PendingFile) { Remove-Item -LiteralPath $PendingFile -Force -ErrorAction SilentlyContinue }
+        return
+    }
+    # A marker for another version is left from a swap that failed or was
+    # undone by hand; without a .prev there is nothing to go back to.
+    if ([string]$p.version -cne $AGENT_VERSION -or -not (Test-Path -LiteralPath $PrevFile)) {
+        Remove-Item -LiteralPath $PendingFile -Force -ErrorAction SilentlyContinue
+        return
+    }
+    # Proven already: a run that stamped last-ok and died before clearing this.
+    $ok = ""
+    try { if (Test-Path -LiteralPath $LastOkFile) { $ok = ([System.IO.File]::ReadAllText($LastOkFile)).Trim() } } catch {}
+    $okf = $ok.Split(' ')
+    if ($okf.Count -eq 2 -and $okf[0] -ceq $AGENT_VERSION -and $okf[1] -cmatch '^[0-9]{1,18}\z' -and [long]$okf[1] -ge [long]$p.since) {
+        Remove-Item -LiteralPath $PendingFile -Force -ErrorAction SilentlyContinue
+        return
+    }
+    $runs = 0; $refused = 0
+    try { $runs = [int]$p.runs + 1; $refused = [int]$p.refused } catch {}
+    if ($refused -lt $ROLLBACK_AFTER_REFUSED -and $runs -le $ROLLBACK_AFTER_RUNS) {
+        try {
+            $p.runs = $runs
+            Save-StateText -Path $PendingFile -Text ($p | ConvertTo-Json -Compress)
+        } catch {}
+        return
+    }
+    $badSha = [string]$p.sha256
+    if ($badSha -cnotmatch '^[0-9a-f]{64}\z') {
+        try { $badSha = (Get-FileHash -LiteralPath $SelfPath -Algorithm SHA256).Hash.ToLowerInvariant() } catch {}
+    }
+    try {
+        # [NullString]: a plain $null reaches .NET as "" and Replace throws.
+        [System.IO.File]::Replace($PrevFile, $SelfPath, [NullString]::Value)
+    } catch {
+        try {
+            Copy-Item -LiteralPath $PrevFile -Destination $SelfPath -Force -ErrorAction Stop
+        } catch {
+            Write-AgentLog "CHYBA UPDATE: Verze $AGENT_VERSION neprošla zkušební dobou, ale návrat na $($p.from) se nezdařil: $($_.Exception.Message)"
+            return
+        }
+    }
+    Remove-Item -LiteralPath $PendingFile -Force -ErrorAction SilentlyContinue
+    try { Save-StateText -Path $RejectedFile -Text "$badSha $AGENT_VERSION $(Get-UnixNow)`n" } catch {}
+    Write-AgentLog "CHYBA UPDATE: Verze $AGENT_VERSION nedoručila hlášení ($refused odmítnuto serverem, $($runs - 1) běhů bez přijetí). Vrácena předchozí verze $($p.from); tento soubor se $REJECTED_SHA_HOURS h znovu nestáhne."
+    exit 1
+}
+
+# The self-update (opt-in, AUTO_UPDATE=1). Called as a statement, so its log
+# lines reach the task's output. Everything is checked on a download next to
+# the script before the script itself is touched; any refusal leaves it
+# byte-identical.
+function Invoke-SelfUpdate {
+    param($Response)
+    $updateUrl = [string]$Response.update_url
+    $expectedSha = ([string]$Response.update_sha256).ToLowerInvariant()
+    $latestVersion = [string]$Response.latest_version
+    if (-not $updateUrl -or -not $expectedSha) { return }
+
+    # Forward only. A deploy of an older file (a reverted submodule, a second
+    # publisher) must not downgrade the fleet, and an unparsable version is not
+    # guessed at. Write-Verbose, not the log: the server repeats the offer on
+    # every run.
+    if ((Compare-AgentVersion $latestVersion $AGENT_VERSION) -ne 1) {
+        Write-Verbose "Nabídnutá verze '$latestVersion' není novější než $AGENT_VERSION, neaktualizuji."
+        return
+    }
+    # A file this agent rolled back, or refused for what its bytes are (no
+    # end line, no parse, a failed self-check), in the last day is not
+    # fetched again: a broken release would otherwise be downloaded and
+    # self-checked on every run.
+    $rej = ""
+    try { if (Test-Path -LiteralPath $RejectedFile) { $rej = ([System.IO.File]::ReadAllText($RejectedFile)).Trim() } } catch {}
+    $rf = $rej.Split(' ')
+    if ($rf.Count -eq 3 -and $rf[0] -ceq $expectedSha -and $rf[2] -cmatch '^[0-9]{1,18}\z' -and ((Get-UnixNow) - [long]$rf[2]) -lt ($REJECTED_SHA_HOURS * 3600)) {
+        Write-Verbose "Verze $latestVersion ($expectedSha) byla odmítnuta, do $REJECTED_SHA_HOURS h ji znovu nestahuji."
+        return
+    }
+    # The download sits next to the script until the rename: room for twice
+    # the current file, or a full disk would take the next state write and log
+    # line with it. A volume that reports nothing (a share) does not stop it.
+    $need = 2 * (Get-Item -LiteralPath $SelfPath).Length
+    $free = $null
+    try { $free = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($SelfPath)).AvailableFreeSpace } catch {}
+    if ($null -ne $free -and $free -lt $need) {
+        Write-AgentLog "CHYBA UPDATE: Vedle $SelfPath není místo na novou verzi (volno $free B, potřeba $need B). Aktualizace zrušena."
+        return
+    }
+
+    Write-AgentLog "K dispozici je nová verze agenta $latestVersion (aktuální $AGENT_VERSION), stahuji z $updateUrl..."
+    # One fixed name, removed first: a run killed in an earlier update leaves
+    # at most this one file. It ends in .ps1 because -File runs nothing else.
+    $newFile = Join-Path $ScriptPath "agent-update.ps1"
+    Remove-Item -LiteralPath $newFile -Force -ErrorAction SilentlyContinue
+    $refusal = ""
+    $badBytes = $false
+    try {
+        Invoke-WebRequest -Uri $updateUrl -OutFile $newFile -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        $actualSha = (Get-FileHash -LiteralPath $newFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        # A mismatch is the transport's fault, not the file's: tried again next run.
+        if ($actualSha -cne $expectedSha) { $refusal = "Checksum nesouhlasí (očekáván $expectedSha, stažen $actualSha)" }
+        # From here on a refusal is a property of these exact bytes.
+        if (-not $refusal) { $badBytes = $true; $refusal = Test-AgentSentinel -Path $newFile -Version $latestVersion }
+        if (-not $refusal) {
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($newFile, [ref]$null, [ref]$parseErrors)
+            if ($parseErrors -and $parseErrors.Count -gt 0) { $refusal = "Stažený soubor neprošel kontrolou syntaxe" }
+        }
+        if (-not $refusal) {
+            $refusal = Invoke-AgentSelfCheck -Path $newFile -Version $latestVersion
+            # An engine that cannot be started says nothing about the file.
+            if ($refusal -like "self-check nejde spustit*") { $badBytes = $false }
+        }
+        if (-not $refusal) {
+            $badBytes = $false
+            # On the disk before the name points at it: a power cut right
+            # after the rename must not leave the name on an empty file.
+            $fs = [System.IO.File]::Open($newFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+            try { $fs.Flush($true) } finally { $fs.Dispose() }
+            # Probation marker BEFORE the swap. If the swap then fails, the
+            # marker names a version this file is not, and the next run drops it.
+            $marker = [ordered]@{ version = $latestVersion; from = $AGENT_VERSION; sha256 = $expectedSha; since = (Get-UnixNow); runs = 0; refused = 0 }
+            Save-StateText -Path $PendingFile -Text ($marker | ConvertTo-Json -Compress)
+            $refusal = Invoke-AgentSwap -NewPath $newFile
+            if ($refusal) { Remove-Item -LiteralPath $PendingFile -Force -ErrorAction SilentlyContinue }
+        }
+    } catch {
+        $refusal = "Aktualizace se nezdařila: $($_.Exception.Message)"
+    }
+    Remove-Item -LiteralPath $newFile -Force -ErrorAction SilentlyContinue
+    if ($refusal -and $badBytes) {
+        try { Save-StateText -Path $RejectedFile -Text "$expectedSha $latestVersion $(Get-UnixNow)`n" } catch {}
+        Write-AgentLog "CHYBA UPDATE: $refusal. Aktualizace zrušena; tento soubor se $REJECTED_SHA_HOURS h znovu nestáhne."
+    } elseif ($refusal) {
+        Write-AgentLog "CHYBA UPDATE: $refusal. Aktualizace zrušena."
+    } else {
+        Write-AgentLog "OK: Agent aktualizován na verzi $latestVersion. Nová verze se použije při příštím spuštění, předchozí zůstává jako $PrevFile."
+    }
+}
+
+if ($AGENT_KEY -eq "ZDE_VLOZTE_UNIKATNI_KLIC_Z_ADMINISTRACE" -and -not $DryRun -and -not $SelfCheckMode) {
     Write-AgentLog "CHYBA: Nebyl nastaven AGENT_KEY. Upravte skript nebo 'agent.cfg'."
     exit 1
 }
+
+# A dry run or a self-check is not a run of the installed agent: it neither
+# counts toward a probation nor rolls anything back.
+if (-not $DryRun -and -not $SelfCheckMode) { Invoke-UpdateProbation }
 
 Write-AgentLog "Získávám systémové statistiky (PowerShell)..."
 
@@ -202,7 +597,10 @@ try {
         } catch {}
     }
 
-    "$($now.ToFileTimeUtc()),$totalBytes,$totalErrors" | Set-Content -Path $NetStateFile -Encoding ASCII -ErrorAction SilentlyContinue
+    # A self-check writes no state: it is not a run of the installed agent.
+    if (-not $SelfCheckMode) {
+        "$($now.ToFileTimeUtc()),$totalBytes,$totalErrors" | Set-Content -Path $NetStateFile -Encoding ASCII -ErrorAction SilentlyContinue
+    }
 
     if ($prev) {
         $elapsedSec = ($now.ToFileTimeUtc() - $prev.Ts) / 10000000.0
@@ -282,7 +680,9 @@ try {
             $saveList += @{ id = $p.Id; cpuMs = $p.TotalProcessorTime.TotalMilliseconds }
         }
     }
-    @{ ticks = $nowTicks; procs = $saveList } | ConvertTo-Json -Depth 3 | Set-Content $stateFile -ErrorAction SilentlyContinue
+    if (-not $SelfCheckMode) {
+        @{ ticks = $nowTicks; procs = $saveList } | ConvertTo-Json -Depth 3 | Set-Content $stateFile -ErrorAction SilentlyContinue
+    }
 
     if ($prevProcMap.Count -gt 0 -and $prevTicks -gt 0) {
         $elapsedSec = ($nowTicks - $prevTicks) / 10000000.0
@@ -364,7 +764,9 @@ try {
                 }
             } catch {}
         }
-        @{ ticks = $nowTicks; cpuMs = $cpuMsNow } | ConvertTo-Json | Set-Content $stateFileTs -ErrorAction SilentlyContinue
+        if (-not $SelfCheckMode) {
+            @{ ticks = $nowTicks; cpuMs = $cpuMsNow } | ConvertTo-Json | Set-Content $stateFileTs -ErrorAction SilentlyContinue
+        }
 
         $ts3Process = @{
             pid = $proc.Id
@@ -527,6 +929,21 @@ $payload = @{
     discovered_services = $discoveredServices
 } | ConvertTo-Json -Depth 4
 
+if ($SelfCheckMode) {
+    # The updater's behaviour gate (Invoke-AgentSelfCheck): the payload must
+    # survive a JSON round trip and carry this file's identity. Nothing was
+    # written and nothing is sent; the key is never printed.
+    $check = $null
+    try { $check = ConvertFrom-Json -InputObject $payload -ErrorAction Stop } catch {}
+    if (-not $check -or [string]$check.agent_type -cne "powershell" -or [string]$check.version -cne $AGENT_VERSION) {
+        [Console]::Error.WriteLine("self-check: the payload is not valid JSON or does not name this agent")
+        exit 3
+    }
+    $summary = [ordered]@{ agent_type = [string]$check.agent_type; agent_version = $AGENT_VERSION; payload_keys = @($check.PSObject.Properties).Count }
+    [Console]::Out.WriteLine(($summary | ConvertTo-Json -Compress))
+    exit 0
+}
+
 if ($DryRun) {
     Write-Output $payload
     Write-AgentLog "Rezim -DryRun: data se neodesilaji."
@@ -544,8 +961,14 @@ try {
     Write-AgentLog "OK: Statistiky úspěšně odeslány."
 } catch {
     Write-AgentLog "CHYBA: Nepodařilo se odeslat data na server. Detaily: $($_.Exception.Message)"
+    Register-UpdateRefusal $_
     exit 1
 }
+
+# The server took the report: the last-ok stamp, and an update on probation
+# is proven (its marker goes, .prev stays for the next update to replace).
+try { Save-StateText -Path $LastOkFile -Text "$AGENT_VERSION $(Get-UnixNow)`n" } catch {}
+if (Test-Path -LiteralPath $PendingFile) { Remove-Item -LiteralPath $PendingFile -Force -ErrorAction SilentlyContinue }
 
 # --- Vzdálené akce (opt-in přes REMOTE_ACTIONS_ENABLED=1) ---
 # Stejný kontrakt jako shell/Python agenti: server může v odpovědi poslat
@@ -554,7 +977,8 @@ try {
 # VŽDY potvrdí zpět (agent_api.php větev action_result) - jinak by akce
 # v administraci navždy visela ve stavu "odesláno".
 function Send-ActionResult {
-    param([int]$ActionId, [string]$Status, [string]$Message)
+    # [long]: the id passed the digits-only gate, which allows more than [int] holds.
+    param([long]$ActionId, [string]$Status, [string]$Message)
     $resultPayload = @{
         agent_key = $AGENT_KEY
         action_result = @{
@@ -574,55 +998,75 @@ function Send-ActionResult {
 $pendingAction = if ($response -and $response.pending_action) { $response.pending_action } else { $response }
 
 if ($REMOTE_ACTIONS_ENABLED -eq "1" -and $pendingAction -and $pendingAction.action_id -and $pendingAction.action -and $pendingAction.timestamp -and $pendingAction.signature) {
-    $actId = [int]$pendingAction.action_id
-    $actType = [string]$pendingAction.action
-    $actTs = [long]$pendingAction.timestamp
-    $actSig = [string]$pendingAction.signature
-    $actNonce = [string]$pendingAction.nonce
-
-    $nowTs = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if ([Math]::Abs($nowTs - $actTs) -gt 30) {
-        Write-AgentLog "VAROVÁNÍ: Odmítnuta vzdálená akce - vypršená platnost (časové okno > 30s)"
-        Send-ActionResult -ActionId $actId -Status "failed" -Message "Vypršela platnost podpisu (>30s)"
-    } elseif (($ALLOWED_ACTIONS -split ",").Trim() -notcontains $actType) {
-        Write-AgentLog "VAROVÁNÍ: Odmítnuta vzdálená akce '$actType' - není na seznamu ALLOWED_ACTIONS!"
-        Send-ActionResult -ActionId $actId -Status "failed" -Message "Akce '$actType' není v ALLOWED_ACTIONS"
+    $actIdRaw = [string]$pendingAction.action_id
+    $actTsRaw = [string]$pendingAction.timestamp
+    # Digits only, before either is used as a number: [int]/[long] casts take
+    # "0x1F", "1e3" and " 12 ", and in agent.sh the same field reached shell
+    # arithmetic, where it ran a command (SEC-01). Not a number = no action,
+    # and no result either - there is no id to report it under. The rest of
+    # the run (self-update) still happens.
+    if ($actIdRaw -cnotmatch '^[0-9]{1,18}\z' -or $actTsRaw -cnotmatch '^[0-9]{1,18}\z') {
+        Write-AgentLog "VAROVÁNÍ: Vzdálená akce má nečíselné action_id nebo timestamp, ignoruji ji."
     } else {
-        $hmacObj = New-Object System.Security.Cryptography.HMACSHA256
-        $hmacObj.Key = [Text.Encoding]::UTF8.GetBytes($AGENT_KEY)
-        $calcStr = "action=$actType|ts=$actTs|nonce=$actNonce"
-        $calcSig = ([BitConverter]::ToString($hmacObj.ComputeHash([Text.Encoding]::UTF8.GetBytes($calcStr)))).Replace("-", "").ToLower()
+        $actId = [long]$actIdRaw
+        $actTs = [long]$actTsRaw
+        $actType = [string]$pendingAction.action
+        $actSig = [string]$pendingAction.signature
+        $actNonce = [string]$pendingAction.nonce
+        $svcName = [string]$(if ($pendingAction.service_name) { $pendingAction.service_name } else { $response.service_name })
 
-        if ($calcSig -ne $actSig.ToLower()) {
-            Write-AgentLog "VAROVÁNÍ: Odmítnuta vzdálená akce - neplatný HMAC podpis!"
-            Send-ActionResult -ActionId $actId -Status "failed" -Message "Neplatný HMAC podpis"
+        $nowTs = Get-UnixNow
+        if ([Math]::Abs($nowTs - $actTs) -gt 30) {
+            Write-AgentLog "VAROVÁNÍ: Odmítnuta vzdálená akce - vypršená platnost (časové okno > 30s)"
+            Send-ActionResult -ActionId $actId -Status "failed" -Message "Vypršela platnost podpisu (>30s)"
         } else {
-            Write-AgentLog "Aktivována bezpečná vzdálená akce: $actType (ID: $actId)"
-            switch ($actType) {
-                "restart_service" {
-                    $svcName = [string]$(if ($pendingAction.service_name) { $pendingAction.service_name } else { $response.service_name })
-                    if (-not $svcName -or $svcName -notmatch '^[A-Za-z0-9_. @-]+$') {
-                        Send-ActionResult -ActionId $actId -Status "failed" -Message "Chybí nebo je neplatné service_name v payloadu akce"
-                    } elseif (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
-                        try {
-                            Restart-Service -Name $svcName -Force -ErrorAction Stop
-                            Write-AgentLog "Restartována služba: $svcName"
-                            Send-ActionResult -ActionId $actId -Status "executed" -Message "Služba '$svcName' restartována"
-                        } catch {
-                            Write-AgentLog "VAROVÁNÍ: Restart služby '$svcName' selhal: $($_.Exception.Message)"
-                            Send-ActionResult -ActionId $actId -Status "failed" -Message "Restart služby '$svcName' selhal: $($_.Exception.Message)"
+            $hmacObj = New-Object System.Security.Cryptography.HMACSHA256
+            $hmacObj.Key = [Text.Encoding]::UTF8.GetBytes($AGENT_KEY)
+            $calcStr = "action=$actType|ts=$actTs|nonce=$actNonce"
+            $calcSig = ([BitConverter]::ToString($hmacObj.ComputeHash([Text.Encoding]::UTF8.GetBytes($calcStr)))).Replace("-", "").ToLowerInvariant()
+
+            if ($calcSig -cne $actSig.ToLowerInvariant()) {
+                # Before the allow-list: an unsigned answer used to learn
+                # from the reply which actions this agent allows.
+                Write-AgentLog "VAROVÁNÍ: Odmítnuta vzdálená akce - neplatný HMAC podpis!"
+                Send-ActionResult -ActionId $actId -Status "failed" -Message "Neplatný HMAC podpis"
+            } else {
+                $actRefused = Get-ActionRefusal -Type $actType -Nonce $actNonce -NowTs $nowTs -ServiceName $svcName
+                if ($actRefused) {
+                    Write-AgentLog "VAROVÁNÍ: Odmítnuta vzdálená akce $actType (ID: $actId): $actRefused"
+                    Send-ActionResult -ActionId $actId -Status "failed" -Message "Odmítnuto: $actRefused"
+                } else {
+                    Write-AgentLog "Aktivována bezpečná vzdálená akce: $actType (ID: $actId)"
+                    switch ($actType) {
+                        "restart_service" {
+                            # $svcName passed Test-ServiceName in the gate.
+                            if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
+                                try {
+                                    Restart-Service -Name $svcName -Force -ErrorAction Stop
+                                    Write-AgentLog "Restartována služba: $svcName"
+                                    Send-ActionResult -ActionId $actId -Status "executed" -Message "Služba '$svcName' restartována"
+                                } catch {
+                                    Write-AgentLog "VAROVÁNÍ: Restart služby '$svcName' selhal: $($_.Exception.Message)"
+                                    Send-ActionResult -ActionId $actId -Status "failed" -Message "Restart služby '$svcName' selhal: $($_.Exception.Message)"
+                                }
+                            } else {
+                                Write-AgentLog "VAROVÁNÍ: Služba '$svcName' nenalezena."
+                                Send-ActionResult -ActionId $actId -Status "failed" -Message "Služba '$svcName' nenalezena"
+                            }
                         }
-                    } else {
-                        Write-AgentLog "VAROVÁNÍ: Služba '$svcName' nenalezena."
-                        Send-ActionResult -ActionId $actId -Status "failed" -Message "Služba '$svcName' nenalezena"
+                        "reboot_server" {
+                            Write-AgentLog "PROVÁDÍM REBOOT SERVERU DLE PODEPSANÉHO POKYNU..."
+                            # Potvrzení musí odejít PŘED rebootem - po Restart-Computer
+                            # se už nic dalšího neprovede.
+                            Send-ActionResult -ActionId $actId -Status "executed" -Message "Server se restartuje"
+                            Restart-Computer -Force
+                        }
+                        default {
+                            # On the list but unknown to this version: say so,
+                            # or the action stays "sent" for ever.
+                            Send-ActionResult -ActionId $actId -Status "failed" -Message "Tato verze agenta akci '$actType' nezná"
+                        }
                     }
-                }
-                "reboot_server" {
-                    Write-AgentLog "PROVÁDÍM REBOOT SERVERU DLE PODEPSANÉHO POKYNU..."
-                    # Potvrzení musí odejít PŘED rebootem - po Restart-Computer
-                    # se už nic dalšího neprovede.
-                    Send-ActionResult -ActionId $actId -Status "executed" -Message "Server se restartuje"
-                    Restart-Computer -Force
                 }
             }
         }
@@ -630,44 +1074,14 @@ if ($REMOTE_ACTIONS_ENABLED -eq "1" -and $pendingAction -and $pendingAction.acti
 }
 
 # --- Automatická aktualizace agenta (opt-in přes AUTO_UPDATE=1) ---
-# Nová verze se stáhne do dočasného souboru, ověří se SHA-256 checksum z API
-# odpovědi a teprve poté se atomicky nahradí tento skript. Nová verze se
-# použije při příštím spuštění naplánované úlohy.
+# Invoke-SelfUpdate: forward only, sha256, the end line, a parse, the new
+# file's own -SelfCheck, free space, then ReplaceFile in this directory with
+# the old file kept as .prev and a probation that brings it back.
 if ($AUTO_UPDATE -eq "1" -and $response -and $response.update_available -eq $true) {
-    $updateUrl = $response.update_url
-    $expectedSha = $response.update_sha256
-    $latestVersion = $response.latest_version
-
-    if ($updateUrl -and $expectedSha) {
-        $selfPath = $MyInvocation.MyCommand.Path
-        $tmpFile = Join-Path $ScriptPath ("agent-update-" + [guid]::NewGuid().ToString("N") + ".ps1")
-        Write-AgentLog "K dispozici je nová verze agenta $latestVersion (aktuální $AGENT_VERSION), stahuji z $updateUrl..."
-
-        try {
-            Invoke-WebRequest -Uri $updateUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 30
-
-            $actualSha = (Get-FileHash -Path $tmpFile -Algorithm SHA256).Hash.ToLower()
-            if ($actualSha -ne $expectedSha.ToLower()) {
-                Write-AgentLog "CHYBA UPDATE: Checksum nesouhlasí (očekáván $expectedSha, stažen $actualSha). Aktualizace zrušena."
-                Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-            } else {
-                # Kontrola syntaxe staženého skriptu
-                $parseErrors = $null
-                [void][System.Management.Automation.Language.Parser]::ParseFile($tmpFile, [ref]$null, [ref]$parseErrors)
-                if ($parseErrors -and $parseErrors.Count -gt 0) {
-                    Write-AgentLog "CHYBA UPDATE: Stažený soubor neprošel kontrolou syntaxe. Aktualizace zrušena."
-                    Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-                } else {
-                    Copy-Item $selfPath "$selfPath.bak" -Force -ErrorAction SilentlyContinue
-                    Move-Item $tmpFile $selfPath -Force
-                    Write-AgentLog "OK: Agent aktualizován na verzi $latestVersion. Nová verze se použije při příštím spuštění."
-                }
-            }
-        } catch {
-            Write-AgentLog "CHYBA UPDATE: Aktualizace se nezdařila: $($_.Exception.Message)"
-            Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
-        }
-    }
+    Invoke-SelfUpdate -Response $response
 }
 
 Write-AgentLog "Hotovo."
+# The updater requires this to be the file's last line (Test-AgentSentinel).
+# It carries the same version as $AGENT_VERSION; bump both together.
+# bk-agent-end 0.1.0
