@@ -139,8 +139,10 @@ jobs:
       # hw_smoke.sh is for the owner's routers; here it meets a container
       # standing in for one, ssh on 127.0.0.1 only.
       - name: hw_smoke.sh against a router container
+        if: ${{ !cancelled() }}
         run: bash tests/hw_smoke_selftest.sh
       - name: agent.sh + agent.py on Ubuntu, Alpine and Rocky
+        if: ${{ !cancelled() }}
         run: bash tests/run_linux_distros.sh all
 
   # The engine the scheduled task actually runs. The container job above is
