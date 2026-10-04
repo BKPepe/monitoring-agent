@@ -541,6 +541,79 @@ log_debug() {
     return 0
 }
 
+# The few events worth a line in the router's syslog as well (0.1.12.1): a
+# run lock taken over, a holder that survives SIGKILL, the SMART watchdog,
+# the LTE modem's web API changing its answer. The agent's own log is a file
+# in /tmp that nobody reads from outside; syslog is what `logread -f`, a
+# remote syslog or `tail -F /var/log/messages` over ssh keep up to the moment
+# a router dies. Events only, never a line per run. `logger` is a busybox
+# applet on OpenWrt and Turris OS; without it the agent log still has it.
+bk_syslog() {
+    log_message "$1"
+    bk_logger "$1"
+}
+# The syslog half alone, and it never holds the run up. logger's send() to
+# /dev/log blocks for as long as the reader (logd, or syslog-ng writing to a
+# disk that hangs) does not drain the socket. In the foreground, a stalled
+# reader would stop the run at its first event - a lock takeover too, and
+# cron would pile up one blocked run a minute, which is what the lock is
+# there to prevent. So logger runs in the background, detached from the
+# run's stdin, stdout and stderr, and gets one second (OpenWrt's sleep takes
+# no fractions, and its busybox has no `timeout`). One still running then is
+# killed - a send() asleep on a full socket dies by SIGKILL - and never
+# waited for, so not even a logger the kernel holds can hold the run; the
+# agent log says that the line did not reach syslog. One that is done is
+# reaped.
+bk_logger() {
+    command -v logger >/dev/null 2>&1 || return 0
+    logger -t bk-agent "$1" </dev/null >/dev/null 2>&1 &
+    _sy_pid=$!
+    bk_logger_busy && sleep 1
+    if bk_logger_busy; then
+        # Nothing forks between the check and the kill, so nothing reaps
+        # the PID meanwhile: it is still this run's own child.
+        kill -9 "$_sy_pid" 2>/dev/null
+        log_message "Syslog radek do 1 s neprevzal (logger PID $_sy_pid ukoncen), je jen v tomto logu."
+    else
+        wait "$_sy_pid" 2>/dev/null
+    fi
+    return 0
+}
+# 0 while logger $_sy_pid has not exited: /proc/PID/stat is there and not a
+# zombie's (a busybox whose sleep is an ash builtin need not reap it in the
+# meantime). Builtins only, and not bk_proc_start: the --smart-refresh child
+# gets here before that function is defined.
+bk_logger_busy() {
+    _sy_st=""
+    read -r _sy_st 2>/dev/null < "/proc/$_sy_pid/stat" || return 1
+    _sy_st=${_sy_st##*") "}
+    case "$_sy_st" in ''|Z*) return 1 ;; esac
+    return 0
+}
+# At most 32 characters of $1 in _sw, every one outside [A-Za-z0-9_.+:-] as
+# "_": a process names itself, and that name goes into syslog.
+bk_safe_word() {
+    _sw=""; _swi=$1; _swn=0
+    while [ -n "$_swi" ] && [ "$_swn" -lt 32 ]; do
+        _swc=${_swi%"${_swi#?}"}; _swi=${_swi#?}
+        case "$_swc" in [A-Za-z0-9_.+:-]) _sw="$_sw$_swc" ;; *) _sw="${_sw}_" ;; esac
+        _swn=$((_swn + 1))
+    done
+}
+# What a process that ignores SIGKILL is stuck in, as "comm iw, wchan
+# rtnl_lock" in _pw: its name and the kernel function it sleeps in. Builtin
+# reads of the real /proc, and never its cmdline, whose read can block on the
+# very lock the process waits for. wchan ends without a newline (`read`
+# returns 1 but fills the variable).
+bk_proc_where() {
+    _pwc=""; _pww=""
+    read -r _pwc 2>/dev/null < "/proc/$1/comm"
+    read -r _pww 2>/dev/null < "/proc/$1/wchan"
+    bk_safe_word "$_pwc"; _pwc=$_sw
+    bk_safe_word "$_pww"
+    _pw="comm ${_pwc:-?}, wchan ${_sw:-?}"
+}
+
 # One run at a time. A report stalled on a dead server or a stuck modem must
 # not let cron pile a fresh agent on top of it every minute until the RAM is
 # gone. mkdir is atomic; flock is not part of stock OpenWrt. A lock whose
@@ -738,9 +811,15 @@ bk_smart_refresh() {
         while [ -d "/proc/$_pid" ] && [ "$_w" -lt "$SMART_TIMEOUT_SEC" ]; do sleep 1; _w=$((_w + 1)); done
         if [ -d "/proc/$_pid" ]; then
             # Watchdog: TERM, then KILL, and CHECK that it died. A smartctl in
-            # D state (a hung USB bridge) survives both signals.
+            # D state (a hung USB bridge) survives both signals. Each step is
+            # a syslog line: a USB bridge that hangs is worth knowing about
+            # even when the router dies before the next report.
+            bk_syslog "SMART: smartctl /dev/$_d (PID $_pid) neskoncil za $_w s, posilam TERM."
             kill "$_pid" 2>/dev/null; sleep 1
-            if [ -d "/proc/$_pid" ]; then kill -9 "$_pid" 2>/dev/null; sleep 1; fi
+            if [ -d "/proc/$_pid" ]; then
+                bk_syslog "SMART: smartctl /dev/$_d (PID $_pid) ignoruje TERM, posilam KILL."
+                kill -9 "$_pid" 2>/dev/null; sleep 1
+            fi
             _rc=124
             [ -d "/proc/$_pid" ] && _hung=$_pid
         else wait "$_pid"; _rc=$?; fi
@@ -757,6 +836,8 @@ bk_smart_refresh() {
         # shows up on the server - and the lock frees itself when the kernel
         # finally lets the process go. Removing it here would hide the hang
         # and start a fresh smartctl against the same dead bridge every hour.
+        bk_proc_where "$_hung"
+        bk_syslog "SMART: smartctl /dev/$_d (PID $_hung, $_pw) prezil i KILL - zamek SMART zustava jemu a dalsi cteni nezacne, dokud neskonci."
         echo "$_hung" > "$_lock/pid"; return 0
     fi
     rm -rf "$_lock"
@@ -855,7 +936,11 @@ if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
                 case "$_kt_a" in ''|*[!0-9]*) break ;; esac
                 _kt_anc="$_kt_anc$_kt_a "
             done
-            log_message "Predchozi beh (PID $_lock_pid) drzi zamek $(( (BK_RUN_START_CS - _lock_since) / 100 )) s, ukoncuji ho."
+            # The agent log has the line before the kills, syslog after them:
+            # logger is a process of its own, and a stalled syslog must not
+            # stand between a wedged run and its end (bk_logger).
+            _kt_msg="Predchozi beh (PID $_lock_pid) drzi zamek $(( (BK_RUN_START_CS - _lock_since) / 100 )) s, ukoncuji ho."
+            log_message "$_kt_msg"
             for _kt_p in $_kt_list; do
                 case "$_kt_anc" in *" $_kt_p "*) continue ;; esac
                 kill -TERM "$_kt_p" 2>/dev/null
@@ -869,6 +954,7 @@ if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
                 [ -n "$_ps_state" ] && [ "$_ps_state" != Z ] && kill -KILL "$_kt_p" 2>/dev/null && _kt_left=1
             done
             [ -n "$_kt_left" ] && sleep 1
+            bk_logger "$_kt_msg"
             # Gone, or a zombie: busybox crond reaps its children only every
             # 10 s, so a holder killed a moment ago is usually still listed -
             # and a zombie holds nothing any more. Anything else survived
@@ -902,7 +988,8 @@ if ! mkdir "$BK_LOCK_DIR" 2>/dev/null; then
                 case "$_kt_anc" in *" $_lock_pid "*) ;; *) : > "$BK_LOCK_DIR/killed" 2>/dev/null ;; esac
                 [ "$_kt_keep" = "$_lock_pid" ] || echo "$_kt_keep" > "$BK_LOCK_DIR/pid" 2>/dev/null
                 [ -n "$_ps_start" ] && printf '%s %s\n' "$BK_RUN_START_CS" "$_ps_start" > "$BK_LOCK_DIR/info" 2>/dev/null
-                log_message "Predchozi beh (PID $_lock_pid) nejde ukoncit ani SIGKILL (zustava PID $_kt_keep), tento koncim."
+                bk_proc_where "$_kt_keep"
+                bk_syslog "Predchozi beh (PID $_lock_pid) nejde ukoncit ani SIGKILL (zustava PID $_kt_keep, $_pw), tento koncim."
                 _lock_pid=$_kt_keep
             else
                 # Written NOW, not held until the fold at the end of the run:
@@ -3993,6 +4080,28 @@ bk_hilink_cached() {
     fi
 }
 
+# What the modem's web API answered last, in hilink.state: ok, silent (no
+# answer at all), other (something answers at that address, not as HiLink)
+# or the code of its error (100003 = login required). A change is one line
+# in the agent log and in syslog; the same answer again is none. No file is
+# ok - a fresh boot, or a modem that has always answered: then nothing is
+# written at all. The line carries the LTE device, never an address or the
+# session.
+BK_HL_STATE="$BK_PRIVATE_DIR/hilink.state"
+bk_hilink_state() {
+    _hst_prev=ok
+    [ -f "$BK_HL_STATE" ] && read -r _hst_prev 2>/dev/null < "$BK_HL_STATE"
+    case "$_hst_prev" in ok|silent|other) ;; ''|*[!0-9]*) _hst_prev=ok ;; esac
+    [ "$1" = "$_hst_prev" ] && return 0
+    printf '%s\n' "$1" > "$BK_HL_STATE" 2>/dev/null
+    case "$1" in
+        ok) bk_syslog "HiLink modem ($lte_device) zase odpovida." ;;
+        silent) bk_syslog "HiLink modem ($lte_device) neodpovida: signal, SIM a operator zustanou prazdne." ;;
+        other) bk_syslog "HiLink modem ($lte_device): na jeho adrese odpovida neco, co neni HiLink API." ;;
+        *) bk_syslog "HiLink modem ($lte_device) odpovida chybou $1: signal, SIM a operator zustanou prazdne." ;;
+    esac
+}
+
 # LTE_API=off (agent_openwrt.cfg) skips this block and nothing else: lte_up,
 # lte_uptime and lte_ipv4 come from netifd, net_lte from /proc/net/dev above,
 # and the uqmi/mmcli block below does not talk to the web API. What only the
@@ -4096,6 +4205,26 @@ elif [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; 
         [ -z "$_carrier" ] && { bk_xml_tag "$lte_plmn_xml" ShortName; _carrier=$_xr; }
         [ -n "$_carrier" ] && lte_carrier="$_carrier"
     fi
+
+    # The verdict of this run is what monitoring/status answered, or silent
+    # when any request got no answer at all. An endpoint of its own refusing
+    # (current-plmn on some firmware) is no change of the modem's state: it
+    # would flip twice a day, at every refresh of the operator. A body cut
+    # short before </response> is still the API answering: ok, though no
+    # cache takes it (bk_hilink_ok).
+    if [ "$_hl_dead" = 1 ]; then
+        _hl_state=silent
+    else
+        case "$lte_mon_xml" in
+            *"<error>"*)
+                _hl_state=other
+                bk_xml_tag "$lte_mon_xml" code; bk_xml_keep 0-9
+                case "$_xr" in ''|??????????*) ;; *) _hl_state=$_xr ;; esac ;;
+            *"<response>"*) _hl_state=ok ;;
+            *) _hl_state=other ;;
+        esac
+    fi
+    bk_hilink_state "$_hl_state"
 fi
 
 # --- LTE/WWAN modem pres uqmi / mmcli ---

@@ -186,5 +186,19 @@ BK_STUB_HILINK_MODE=dead wget -q -O - $H/monitoring/status > $T/o 2>&1; _rc=$?
 t "wget: dead prints nothing and exits 1" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9)" "1,0"
 t "wget: a call with the session is logged with tok in front, the URL last" eq "$(grep -c "^tok $H/device/signal\$" $OUT/hilink_calls.log)" 3
 
+# logger: one line per call, "TAG: MESSAGE", in the order of the calls.
+logger -t bk-agent "one two"; logger -t bk-agent three
+t "logger: -t TAG MESSAGE lands as 'TAG: MESSAGE', one line per call" eq "$(tr '\n' '|' < $OUT/logger.log)" "bk-agent: one two|bk-agent: three|"
+# BK_STUB_LOGGER=hang: filed with its PID, nothing in logger.log, and still
+# running a second later, until a signal ends it.
+BK_STUB_LOGGER=hang logger -t bk-agent stuck &
+_lp=$!
+_n=0; while [ ! -s $OUT/logger_hung.log ] && [ $_n -lt 50 ]; do sleep 0.1; _n=$((_n + 1)); done
+sleep 1
+read -r _ls 2>/dev/null < /proc/$_lp/stat || _ls=""
+_ls=${_ls##*") "}
+t "logger: hang files 'PID TAG: MESSAGE', writes no logger.log line and has not returned after 1 s" eq "$(cat $OUT/logger_hung.log),$(wc -l < $OUT/logger.log | tr -cd 0-9),${_ls%% *}" "$_lp bk-agent: stuck,2,S"
+kill -9 $_lp 2>/dev/null; wait $_lp 2>/dev/null
+
 rm -rf $T
-rm -f $OUT/*_calls.log $OUT/iwinfo_scan.log /tmp/bk-stub-iw.*.count
+rm -f $OUT/*_calls.log $OUT/iwinfo_scan.log /tmp/bk-stub-iw.*.count $OUT/logger.log $OUT/logger_hung.log

@@ -28,8 +28,8 @@
 # mark, self-check, direction, probation, rollback, a reboot in the
 # probation), wcron0/wcron (a cron PATH without sbin), wlte1..2 (LTE_API),
 # whl1..5, wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session,
-# what is cached of its answers) - and the hardening runs (runs-g28.sh,
-# remote actions w19_1..18).
+# what is cached of its answers), wst1..3 (the modem's answer changing, in
+# syslog) - and the hardening runs (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -170,7 +170,10 @@ stub_on hostapd_cli smartctl iw
 if [ -d /tmp/status-agent-openwrt.lock ]; then echo "lock directory left behind" >&2; exit 1; fi
 # 10 s is the floor of the timeout's clamp: sde's smartctl sleeps through it.
 echo "SMART_TIMEOUT_SEC=10" > /root/agent/agent_openwrt.cfg
+# Its syslog lines (bin/logger) are filed between "# r4" and "# end".
+echo "# r4" >> $OUT/logger.log
 ( export STATUS_TEST_ROOT=/tmp/fakeroot-emmc; run r4 )
+echo "# end" >> $OUT/logger.log
 # sde's smartctl ignores TERM (the ignore survives its `exec`), so the watchdog
 # has to reach for KILL. Both are recorded right here: after the KILL nothing
 # of that probe may be left running, and the lock must be free again. The
@@ -582,8 +585,10 @@ mkholder() { # -> H (a shell that execs sleep) and C, its child
 fresh
 mkholder
 set -- $(pstat "$H"); plant "$H" "$2" 400
+echo "# wtake1" >> $OUT/logger.log
 pl wtake1
 sh agent_openwrt.sh --dry-run > $OUT/wtake1.json 2> $OUT/wtake1.err
+echo "# end" >> $OUT/logger.log
 echo "holder=$(pstat "$H") child=$(pstat "$C")" > $OUT/wtake1_procs.txt
 if [ -d "$PRIV/run.lock" ]; then echo yes; else echo no; fi > $OUT/wtake1_lock.txt
 kill -9 "$H" "$C" 2>/dev/null || true
@@ -622,8 +627,10 @@ echo "zombie=$(pstat "$Z" | cut -c1)" > $OUT/wtake4_procs.txt
 kill -9 "$ZP" 2>/dev/null || true
 fresh
 set -- $(pstat 1); plant 1 "$2" 400
+echo "# wtake5" >> $OUT/logger.log
 pl -wtake5
 sh agent_openwrt.sh --dry-run > $OUT/wtake5.json 2> $OUT/wtake5.err
+echo "# end" >> $OUT/logger.log
 { cat "$PRIV/run.lock/pid"; cat "$PRIV/skipped"; } > $OUT/wtake5_lock.txt 2>/dev/null || true
 if [ -e "$PRIV/run.lock/killed" ]; then echo yes; else echo no; fi > $OUT/wtake5_killed.txt
 rm -rf "$PRIV/run.lock"
@@ -683,6 +690,51 @@ plant "$D8" 1 400
 pl wtake8
 sh agent_openwrt.sh --dry-run > $OUT/wtake8.json 2> $OUT/wtake8.err
 if [ -d "$PRIV/run.lock" ]; then echo yes; else echo no; fi > $OUT/wtake8_lock.txt
+fresh
+
+# --- wtake9: a syslog that takes nothing (0.1.12.1) --------------------------
+# wtake1 once more, with a logger that never returns (BK_STUB_LOGGER=hang:
+# logd stopped, syslog-ng on a disk that hangs). Its line may cost the
+# takeover a second, never the takeover itself: the holder and its child are
+# killed and the run takes the lock - its first df (BK_STUB_DF_HOLD) marks the
+# moment it got past the lock, timed on the container's own clock - and the
+# logger it started is not left behind. A run that waited for its logger
+# would never get that far, so both waits below have a deadline, and a run
+# still there at the second one is killed.
+realcs() { read -r _u _ < /proc/uptime; echo "${_u%.*}${_u#*.}"; }
+fresh
+mkholder
+set -- $(pstat "$H"); plant "$H" "$2" 400
+touch /tmp/df.hold
+echo "# wtake9" >> $OUT/logger.log
+_t0=$(realcs)
+pl wtake9
+BK_STUB_LOGGER=hang BK_STUB_DF_HOLD=/tmp/df.hold BK_STUB_DF_HOLD_S=1 sh agent_openwrt.sh --dry-run > $OUT/wtake9.json 2> $OUT/wtake9.err &
+W=$!
+held
+_t1=$(realcs)
+_wl=none; read -r _wl 2>/dev/null < "$PRIV/run.lock/pid" || true
+_n=0
+while [ $_n -lt 1200 ]; do
+    case "$(pstat "$W")" in gone|Z*) break ;; esac
+    sleep 0.1; _n=$((_n + 1))
+done
+case "$(pstat "$W")" in gone|Z*) _wend=done ;; *) _wend=hung; kill -9 "$W" 2>/dev/null || true ;; esac
+wait "$W" 2>/dev/null || true
+echo "# end" >> $OUT/logger.log
+rm -f /tmp/df.hold
+if [ "$_wl" = "$W" ]; then _wl=run; else _wl="pid$_wl"; fi
+echo "holder=$(pstat "$H") child=$(pstat "$C") lock=$_wl claim_cs=$((_t1 - _t0)) end=$_wend" > $OUT/wtake9_procs.txt
+# What became of each logger the run started: gone, or a zombie nobody has
+# reaped yet - never still running. One that is gets killed here.
+: > $OUT/wtake9_loggers.txt
+if [ -f $OUT/logger_hung.log ]; then
+    while read -r _lp _; do
+        pstat "$_lp" >> $OUT/wtake9_loggers.txt
+        kill -9 "$_lp" 2>/dev/null || true
+    done < $OUT/logger_hung.log
+fi
+kill -9 "$H" "$C" 2>/dev/null || true
 fresh
 
 # --- wskip1..wskip2c: the skip counters are folded (IO-03) -------------------
@@ -1221,13 +1273,13 @@ sh /tmp/wjs.sh > $OUT/wjs.txt 2> $OUT/wjs.err
 # netifd says about the link (up, uptime, address) is still reported. Any
 # other value is the default, auto: a collector must not go off by a typo.
 # Every run here files its modem calls between "# TAG" and "# end" in
-# hilink_calls.log (by_run reads them), because the runs around it call the
-# stub modem too.
+# hilink_calls.log, and its syslog lines in logger.log (by_run reads them),
+# because the runs around it call the stub modem and logger too.
 hl() { # TAG [MODE]: one dry run against the stub modem in MODE (bin/wget)
-    echo "# $1" >> $OUT/hilink_calls.log
+    echo "# $1" >> $OUT/hilink_calls.log; echo "# $1" >> $OUT/logger.log
     pl "$1"
     BK_STUB_HILINK_MODE="${2:-canonical}" sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err"
-    echo "# end" >> $OUT/hilink_calls.log
+    echo "# end" >> $OUT/hilink_calls.log; echo "# end" >> $OUT/logger.log
 }
 fresh
 echo "LTE_API=off" > /root/agent/agent_openwrt.cfg
@@ -1291,6 +1343,14 @@ hl wcut1 cut; hlfiles wcut1
 hl wcut2 cut; hlfiles wcut2
 fresh
 hl wdead dead; hlfiles wdead
+fresh
+# --- wst1..3: the modem stops answering and answers again (0.1.12.1) --------
+# A modem that answers writes nothing (no hilink.state, no line); one that
+# goes silent and comes back is one line each way in syslog, and the state
+# file says where it is now.
+hl wst1; cat "$PRIV/hilink.state" > $OUT/wst1_state.txt 2>/dev/null || echo none > $OUT/wst1_state.txt
+hl wst2 dead; cat "$PRIV/hilink.state" > $OUT/wst2_state.txt 2>/dev/null || echo none > $OUT/wst2_state.txt
+hl wst3; cat "$PRIV/hilink.state" > $OUT/wst3_state.txt 2>/dev/null || echo none > $OUT/wst3_state.txt
 fresh
 # What the agent logged in these runs, for the check that no session or token
 # is in any file of out/ (their stderr is there already).

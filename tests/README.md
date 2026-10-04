@@ -250,6 +250,20 @@ with nobody on it.
   one session a run and cache nothing; `wnoplmn1..2` do not cache an error
   as the operator, `wcut1..2` no answer cut short. No file the runs leave
   may hold the stub's session or token.
+- **Syslog (`bin/logger`).** Every call lands in `logger.log` as
+  `TAG: MESSAGE`, filed by `# TAG` lines like the modem calls. `wst1..3`
+  (the modem answers, goes silent, answers again) are exactly two lines and
+  leave `hilink.state` at none, `silent`, `ok`; `wlogin1` names the error
+  code once and `wlogin2` repeats nothing; `r4` holds the SMART watchdog's
+  TERM and KILL lines for `sde`, `wtake1` the takeover and `wtake5` the
+  holder that survives SIGKILL (PID 1, `comm sh`). A `smartctl` that
+  survives KILL, and so the line that leaves it the SMART lock, cannot be
+  made in a container. `BK_STUB_LOGGER=hang` is a syslog that takes nothing:
+  the call files `PID TAG: MESSAGE` in `logger_hung.log` and never returns.
+  `wtake9` is `wtake1` with it: the holder and its child are killed, the run
+  has the lock within 15 s (timed by its first `df`) and reports, the agent
+  log says the line did not reach syslog, and the logger is not left
+  running.
 - **Pending checks.** `assert_openwrt_payload.py` may list checks in `PENDING`
   while the collector that satisfies them is not merged yet. A pending check
   that passes fails the run, and `BK_E2E_STRICT=1` fails every pending check;

@@ -473,7 +473,7 @@ checks = {
         '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_UPDATE" ] && BK_TEST_UPDATE="$STATUS_TEST_UPDATE"'],
     "wifi: every iwinfo call carries exactly one command": len(iwinfo_calls) > 0 and all(len(c.split()) <= 2 for c in iwinfo_calls),
     "wifi: iwinfo was never asked to scan": log_lines("iwinfo_scan.log") == [],
-    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 84 checks)": len(selftest) == 84 and all(l.startswith("ok ") for l in selftest),
+    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 86 checks)": len(selftest) == 86 and all(l.startswith("ok ") for l in selftest),
     "harness: all six payload runs produced a payload of this version": all(x.get("version") == d["version"] for x in (d1, d2b, d3, d4, d5)),
     "wan: PPPoE over a VLAN (the owner's line) - the l3 device is the ppp netdev": (wpppoe["wan_proto"], wpppoe["wan_l3_device"], wpppoe["wan_up"]) == ("pppoe", "pppoe-wan", True),
     # --- W-A2 the WAN device walk (WAN 3.1.1; WAN e2e #5) ---
@@ -1318,6 +1318,58 @@ checks.update({
         hl_calls.get("wdead") == hl_expect("monitoring/status")
         and lte(hlp["wdead"], "lte_connected", "lte_rsrp", "lte_up") == [None, None, True],
     "hilink: the session and the token are in no log, payload or other file the runs leave": hl_secret_files == [],
+})
+# What went to syslog: bin/logger writes "TAG: MESSAGE" per call to
+# logger.log, and the runs that are checked file theirs by "# TAG" lines.
+sys_lines = by_run("logger.log")
+wst_state = [text(f"wst{n}_state.txt") for n in (1, 2, 3)]
+SYS_QUIET = ("wlte1", "wlte2", "whl1", "whl2", "whl3", "whl4", "whl5", "wlogin2", "wnoplmn1", "wnoplmn2", "wcut1", "wcut2", "wst1")
+r4_sys = sys_lines.get("r4") or []
+r4_term = re.fullmatch(r"bk-agent: SMART: smartctl /dev/sde \(PID (\d+)\) neskoncil za 10 s, posilam TERM\.", r4_sys[0]) if r4_sys else None
+r4_kill = re.fullmatch(r"bk-agent: SMART: smartctl /dev/sde \(PID (\d+)\) ignoruje TERM, posilam KILL\.", r4_sys[1]) if len(r4_sys) > 1 else None
+wt5_sys = sys_lines.get("wtake5") or []
+# wtake9: logger never returns (BK_STUB_LOGGER=hang files "PID TAG: MESSAGE"
+# in logger_hung.log instead of logger.log).
+wt9 = maybe("wtake9")
+wt9_procs = procs("wtake9_procs.txt")
+wt9_claim = wt9_procs.get("claim_cs", "")
+wt9_hung = (text("logger_hung.log") or "").splitlines()
+wt9_left = (text("wtake9_loggers.txt") or "").splitlines()
+checks.update({
+    "syslog: a modem that goes silent and answers again is exactly 2 lines, under the tag bk-agent (wst1..3)":
+        [sys_lines.get(t) for t in ("wst1", "wst2", "wst3")] == [
+            [], ["bk-agent: HiLink modem (lo) neodpovida: signal, SIM a operator zustanou prazdne."],
+            ["bk-agent: HiLink modem (lo) zase odpovida."]],
+    "syslog: ... and hilink.state is written only by a change - none while the modem answers, silent, then ok (wst1..3)":
+        wst_state == ["none", "silent", "ok"],
+    "syslog: an error code is one line, the same error the next run none (wlogin1, wlogin2)":
+        sys_lines.get("wlogin1") == ["bk-agent: HiLink modem (lo) odpovida chybou 100003: signal, SIM a operator zustanou prazdne."]
+        and sys_lines.get("wlogin2") == [],
+    "syslog: a modem that answers - with a session, from the cache, cut short, or refusing only the operator - and one not asked (LTE_API=off) write nothing":
+        all(sys_lines.get(t) == [] for t in SYS_QUIET),
+    "syslog: a modem that answers nothing at all is one line (wdead)":
+        sys_lines.get("wdead") == ["bk-agent: HiLink modem (lo) neodpovida: signal, SIM a operator zustanou prazdne."],
+    "syslog: no line carries an address, a MAC, the session or the token":
+        not any(re.search(r"\d+\.\d+\.\d+\.\d+|([0-9a-fA-F]{2}:){5}|stub-ses|stub-tok|SessionID", line)
+                for lines in sys_lines.values() for line in lines),
+    "syslog: taking over a wedged run is one line, the agent log keeps its own (wtake1)":
+        len(sys_lines.get("wtake1") or []) == 1
+        and re.fullmatch(r"bk-agent: Predchozi beh \(PID \d+\) drzi zamek 400 s, ukoncuji ho\.", sys_lines["wtake1"][0]) is not None
+        and "ukoncuji ho" in err("wtake1"),
+    "syslog: a holder that survives SIGKILL is named by its comm and wchan, read without its cmdline (wtake5)":
+        len(wt5_sys) == 2 and "drzi zamek 400 s, ukoncuji ho" in wt5_sys[0]
+        and re.fullmatch(r"bk-agent: Predchozi beh \(PID 1\) nejde ukoncit ani SIGKILL \(zustava PID 1, comm sh, wchan [A-Za-z0-9_.+:?-]+\), tento koncim\.", wt5_sys[1]) is not None,
+    "syslog: the SMART watchdog writes TERM, then KILL, each with the disk, the seconds and the PID (r4)":
+        len(r4_sys) == 2 and r4_term is not None and r4_kill is not None and r4_term.group(1) == r4_kill.group(1),
+    "syslog: a syslog that takes nothing does not hold up a takeover - the holder and its child are killed, the run has the lock within 15 s and reports (wtake9)":
+        wt9_procs.get("holder") in ("gone", "Z") and wt9_procs.get("child") in ("gone", "Z")
+        and wt9_procs.get("lock") == "run" and wt9_claim.isdigit() and int(wt9_claim) <= 1500
+        and wt9_procs.get("end") == "done" and killed(wt9) == [0, 0, 1],
+    "syslog: ... its line went to a logger that never returned, which the run killed after a second and left nothing of, and the agent log says so (wtake9)":
+        len(wt9_hung) == 1
+        and re.fullmatch(r"\d+ bk-agent: Predchozi beh \(PID \d+\) drzi zamek 400 s, ukoncuji ho\.", wt9_hung[0]) is not None
+        and len(wt9_left) == 1 and wt9_left[0].split()[0] in ("gone", "Z") and sys_lines.get("wtake9") == []
+        and "ukoncuji ho" in err("wtake9") and "Syslog radek do 1 s neprevzal" in err("wtake9"),
 })
 
 # Checks written down before the collector that can pass them: the stubs

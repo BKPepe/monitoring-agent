@@ -563,6 +563,26 @@ silent or reboots.
   0.1.12 kept an error XML, or the 404 page of a router that is no modem, as
   the SIM state for ten minutes and as the operator for a day. A body that
   breaks off before `</response>` is not kept either.
+- **Syslog lines for the events that left no trace.** Besides the agent's
+  own log in `/tmp`, one line goes to syslog through `logger -t bk-agent`
+  (`logread | grep bk-agent`, or a remote syslog that outlives the router)
+  when:
+  - the modem's web API changes its answer: it stops answering, answers an
+    error code (100003: login required), something that is not the HiLink
+    API answers at its address, or it answers again - once per change,
+    never per run, with the LTE device and without an address or the
+    session (the last verdict is `hilink.state` in the private directory);
+  - a run wedged for 300 s is taken over, and when a process of it survives
+    SIGKILL: its `comm` and `wchan` (the kernel function it is stuck in),
+    read from `/proc` without touching its `cmdline`;
+  - the SMART watchdog sends TERM, then KILL, or leaves its lock to a
+    `smartctl` that survives both: disk, seconds and PID.
+- **A syslog that takes nothing does not stop the agent.** `logger` blocks
+  for as long as the syslog reader does not drain `/dev/log` (logd stopped,
+  syslog-ng writing to a disk that hangs). It runs in the background, gets
+  one second and is then killed, and the agent log says that the line did
+  not reach syslog. The lock takeover writes its line to syslog only after
+  its kills.
 
 ### What 0.1.11 adds (OpenWrt)
 
