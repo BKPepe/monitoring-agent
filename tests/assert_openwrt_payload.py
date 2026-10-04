@@ -1244,6 +1244,25 @@ checks.update({
         and wcron.get("lan_ports") == wcron0.get("lan_ports"),
 })
 
+# --- 0.1.12.1: the LTE modem's web API (run-in-container.sh: wlte*, help) ---
+# Each of these runs files its modem calls between "# TAG" and "# end".
+hl_calls = by_run("hilink_calls.log")
+def lte(p, *keys):
+    return None if p is None else [p.get(k, "MISSING") for k in keys]
+wlte1, wlte2 = maybe("wlte1"), maybe("wlte2")
+help_text = text("help.txt") or ""
+checks.update({
+    "lte_api: LTE_API=off asks the modem nothing at all, and netifd's view of the link is still reported (wlte1)":
+        hl_calls.get("wlte1") == [] and lte(wlte1, "lte_up", "lte_ipv4", "lte_uptime") == [True, "192.168.8.100", 700],
+    "lte_api: ... so what only the modem knows - signal, SIM, operator - is null, not a guess (wlte1)":
+        lte(wlte1, "lte_rsrp", "lte_connected", "lte_sim_state", "lte_conn_code", "lte_carrier") == [None] * 5,
+    "lte_api: any other value is auto - a typo does not switch the modem off (wlte2)":
+        len(hl_calls.get("wlte2") or []) == 4 and lte(wlte2, "lte_rsrp", "lte_connected") == [-85, True],
+    "help: --dry-run says it asks the modem and the radios like a cron run and skips only the POST, actions and update; LTE_API=off is named":
+        "pta se modemu i Wi-Fi radii" in help_text and "vynecha jen odeslani, vzdalene akce a aktualizaci" in help_text
+        and "LTE_API=off" in help_text,
+})
+
 # Checks written down before the collector that can pass them: the stubs
 # already serve the real router, the Wi-Fi block of the agent is still the
 # 0.1.6 one. A pending check does not fail the run, but one that PASSES does,

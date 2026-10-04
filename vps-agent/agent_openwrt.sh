@@ -104,6 +104,7 @@ if [ -f "$ScriptPath/agent_openwrt.cfg" ]; then
                     SMART_INTERVAL_MINUTES) SMART_INTERVAL_MINUTES="$val" ;;
                     SMART_TIMEOUT_SEC) SMART_TIMEOUT_SEC="$val" ;;
                     LOG_LINES_ENABLED) LOG_LINES_ENABLED="$val" ;;
+                    LTE_API) LTE_API="$val" ;;
                 esac
                 ;;
         esac
@@ -126,6 +127,13 @@ SMART_INTERVAL_SEC=$(( SMART_INTERVAL_MINUTES * 60 ))
 case "$SMART_TIMEOUT_SEC" in ''|*[!0-9]*) SMART_TIMEOUT_SEC=60 ;; esac
 [ "$SMART_TIMEOUT_SEC" -lt 10 ] && SMART_TIMEOUT_SEC=10
 [ "$SMART_TIMEOUT_SEC" -gt 180 ] && SMART_TIMEOUT_SEC=180
+
+# LTE_API=off: not one request to the LTE modem's web API (HiLink, below);
+# what netifd and /proc/net/dev say about the link is still reported. Only
+# the exact word switches it off: anything else, a typo included, is the
+# default auto, today's behaviour, because a collector must never go off by
+# accident.
+case "$LTE_API" in off) ;; *) LTE_API=auto ;; esac
 
 if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     # The token is best kept out of the command line: `ps` shows every
@@ -208,7 +216,9 @@ for arg in "$@"; do
             echo "  --register - [API_URL]       Zaregistruje router (token z BK_REG_TOKEN nebo stdin)"
             echo "  --update, --auto-update      Vynuti kontrolu a aktualizaci agenta ze serveru"
             echo "  --verbose, -v                Zobrazi podrobny prubeh sberu dat a odesilani"
-            echo "  --dry-run, --print           Sesbira data a vypise JSON, neodesila (i bez registrace)"
+            echo "  --dry-run, --print           Vypise JSON misto odeslani (i bez registrace). Jinak bezi jako z cronu:"
+            echo "                               pta se modemu i Wi-Fi radii, muze cist SMART a drzi zamek behu;"
+            echo "                               vynecha jen odeslani, vzdalene akce a aktualizaci"
             echo "  --version, -V                Zobrazi verzi agenta"
             echo "  --help, -h                   Zobrazi tuto napovedu"
             echo ""
@@ -216,6 +226,7 @@ for arg in "$@"; do
             echo "  Cte nastaveni ze souboru agent_openwrt.cfg nebo z promendych prostredi:"
             echo "  STATUS_API_URL, STATUS_AGENT_KEY, STATUS_AUTO_UPDATE, STATUS_HEAVY_OP_INTERVAL_HOURS"
             echo "  LOG_LINES_ENABLED=0 v agent_openwrt.cfg: radky chyb z logu neopusti router, posila se jen jejich pocet"
+            echo "  LTE_API=off v agent_openwrt.cfg: zadny dotaz na webove API LTE modemu (HiLink); stav linky hlasi dal netifd"
             echo ""
             echo "Volitelne balicky (bez nich zustanou jejich hodnoty prazdne, nikdy nulove):"
             echo "  smartmontools, smartmontools-drivedb   zdravi disku (SMART)"
@@ -3930,7 +3941,13 @@ bk_hilink_cached() {
     fi
 }
 
-if [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; then
+# LTE_API=off (agent_openwrt.cfg) skips this block and nothing else: lte_up,
+# lte_uptime and lte_ipv4 come from netifd, net_lte from /proc/net/dev above,
+# and the uqmi/mmcli block below does not talk to the web API. What only the
+# modem knows - signal, SIM, operator - is then null.
+if [ "$LTE_API" = off ]; then
+    log_debug "LTE: webove API modemu je vypnute (LTE_API=off), modem se na nic nepta."
+elif [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; then
     # The last octet becomes .1 (`sed 's/\.[0-9]*$/.1/'`) without the two
     # forks; an address that is not plain digits and dots still goes to sed.
     case "$lte_ipv4" in

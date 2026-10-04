@@ -26,8 +26,8 @@
 # lines behind the log count, and who may switch them off), wupd1..11 with
 # wprob1..7, wconf0..2, wlim0..1 and wreb0..5 (the self-update: swap, end
 # mark, self-check, direction, probation, rollback, a reboot in the
-# probation), wcron0/wcron (a cron PATH without sbin) - and the hardening runs
-# (runs-g28.sh, remote actions w19_1..18).
+# probation), wcron0/wcron (a cron PATH without sbin), wlte1..2 (LTE_API) -
+# and the hardening runs (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -1213,6 +1213,30 @@ fresh
   echo 'bk_js "$(printf "a\tb\001c\037d\"e\\\\f\rg")"; printf "%s" "$_jr"'
 } > /tmp/wjs.sh
 sh /tmp/wjs.sh > $OUT/wjs.txt 2> $OUT/wjs.err
+
+# --- wlte1, wlte2: the modem's web API can be switched off (0.1.12.1) --------
+# LTE_API=off in agent_openwrt.cfg: not one request to the modem, while what
+# netifd says about the link (up, uptime, address) is still reported. Any
+# other value is the default, auto: a collector must not go off by a typo.
+# Every run here files its modem calls between "# TAG" and "# end" in
+# hilink_calls.log (by_run reads them), because the runs around it call the
+# stub modem too.
+hl() { # TAG: one dry run
+    echo "# $1" >> $OUT/hilink_calls.log
+    pl "$1"
+    sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err"
+    echo "# end" >> $OUT/hilink_calls.log
+}
+fresh
+echo "LTE_API=off" > /root/agent/agent_openwrt.cfg
+hl wlte1
+echo "LTE_API=nope" > /root/agent/agent_openwrt.cfg
+hl wlte2
+rm -f /root/agent/agent_openwrt.cfg
+fresh
+# --help says what a dry run really does - it asks the modem and the radios
+# like a cron run - and names the switch.
+sh agent_openwrt.sh --help > $OUT/help.txt 2>&1
 
 # Agent hardening (identity cache, last payload, remote actions); the version
 # stamp it needs was written by the runs above and lives outside $PRIV.

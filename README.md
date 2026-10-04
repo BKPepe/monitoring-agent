@@ -534,6 +534,24 @@ and what it counted:
 - **Null, never an empty list**, when there is no readable log. `[]` means the
   log was read and holds no error line.
 
+### What 0.1.12.1 changes (OpenWrt)
+
+A fix release with switches and traces for finding out why a router goes
+silent or reboots.
+
+- **`LTE_API=off` switches the LTE modem's web API off.** With that line in
+  `agent_openwrt.cfg` the agent sends the modem not one request: no
+  `monitoring/status`, `device/signal`, `pin/status` or `net/current-plmn`.
+  What netifd and `/proc/net/dev` say about the link is still reported
+  (`lte_up`, `lte_uptime`, `lte_ipv4`, `net_lte`); signal, SIM and operator
+  are null.
+  Only the exact word `off` switches it off, anything else is the default
+  `auto` (a collector does not go off by a typo). uqmi and mmcli are not the
+  web API and are not affected.
+- **`--dry-run` is not passive, and `--help` now says so.** It runs like a
+  cron run - takes the run lock, asks the modem and the Wi-Fi radios, may
+  read SMART - and skips only the POST, remote actions and the update.
+
 ### What 0.1.11 adds (OpenWrt)
 
 - **Which uplink carried each speed test.** Turris runs `librespeed-cli`
