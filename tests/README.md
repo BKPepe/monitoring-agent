@@ -417,7 +417,8 @@ check:
   invented. Known gap: agent 0.1.12 opens the file before its `2>/dev/null`
   applies and prints `agent_openwrt.sh: line 1922: can't open
   /proc/net/stat/nf_conntrack: no such file`; that line passes only when the
-  file is absent and the payload is 0.1.12, so 0.1.13 must not print it.
+  file is absent and the payload is 0.1.12; 0.1.12.1 swapped the order, and
+  no later version may print it.
   `assert_real_payload.py selftest` (in `lint`) walks both paths.
 - Values that vary between runs are checked by type only.
 

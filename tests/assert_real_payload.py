@@ -138,7 +138,8 @@ NF_STAT_KEYS = ("conntrack_insert_failed", "conntrack_drop", "conntrack_early_dr
 # Known gap: agent_openwrt.sh 0.1.12 reads the file with `done < FILE
 # 2>/dev/null`; the < is opened before the 2> applies, so a missing file
 # prints this line. It passes only when the file is absent and the payload is
-# one of these versions: 0.1.13 must not print it.
+# one of these versions: 0.1.12.1 swapped the order, and no later version may
+# print it.
 NF_STAT_GAP_VERSIONS = ("0.1.12",)
 NF_STAT_GAP = re.compile(r"^(\./)?agent_openwrt\.sh: line \d+: can't open /proc/net/stat/nf_conntrack: no such file$")
 
@@ -501,6 +502,8 @@ def selftest():
       run(absent, err=("./" + leak,), ct=None, prefix="") == [])
     t("absent, 0.1.13: the same line fails (0.1.13 must not print it)",
       only(run(absent, version="0.1.13", err=(leak,), ct=None), "stderr", leak))
+    t("absent, 0.1.12.1: the fix release is not excused, though 0.1.12 is a prefix of it",
+      only(run(absent, version="0.1.12.1", err=(leak,), ct=None), "stderr", leak))
     t("absent, 0.1.1: the gap is 0.1.12's alone, not a prefix of it",
       only(run(absent, version="0.1.1", err=(leak,), ct=None), "stderr", leak))
     t("absent, 0.1.12: the line with more after it fails",

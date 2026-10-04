@@ -339,7 +339,7 @@ checks = {
     "link roles: the WAN device is reported, the LTE rate is measured on the second run": d["wan_l3_device"] == "eth0" and d1["net_lte"] is None and isinstance(d["net_lte"], (int, float)),
     "no interfaces at all: no WAN device, no LTE rate": d3["wan_l3_device"] is None and d3["net_lte"] is None,
     "the log is trimmed on a router that has no stat applet": 0 < log_size <= 40000,
-    "version reported": d.get("version") == "0.1.12",
+    "version reported": d.get("version") == "0.1.12.1",
     # --- storage and SMART (CORE 2.3, 2.7; CORE e2e #22-#39, #44, #45) ---
     # CORE e2e #22
     "omnia: storage_disks has sda and no loop*, mtdblock*, zram* - and no mmcblk0; emmc is null":

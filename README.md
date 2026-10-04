@@ -537,7 +537,8 @@ and what it counted:
 ### What 0.1.12.1 changes (OpenWrt)
 
 A fix release with switches and traces for finding out why a router goes
-silent or reboots.
+silent or reboots. It sends the same keys as 0.1.12; the server needs no
+change.
 
 - **`LTE_API=off` switches the LTE modem's web API off.** With that line in
   `agent_openwrt.cfg` the agent sends the modem not one request: no
@@ -583,6 +584,10 @@ silent or reboots.
   one second and is then killed, and the agent log says that the line did
   not reach syslog. The lock takeover writes its line to syslog only after
   its kills.
+- **No `can't open` on a kernel without conntrack statistics.** 0.1.12 opened
+  `/proc/net/stat/nf_conntrack` before its `2>/dev/null` applied, so a
+  kernel without `CONFIG_NF_CONNTRACK_PROCFS` printed the line every run
+  (cron threw it away; the real-image gate on GitHub's runner did not).
 
 ### What 0.1.11 adds (OpenWrt)
 
