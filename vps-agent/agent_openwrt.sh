@@ -1917,6 +1917,11 @@ fi
 # entries and long hash chains, early_drop counts entries evicted to make
 # room (nothing was refused), and only drop with a full table is a connection
 # the router turned away. The server keeps them apart.
+#
+# The file exists only with CONFIG_NF_CONNTRACK_PROCFS and nf_conntrack
+# loaded. 2>/dev/null comes BEFORE the `<` of the loop: redirections apply
+# left to right, and 0.1.12 opened the file first, so a kernel without it
+# printed "can't open" on every run.
 conntrack_insert_failed="null"; conntrack_drop="null"; conntrack_early_drop="null"
 _ct_a=0; _ct_b=0; _ct_c=0; _ct_seen=""; _ct_cols=""
 while read -r _ct1 _ct2 _ct3 _ct4 _ct5 _ct6 _ct7 _ct8 _ct9 _ct10 _ct11 _ct12 _ct_rest; do
@@ -1936,7 +1941,7 @@ while read -r _ct1 _ct2 _ct3 _ct4 _ct5 _ct6 _ct7 _ct8 _ct9 _ct10 _ct11 _ct12 _ct
     case "$_ct12" in ''|*[!0-9a-fA-F]*) continue ;; esac
     _ct_a=$((_ct_a + 0x$_ct10)); _ct_b=$((_ct_b + 0x$_ct11)); _ct_c=$((_ct_c + 0x$_ct12))
     _ct_seen=1
-done < "$BK_PROC/net/stat/nf_conntrack" 2>/dev/null
+done 2>/dev/null < "$BK_PROC/net/stat/nf_conntrack"
 if [ -n "$_ct_seen" ]; then
     conntrack_insert_failed="$_ct_a"; conntrack_drop="$_ct_b"; conntrack_early_drop="$_ct_c"
 fi

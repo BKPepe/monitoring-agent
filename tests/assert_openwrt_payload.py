@@ -519,6 +519,10 @@ checks = {
         wan_keys(wk4, "conntrack_insert_failed", "conntrack_drop", "conntrack_early_drop") == [None] * 3),
     "wan: a kernel without the conntrack file reports null, not zero": (
         wan_keys(d3, "conntrack_insert_failed", "conntrack_drop", "conntrack_early_drop") == [None] * 3),
+    # 0.1.12 opened the file before its 2>/dev/null applied: "can't open" on
+    # stderr every run, which the real-image gate fails on GitHub's runner.
+    "wan: ... and says nothing about the missing file on stderr": (
+        text("e3.txt") is not None and "nf_conntrack" not in text("e3.txt")),
     "wan: 0.1.7 sends no top-level softnet key (they live in the probe diagnostics)": not [k for k in d if k.startswith("softnet")],
     # --- W-A1 the speedtest pick-up (WAN 3.1.7, 3.1.6; WAN e2e #1-#4a, #13) ---
     "speed: 1850.23 Mbit/s arrives as 1850.23 - the result is Mbit/s, there is no bytes-per-second heuristic":
