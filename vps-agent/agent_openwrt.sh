@@ -386,7 +386,8 @@ if [ "$_sl" != "$AGENT_VERSION" ]; then
           /tmp/status-agent-openwrt-private/hilink-plmn.cache 2>/dev/null || true
     # Everything a parser of this version may read back from an older one:
     # Wi-Fi survey counters and card facts, the disk list and the SMART
-    # readings, the WAN path and the rate states. NOT on the list, on purpose:
+    # readings, the WAN path, the rate states and the modem's web session
+    # (hilink.session). NOT on the list, on purpose:
     # probe.count, probe.attempts, pending.state, probe-out/ and skipped -
     # spend the owner consented to and results not sent yet are no cache.
     # run.cpu goes too: the last run of the old version (the one that just
@@ -399,7 +400,7 @@ if [ "$_sl" != "$AGENT_VERSION" ]; then
         rm -f "$_bk_pd/wifi-survey.state" "$_bk_pd"/wifi-caps.* \
               "$_bk_pd/disks.static" "$_bk_pd/smart.cache" "$_bk_pd/smart.spawn" \
               "$_bk_pd/wan-path.cache" "$_bk_pd"/cores.* "$_bk_pd/wan-rate.state" \
-              "$_bk_pd/run.cpu" 2>/dev/null || true
+              "$_bk_pd/run.cpu" "$_bk_pd/hilink.session" 2>/dev/null || true
     done
     # 0.1.6 remembered only the newest speedtest file here and so never sent
     # the older ones; without the file the first run offers them all again.
@@ -3873,7 +3874,50 @@ bk_xml_keep() {
 # with a token it is sent straight away, and once the gateway failed to
 # answer at all the remaining endpoints are skipped - a stuck modem used to
 # cost four 2-second timeouts every minute.
-_hl_ses=""; _hl_ver=""; _hl_dead="0"
+#
+# The session outlives the run (0.1.12.1). 0.1.12 asked SesTokInfo again
+# every minute: four requests a run instead of two, and a new web session
+# on the modem every minute. It is kept in hilink.session (the private
+# directory, 0600) for BK_HL_SESSION_TTL seconds from the run that got it,
+# for the same modem only: another LTE device, or another address of the
+# router on the modem's network, and it is not sent. A session the modem
+# refuses (125002/125003) is replaced. SesTokInfo is asked at most ONCE a
+# run: a modem that wants a login (100003) refuses every session, and asking
+# again for each endpoint cost nine requests a run. Neither the session nor
+# the token is ever logged.
+BK_HL_SESSION="$BK_PRIVATE_DIR/hilink.session"
+BK_HL_SESSION_TTL=240
+_hl_ses=""; _hl_ver=""; _hl_dead="0"; _hl_asked=""
+# An answer of the API: <response> through </response>, and no <error>.
+# Only that is data: an error XML, a body cut short, a 404 page of whatever
+# answers at that address, or nothing at all is never cached and opens no
+# session.
+bk_hilink_ok() {
+    case "$1" in *"<error>"*) return 1 ;; *"<response>"*"</response>"*) return 0 ;; esac
+    return 1
+}
+# The kept session into _hl_ses/_hl_ver when it is young enough and this
+# modem's. Builtins only, and no file at all on a modem that needs no token.
+bk_hilink_session_load() {
+    [ -f "$BK_HL_SESSION" ] || return 0
+    _hs_ts=""; _hs_dev=""; _hs_ip=""; _hs_ses=""; _hs_ver=""
+    { IFS= read -r _hs_ts; IFS= read -r _hs_dev; IFS= read -r _hs_ip
+      IFS= read -r _hs_ses; IFS= read -r _hs_ver; } 2>/dev/null < "$BK_HL_SESSION"
+    # Ten digits at most: a damaged line must not end the run in $(( )).
+    case "$_hs_ts" in ''|*[!0-9]*|???????????*) return 0 ;; esac
+    _hs_age=$((now_ts - _hs_ts))
+    # A clock stepped back (ntpd after boot) gives a negative age: too old.
+    [ "$_hs_age" -ge 0 ] && [ "$_hs_age" -lt "$BK_HL_SESSION_TTL" ] || return 0
+    [ "$_hs_dev" = "$lte_device" ] && [ "$_hs_ip" = "$lte_ipv4" ] || return 0
+    [ -n "$_hs_ses" ] && [ -n "$_hs_ver" ] || return 0
+    _hl_ses=$_hs_ses; _hl_ver=$_hs_ver
+}
+# One subshell (umask 077), once per new session: every few minutes on a
+# token firmware, never on any other modem.
+bk_hilink_session_save() {
+    ( umask 077
+      printf '%s\n' "$now_ts" "$lte_device" "$lte_ipv4" "$_hl_ses" "$_hl_ver" > "$BK_HL_SESSION" ) 2>/dev/null
+}
 bk_hilink_get() {
     _hl_url="http://${lte_api_host}$1"
     _hl_body=""; _hl_out=""
@@ -3891,6 +3935,9 @@ bk_hilink_get() {
     fi
     case "$_hl_body" in
         *"<code>125002</code>"*|*"<code>125003</code>"*|*"<code>100003</code>"*)
+            # A second refusal in the same run is that endpoint's answer.
+            [ -n "$_hl_asked" ] && { _hl_out="$_hl_body"; return 0; }
+            _hl_asked=1
             _hl_tok=""
             if command -v curl >/dev/null 2>&1; then
                 _hl_tok=$(curl -s -m 2 "http://${lte_api_host}/api/webserver/SesTokInfo" 2>/dev/null)
@@ -3905,6 +3952,9 @@ bk_hilink_get() {
                 elif command -v wget >/dev/null 2>&1; then
                     _hl_body=$(wget -q -T 2 -O - --header "Cookie: $_hl_ses" --header "__RequestVerificationToken: $_hl_ver" "$_hl_url" 2>/dev/null)
                 fi
+                # Kept only when it opened the API: a login-protected modem
+                # refuses it anyway, and the next run would just send it in vain.
+                bk_hilink_ok "$_hl_body" && bk_hilink_session_save
             fi
             ;;
     esac
@@ -3930,12 +3980,14 @@ bk_hilink_cached() {
         case "$_hc_ts" in ''|*[!0-9]*) _hc_ts=0 ;; esac
         if [ $((now_ts - _hc_ts)) -lt "$_hc_ttl" ] && [ "$_hc_k" = "$_hc_key" ]; then
             while :; do case "$_hc_body" in *"$BK_NL") _hc_body=${_hc_body%"$BK_NL"} ;; *) break ;; esac; done
-            _hl_out=$_hc_body
-            [ -n "$_hl_out" ] && return 0
+            bk_hilink_ok "$_hc_body" && { _hl_out=$_hc_body; return 0; }
         fi
     fi
     bk_hilink_get "$1"
-    if [ -n "$_hl_out" ]; then
+    # Only an answer is kept (0.1.12.1): 0.1.12 kept an error body, or the 404
+    # page of a router that is no modem, as the SIM state for ten minutes and
+    # as the operator for a day.
+    if bk_hilink_ok "$_hl_out"; then
         { printf '%s\n%s\n' "$now_ts" "$_hc_key"; printf '%s' "$_hl_out"; } > "$_hc_file.tmp" 2>/dev/null \
             && mv "$_hc_file.tmp" "$_hc_file" 2>/dev/null
     fi
@@ -3955,6 +4007,7 @@ elif [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; 
         *.*) lte_api_host=${lte_ipv4%.*}.1 ;;
         *) lte_api_host=$lte_ipv4 ;;
     esac
+    bk_hilink_session_load
 
     # -- registrace do site: /api/monitoring/status --
     # ConnectionStatus 901 = pripojeno; 902/903/905 = odpojeno; 7/11/12/14/37

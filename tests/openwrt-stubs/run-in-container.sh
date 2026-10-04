@@ -26,8 +26,10 @@
 # lines behind the log count, and who may switch them off), wupd1..11 with
 # wprob1..7, wconf0..2, wlim0..1 and wreb0..5 (the self-update: swap, end
 # mark, self-check, direction, probation, rollback, a reboot in the
-# probation), wcron0/wcron (a cron PATH without sbin), wlte1..2 (LTE_API) -
-# and the hardening runs (runs-g28.sh, remote actions w19_1..18).
+# probation), wcron0/wcron (a cron PATH without sbin), wlte1..2 (LTE_API),
+# whl1..5, wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session,
+# what is cached of its answers) - and the hardening runs (runs-g28.sh,
+# remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -1221,10 +1223,10 @@ sh /tmp/wjs.sh > $OUT/wjs.txt 2> $OUT/wjs.err
 # Every run here files its modem calls between "# TAG" and "# end" in
 # hilink_calls.log (by_run reads them), because the runs around it call the
 # stub modem too.
-hl() { # TAG: one dry run
+hl() { # TAG [MODE]: one dry run against the stub modem in MODE (bin/wget)
     echo "# $1" >> $OUT/hilink_calls.log
     pl "$1"
-    sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err"
+    BK_STUB_HILINK_MODE="${2:-canonical}" sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err"
     echo "# end" >> $OUT/hilink_calls.log
 }
 fresh
@@ -1237,6 +1239,62 @@ fresh
 # --help says what a dry run really does - it asks the modem and the radios
 # like a cron run - and names the switch.
 sh agent_openwrt.sh --help > $OUT/help.txt 2>&1
+
+# --- whl*, wlogin*, wnoplmn*, wcut*, wdead: session and caches (0.1.12.1) ----
+# A token firmware (E3372h-320) refuses every GET without the session that
+# /api/webserver/SesTokInfo hands out; 0.1.12 asked for a new one every run.
+#   whl1    cold: status, SesTokInfo, then status, pin, signal and operator
+#           with the session - and the session is kept
+#   whl2    the next run sends the kept one: status and signal, 2 requests
+#   whl3    the kept session is 241 s old: a new one is asked for
+#   whl4    a session the modem never handed out (125003): replaced, once
+#   whl5    another LTE device (eth3): the old device's session is not sent
+#   wlogin1..2  a modem that wants a login (100003) everywhere: one SesTokInfo
+#           a run, no session kept, and its errors are no SIM state to cache
+#   wnoplmn1..2  current-plmn answers an error: no operator cache, asked again
+#   wcut1..2  status, pin and operator break off before </response>: what is
+#           whole in them is read, nothing is cached, the next run asks again
+#   wdead   the modem answers nothing: one request, then nothing
+# hlfiles records what a run left of the modem in the private directory:
+# the caches by name, the session by mode, device, address and whether it
+# is the stub's own - never the session or the token themselves.
+hlfiles() { # TAG
+    {
+        for _f in hilink-pin.cache hilink-plmn.cache; do
+            if [ -f "$PRIV/$_f" ]; then echo "$_f"; fi
+        done
+        if [ -f "$PRIV/hilink.session" ]; then
+            _hm=$(ls -l "$PRIV/hilink.session" | cut -c1-10)
+            { read -r _ht; read -r _hd; read -r _hi; read -r _hs; read -r _hk; } < "$PRIV/hilink.session" || true
+            if [ "$_hs" = "SessionID=stub-ses-0001" ]; then _hs=stub; else _hs=other; fi
+            if [ "$_hk" = "stub-tok-0001" ]; then _hk=stub; else _hk=other; fi
+            echo "session $_hm $_hd $_hi $_hs $_hk"
+        fi
+    } > "$OUT/$1_files.txt"
+}
+fresh
+hl whl1 token; hlfiles whl1
+hl whl2 token; hlfiles whl2
+sed -i "1s/.*/$(( $(date +%s) - 241 ))/" "$PRIV/hilink.session" || true
+hl whl3 token; hlfiles whl3
+printf '%s\n' "$(date +%s)" lo 192.168.8.100 SessionID=gone gone > "$PRIV/hilink.session"
+hl whl4 token; hlfiles whl4
+( export BK_STUB_LTE_DEV=eth3; hl whl5 token ); hlfiles whl5
+fresh
+hl wlogin1 login; hlfiles wlogin1
+hl wlogin2 login; hlfiles wlogin2
+fresh
+hl wnoplmn1 noplmn; hlfiles wnoplmn1
+hl wnoplmn2 noplmn; hlfiles wnoplmn2
+fresh
+hl wcut1 cut; hlfiles wcut1
+hl wcut2 cut; hlfiles wcut2
+fresh
+hl wdead dead; hlfiles wdead
+fresh
+# What the agent logged in these runs, for the check that no session or token
+# is in any file of out/ (their stderr is there already).
+cp /tmp/status-agent-openwrt.log $OUT/hl_agent_log.txt 2>/dev/null || true
 
 # Agent hardening (identity cache, last payload, remote actions); the version
 # stamp it needs was written by the runs above and lives outside $PRIV.

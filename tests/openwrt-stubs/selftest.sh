@@ -167,5 +167,24 @@ t "logread pii: a UTF-8 letter and a lone 0xff byte are in the kresd line" eq "$
 t "logread formats: ten lines, one of them without a date" eq "$(BK_STUB_LOG=formats logread | wc -l | tr -cd 0-9),$(BK_STUB_LOG=formats logread | grep -c '^    error:')" "10,1"
 rm -f $OUT/logread_now.log
 
+# wget, the HiLink modem: what each BK_STUB_HILINK_MODE answers. A token
+# firmware has to refuse a session it never handed out (125003) differently
+# from no session at all (125002), or the replacement of a stale one is not
+# tested; a login-protected one refuses even the session it handed out.
+H=http://192.168.8.1/api
+t "wget: canonical answers all four endpoints" eq "$(for _e in monitoring/status pin/status device/signal net/current-plmn; do wget -q -O - $H/$_e; done | grep -c '^<response>')" 4
+BK_STUB_HILINK_MODE=token wget -q -O - $H/webserver/SesTokInfo > $T/ses
+_ses=$(sed -n 's/.*<SesInfo>\([^<]*\)<.*/\1/p' $T/ses); _tok=$(sed -n 's/.*<TokInfo>\([^<]*\)<.*/\1/p' $T/ses)
+t "wget: SesTokInfo hands out a session and a token" sh -c "[ -n '$_ses' ] && [ -n '$_tok' ]"
+t "wget: token refuses a GET without a session (125002)" eq "$(BK_STUB_HILINK_MODE=token wget -q -O - $H/device/signal | grep -c '<code>125002</code>')" 1
+t "wget: token refuses a session it never handed out (125003)" eq "$(BK_STUB_HILINK_MODE=token wget -q -O - --header 'Cookie: SessionID=gone' --header '__RequestVerificationToken: gone' $H/device/signal | grep -c '<code>125003</code>')" 1
+t "wget: token answers with the session it handed out" eq "$(BK_STUB_HILINK_MODE=token wget -q -O - --header "Cookie: $_ses" --header "__RequestVerificationToken: $_tok" $H/device/signal | grep -c '<rsrp>-85dBm</rsrp>')" 1
+t "wget: login refuses even that session (100003)" eq "$(BK_STUB_HILINK_MODE=login wget -q -O - --header "Cookie: $_ses" --header "__RequestVerificationToken: $_tok" $H/device/signal | grep -c '<code>100003</code>')" 1
+t "wget: noplmn refuses current-plmn alone" eq "$(BK_STUB_HILINK_MODE=noplmn wget -q -O - $H/net/current-plmn | grep -c '<error>'),$(BK_STUB_HILINK_MODE=noplmn wget -q -O - $H/device/signal | grep -c '<response>')" "1,1"
+t "wget: cut breaks off status, pin and current-plmn before </response>, signal is whole" eq "$(for _e in monitoring/status pin/status net/current-plmn device/signal; do BK_STUB_HILINK_MODE=cut wget -q -O - $H/$_e; echo; done | grep -c '</response>'),$(for _e in monitoring/status pin/status net/current-plmn; do BK_STUB_HILINK_MODE=cut wget -q -O - $H/$_e; echo; done | grep -c '^<response>.*</[A-Za-z]*><[A-Za-z]*$')" "1,3"
+BK_STUB_HILINK_MODE=dead wget -q -O - $H/monitoring/status > $T/o 2>&1; _rc=$?
+t "wget: dead prints nothing and exits 1" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9)" "1,0"
+t "wget: a call with the session is logged with tok in front, the URL last" eq "$(grep -c "^tok $H/device/signal\$" $OUT/hilink_calls.log)" 3
+
 rm -rf $T
 rm -f $OUT/*_calls.log $OUT/iwinfo_scan.log /tmp/bk-stub-iw.*.count

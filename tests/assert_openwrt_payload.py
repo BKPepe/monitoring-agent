@@ -473,7 +473,7 @@ checks = {
         '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_UPDATE" ] && BK_TEST_UPDATE="$STATUS_TEST_UPDATE"'],
     "wifi: every iwinfo call carries exactly one command": len(iwinfo_calls) > 0 and all(len(c.split()) <= 2 for c in iwinfo_calls),
     "wifi: iwinfo was never asked to scan": log_lines("iwinfo_scan.log") == [],
-    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 74 checks)": len(selftest) == 74 and all(l.startswith("ok ") for l in selftest),
+    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 84 checks)": len(selftest) == 84 and all(l.startswith("ok ") for l in selftest),
     "harness: all six payload runs produced a payload of this version": all(x.get("version") == d["version"] for x in (d1, d2b, d3, d4, d5)),
     "wan: PPPoE over a VLAN (the owner's line) - the l3 device is the ppp netdev": (wpppoe["wan_proto"], wpppoe["wan_l3_device"], wpppoe["wan_up"]) == ("pppoe", "pppoe-wan", True),
     # --- W-A2 the WAN device walk (WAN 3.1.1; WAN e2e #5) ---
@@ -756,7 +756,7 @@ checks = {
     # WAN e2e #23
     "gap: a version change drops the relocated identity cache, in either place of the private directory": (w18["hostname"], w18["model"]) == ("turris", "Turris Omnia") and text("w23_fallback.txt") == "no",
     "gap: a version change drops the relocated identity cache - and the stamp then reads the running version": text("w23_stamp.txt") == w18["version"] != "0.0.0",
-    "gap: a version change drops every cache a new parser would read back (Wi-Fi, disks, SMART, WAN path, rates, the old speedtest state) - and nothing else: probe counters and unsent results stay": (text("w23_stale.txt") or "").splitlines() == [f"/tmp/status-agent-openwrt-private/{f}" for f in ("pending.state", "probe-out/1.json", "probe.attempts", "probe.count", "skipped")],
+    "gap: a version change drops every cache a new parser would read back (Wi-Fi, disks, SMART, WAN path, rates, the modem's session, the old speedtest state) - and nothing else: probe counters and unsent results stay": (text("w23_stale.txt") or "").splitlines() == [f"/tmp/status-agent-openwrt-private/{f}" for f in ("pending.state", "probe-out/1.json", "probe.attempts", "probe.count", "skipped")],
     # WAN e2e #19
     "gap: remote actions - positive control: signed and allowed, restart_wan runs": act_calls.get("w19_1") == ["/sbin/ifdown wan", "/sbin/ifup wan"] and act_results.get("w19_1") == ["1|executed|WAN restartovano"],
     "gap: remote actions - what the agent signs is action|ts|nonce of the answer": signed.get("w19_1") == [f"action=restart_wan|ts={resp1['timestamp']}|nonce={resp1['nonce']}"],
@@ -1261,6 +1261,63 @@ checks.update({
     "help: --dry-run says it asks the modem and the radios like a cron run and skips only the POST, actions and update; LTE_API=off is named":
         "pta se modemu i Wi-Fi radii" in help_text and "vynecha jen odeslani, vzdalene akce a aktualizaci" in help_text
         and "LTE_API=off" in help_text,
+})
+# The modem's session and what is cached of its answers (whl*, wlogin*,
+# wnoplmn*, wcut*, wdead). The expected calls of a run: "tok " marks a
+# request that carried the session, as the stub logs it.
+HL = "http://192.168.8.1/api/"
+def hl_expect(*paths):
+    return [f"tok {HL}{p[4:]}" if p.startswith("tok ") else HL + p for p in paths]
+hl_tags = ("whl1", "whl2", "whl3", "whl4", "whl5", "wlogin1", "wlogin2", "wnoplmn1", "wnoplmn2", "wcut1", "wcut2", "wdead")
+hlp = {t: maybe(t) for t in hl_tags}
+hl_files = {t: (text(f"{t}_files.txt") or "").splitlines() for t in hl_tags}
+# Every file the harness keeps: the session and the token of the stub modem
+# may be in none of them (stderr of every run, the agent's log, the payloads).
+hl_secret_files = sorted(
+    os.path.relpath(f, out) for f in glob.glob(f"{out}/**", recursive=True)
+    if os.path.isfile(f) and re.search("stub-ses-0001|stub-tok-0001", open(f, errors="replace").read()))
+SESSION_KEPT = "session -rw------- {} 192.168.8.100 stub stub"
+checks.update({
+    "hilink: a token firmware, cold - status, SesTokInfo, then status, pin, signal and operator with the session (whl1)":
+        hl_calls.get("whl1") == hl_expect("monitoring/status", "webserver/SesTokInfo", "tok monitoring/status",
+                                         "tok pin/status", "tok device/signal", "tok net/current-plmn")
+        and lte(hlp["whl1"], "lte_rsrp", "lte_sim_state", "lte_carrier") == [-85, "ready", "T-Mobile CZ"],
+    "hilink: the session is kept 0600 in the private directory, for this LTE device and address (whl1)":
+        SESSION_KEPT.format("lo") in hl_files["whl1"],
+    "hilink: the next run sends the kept session - status and signal, 2 requests, not 4 (whl2)":
+        hl_calls.get("whl2") == hl_expect("tok monitoring/status", "tok device/signal")
+        and lte(hlp["whl2"], "lte_rsrp", "lte_carrier") == [-85, "T-Mobile CZ"],
+    "hilink: a kept session 241 s old is not sent - a new one is asked for (whl3)":
+        hl_calls.get("whl3") == hl_expect("monitoring/status", "webserver/SesTokInfo", "tok monitoring/status", "tok device/signal"),
+    "hilink: a session the modem refuses (125003) is replaced by a new one, once (whl4)":
+        hl_calls.get("whl4") == hl_expect("tok monitoring/status", "webserver/SesTokInfo", "tok monitoring/status", "tok device/signal")
+        and SESSION_KEPT.format("lo") in hl_files["whl4"],
+    "hilink: another LTE device is not sent the old device's session (whl5)":
+        hl_calls.get("whl5") == hl_expect("monitoring/status", "webserver/SesTokInfo", "tok monitoring/status", "tok device/signal")
+        and SESSION_KEPT.format("eth3") in hl_files["whl5"],
+    "hilink: a modem that wants a login (100003) is asked for a session once a run, not per endpoint - 5 requests, not 9 (wlogin1, wlogin2)":
+        hl_calls.get("wlogin1") == hl_expect("monitoring/status", "webserver/SesTokInfo", "tok monitoring/status",
+                                            "tok pin/status", "tok device/signal")
+        and hl_calls.get("wlogin2") == hl_calls.get("wlogin1"),
+    "hilink: ... and its errors are no data: no SIM cache, no session kept, every modem value null (wlogin1, wlogin2)":
+        hl_files["wlogin1"] == [] and hl_files["wlogin2"] == []
+        and all(lte(hlp[t], "lte_connected", "lte_sim_state", "lte_rsrp", "lte_carrier") == [None] * 4 for t in ("wlogin1", "wlogin2")),
+    "hilink: an operator answer that is an error is not cached - null, and asked again the next run (wnoplmn1, wnoplmn2)":
+        hl_calls.get("wnoplmn1") == hl_expect("monitoring/status", "pin/status", "device/signal", "net/current-plmn")
+        and hl_calls.get("wnoplmn2") == hl_expect("monitoring/status", "device/signal", "net/current-plmn")
+        and hl_files["wnoplmn2"] == ["hilink-pin.cache"]
+        and lte(hlp["wnoplmn2"], "lte_carrier", "lte_rsrp", "lte_sim_state") == [None, -85, "ready"],
+    "hilink: an answer cut short (no </response>) is not cached - pin and operator are asked again the next run (wcut1, wcut2)":
+        hl_calls.get("wcut1") == hl_expect("monitoring/status", "pin/status", "device/signal", "net/current-plmn")
+        and hl_calls.get("wcut2") == hl_calls.get("wcut1")
+        and hl_files["wcut1"] == [] and hl_files["wcut2"] == [],
+    "hilink: ... while what is whole in it is still read (wcut1, wcut2)":
+        all(lte(hlp[t], "lte_connected", "lte_sim_state", "lte_sim_pin_left", "lte_carrier", "lte_rsrp") == [True, "ready", 3, "T-Mobile CZ", -85]
+            for t in ("wcut1", "wcut2")),
+    "hilink: a modem that answers nothing costs one request, and every value it would give is null (wdead)":
+        hl_calls.get("wdead") == hl_expect("monitoring/status")
+        and lte(hlp["wdead"], "lte_connected", "lte_rsrp", "lte_up") == [None, None, True],
+    "hilink: the session and the token are in no log, payload or other file the runs leave": hl_secret_files == [],
 })
 
 # Checks written down before the collector that can pass them: the stubs

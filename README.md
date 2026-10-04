@@ -551,6 +551,18 @@ silent or reboots.
 - **`--dry-run` is not passive, and `--help` now says so.** It runs like a
   cron run - takes the run lock, asks the modem and the Wi-Fi radios, may
   read SMART - and skips only the POST, remote actions and the update.
+- **A token firmware's session is kept between runs.** A modem that answers
+  125002 until it gets a session (E3372h-320 and the like) was asked for a
+  new one every minute: four requests a run instead of two. The session is
+  now kept in `hilink.session` (private directory, 0600) for 240 s from the
+  run that got it, for the same LTE device and address only, and replaced
+  when the modem refuses it. A session is asked for at most once a run, so
+  a modem that wants a login (100003) costs 5 requests a run (0.1.12: 6,
+  and 9 after a reboot). The session and its token are never logged.
+- **An error is not an answer.** Only a whole `<response>` body is cached:
+  0.1.12 kept an error XML, or the 404 page of a router that is no modem, as
+  the SIM state for ten minutes and as the operator for a day. A body that
+  breaks off before `</response>` is not kept either.
 
 ### What 0.1.11 adds (OpenWrt)
 

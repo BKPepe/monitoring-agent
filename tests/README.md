@@ -235,6 +235,21 @@ with nobody on it.
   switch through the response seam (`false`, a fresh private directory and
   an answer without the key, `"log_lines": true`, back on); `wlog8` has no
   log at all.
+- **The LTE modem (`wlte*`, `whl*`, `wlogin*`, `wnoplmn*`, `wcut*`,
+  `wdead`).** The `wget` stub is the HiLink modem, and
+  `BK_STUB_HILINK_MODE` picks which one: `canonical` answers every GET;
+  `token` refuses a GET without the session `/api/webserver/SesTokInfo`
+  hands out (125002) and one it never handed out (125003); `login` refuses
+  everything with 100003; `noplmn` refuses only `current-plmn`; `cut` breaks
+  off status, pin and operator before `</response>`; `dead` answers nothing.
+  Each run files its modem calls between `# TAG` and `# end` in
+  `hilink_calls.log`, a call that carried the session with `tok ` in front.
+  `wlte1` sets `LTE_API=off` (not one call, the link still reported),
+  `wlte2` a junk value (auto). `whl1..5` keep, expire (241 s), replace
+  (125003) and drop (another LTE device) the session; `wlogin1..2` ask for
+  one session a run and cache nothing; `wnoplmn1..2` do not cache an error
+  as the operator, `wcut1..2` no answer cut short. No file the runs leave
+  may hold the stub's session or token.
 - **Pending checks.** `assert_openwrt_payload.py` may list checks in `PENDING`
   while the collector that satisfies them is not merged yet. A pending check
   that passes fails the run, and `BK_E2E_STRICT=1` fails every pending check;

@@ -65,7 +65,7 @@ done
 # of the same name. The keep-files sit in the fallback place only: the
 # cleanup treats both places alike, and the agent never reads that one here.
 for _d in "$PRIV" /tmp/status-agent-openwrt-private; do
-    for _f in wifi-survey.state wifi-caps.phy0-ap0 disks.static smart.cache smart.spawn wan-path.cache cores.prev wan-rate.state; do
+    for _f in wifi-survey.state wifi-caps.phy0-ap0 disks.static smart.cache smart.spawn wan-path.cache cores.prev wan-rate.state hilink.session; do
         echo "STALE-0.0.0" > "$_d/$_f"
     done
 done
