@@ -31,8 +31,9 @@
 # wcfg1..5 with wcfgu (the cfg's integers are decimal and clamped), whl1..5,
 # wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session, what is
 # cached of its answers), wnum1 with wjnum (a value that is no JSON number is
-# null), wst1..3 (the modem's answer changing, in syslog) - and the hardening
-# runs (runs-g28.sh, remote actions w19_1..18).
+# null), wst1..3 (the modem's answer changing, in syslog), wreg1 (the file
+# --register sends its token from) - and the hardening runs (runs-g28.sh,
+# remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -1722,6 +1723,38 @@ fresh
 # What the agent logged in these runs, for the check that no session or token
 # is in any file of out/ (their stderr is there already).
 cp /tmp/status-agent-openwrt.log $OUT/hl_agent_log.txt 2>/dev/null || true
+
+# --- wreg1: --register keeps its token in a file only root can open ---------
+# 0.1.13 wrote the body to /tmp/status-agent-register.$$ with a plain `>`: a
+# file another user had made under a guessed PID kept its owner and mode, and
+# that user read the token. mktemp makes the file new, 0600 and unguessable.
+# The agent is a copy, because --register writes its cfg next to itself and
+# the real one must keep its own. The image has no curl or uclient-fetch, so
+# the wget put in front of the stubs (whose wget is the modem) is the one
+# asked: it files what it found behind --post-file= and answers a key. It
+# files its $PPID too: ash execs the last command of a $(...) in place, so
+# that is the agent's $$, the old name's suffix. Once this container's PIDs
+# reach six digits, the name pattern alone would let the old name through.
+mkdir -p /tmp/wreg/bin
+cp agent_openwrt.sh /tmp/wreg/agent_openwrt.sh
+cat > /tmp/wreg/bin/wget <<'M'
+#!/bin/sh
+for _a; do case "$_a" in --post-file=*) _pf=${_a#--post-file=} ;; esac; done
+{
+    echo "file $_pf"
+    ls -l "$_pf" | cut -c1-10
+    if grep -q '"token":"wreg-tok-0001"' "$_pf"; then echo body; else echo nobody; fi
+    echo "ppid $PPID"
+    case " $* " in *wreg-tok-0001*) echo argv ;; esac
+} >> /work/out/wreg1_wget.txt 2>&1
+printf '{"agent_key":"K"}\n'
+M
+chmod +x /tmp/wreg/bin/wget
+BK_REG_TOKEN=wreg-tok-0001 PATH="/tmp/wreg/bin:$PATH" sh /tmp/wreg/agent_openwrt.sh --register - http://localhost:9/ \
+    < /dev/null > $OUT/wreg1.txt 2> $OUT/wreg1.err || true
+ls -d /tmp/status-agent-register* > $OUT/wreg1_left.txt 2>/dev/null || true
+{ ls -l /tmp/wreg/agent_openwrt.cfg | cut -c1-10; cat /tmp/wreg/agent_openwrt.cfg; } > $OUT/wreg1_cfg.txt 2>/dev/null || true
+rm -rf /tmp/wreg
 
 # Agent hardening (identity cache, last payload, remote actions); the version
 # stamp it needs was written by the runs above and lives outside $PRIV.

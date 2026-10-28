@@ -292,6 +292,13 @@ with nobody on it.
   load with a json as strict as the server's. `wjnum` runs `bk_uint`,
   `bk_jnum` and `bk_xml_num`, taken from the agent, on this image's busybox
   ash. The canonical runs pin RSSI, PCI and cell id as the modem printed them.
+- **The token file of `--register` (`wreg1`).** A copy of the agent, since
+  `--register` writes its cfg next to itself, registers through a `wget`
+  put in front of the stubs. It files the `--post-file=` it was handed: a
+  name mktemp made (`/tmp/status-agent-register.` and 6 random characters,
+  which are not the agent's PID: the wget files its `$PPID` as well),
+  `-rw-------`, the token in the body and not in argv. Nothing of it may be
+  left in `/tmp` afterwards, and the copy's cfg holds the key, 0600.
 - **Syslog (`bin/logger`).** Every call lands in `logger.log` as
   `TAG: MESSAGE`, filed by `# TAG` lines like the modem calls. `wst1..3`
   (the modem answers, goes silent, answers again) are exactly two lines and

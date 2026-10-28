@@ -1625,6 +1625,24 @@ checks.update({
     "cfg: bk_cfg_uint on busybox ash - a leading 0 is decimal, 0 is the floor, more than 9 digits the ceiling, junk the default (wcfgu)":
         " ".join((text("wcfgu.txt") or "").split()) == WCFGU and err("wcfgu") == "",
 })
+# --register's token file (wreg1). 0.1.13 opened /tmp/status-agent-register.$$
+# with a plain `>`: a file another user had made under a guessed PID kept its
+# owner and mode, and that user read the token. The modes are read in the
+# container, where they are still root's (see the end of run-in-container.sh).
+# The wget's parent is the agent, and the suffix must not be its PID: a
+# six-digit $$ fits the name pattern as well as mktemp's characters do.
+wreg_wget = (text("wreg1_wget.txt") or "").splitlines()
+wreg_cfg = (text("wreg1_cfg.txt") or "").splitlines()
+wreg_name = re.fullmatch(r"file /tmp/status-agent-register\.([A-Za-z0-9]{6})", wreg_wget[0]) if wreg_wget else None
+wreg_ppid = re.fullmatch(r"ppid ([0-9]+)", wreg_wget[3]) if len(wreg_wget) == 4 else None
+checks.update({
+    "register: the token goes out from a file mktemp made - a name nobody can guess, 0600, the body in it and not in argv (wreg1)":
+        wreg_name is not None and wreg_ppid is not None and wreg_name.group(1) != wreg_ppid.group(1)
+        and wreg_wget[1:3] == ["-rw-------", "body"],
+    "register: ... nothing of it is left in /tmp, and the key is in the cfg next to the agent, 0600 (wreg1)":
+        text("wreg1_left.txt") == "" and wreg_cfg == ["-rw-------", 'API_URL="http://localhost:9/"', 'AGENT_KEY="K"']
+        and "OK: Router zaregistrovan" in (text("wreg1.txt") or "") and err("wreg1") == "",
+})
 # What went to syslog: bin/logger writes "TAG: MESSAGE" per call to
 # logger.log, and the runs that are checked file theirs by "# TAG" lines.
 sys_lines = by_run("logger.log")

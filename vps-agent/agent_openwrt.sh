@@ -178,8 +178,17 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     # on exactly the routers this script is for. Values are escaped into the
     # body, not eval'ed into a command line, and the body goes through a file
     # only root can read: as an argument it would put the token back in `ps`.
+    # mktemp makes that file new (O_EXCL), 0600 and under a name nobody can
+    # guess. The old .$$ name was opened with a plain `>`: a file another user
+    # had made under a guessed PID kept its owner and mode, and that user read
+    # the token. Without mktemp registration stops, never falls back to a
+    # name that can be predicted.
     bk_reg_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-    REG_FILE="/tmp/status-agent-register.$$"
+    REG_FILE=$(mktemp /tmp/status-agent-register.XXXXXX 2>/dev/null) || REG_FILE=""
+    case "$REG_FILE" in
+        /tmp/status-agent-register.?*) ;;
+        *) echo "CHYBA: Docasny soubor pro registraci nejde bezpecne vytvorit (mktemp)."; exit 1 ;;
+    esac
     ( umask 077; printf '{"action":"register","token":"%s","hostname":"%s","agent_type":"openwrt"}' \
         "$(bk_reg_esc "$REG_TOKEN")" "$(bk_reg_esc "$HOSTNAME_VAL")" > "$REG_FILE" )
     if command -v curl >/dev/null 2>&1; then
