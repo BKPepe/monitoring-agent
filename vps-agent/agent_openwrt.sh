@@ -111,22 +111,40 @@ if [ -f "$ScriptPath/agent_openwrt.cfg" ]; then
     done < "$ScriptPath/agent_openwrt.cfg"
 fi
 
-# A non-numeric value from agent.cfg used to abort the shell right here, before
-# the first log line.
-case "$HEAVY_OP_INTERVAL_HOURS" in ''|*[!0-9]*) HEAVY_OP_INTERVAL_HOURS=24 ;; esac
+# bk_cfg_uint VALUE DEFAULT MIN MAX: one integer from the cfg or the
+# environment, as plain decimal and within MIN-MAX, in $_t. Builtins only.
+# A value that is not all digits is DEFAULT: it used to abort the shell right
+# here, before the first log line. Leading zeros go, because ash reads a
+# leading 0 as octal: 08 or 09 ended every run in the $(( )) below just the
+# same, 024 was 20 h, and 024 as a bare JSON number made the server refuse
+# every report. More than 9 digits is MAX without a test: a number past 64
+# bits would overflow `[` and $(( )).
+bk_cfg_uint() {
+    _t=$1
+    case "$_t" in ''|*[!0-9]*) _t=$2; return 0 ;; esac
+    _t=${_t#"${_t%%[!0]*}"}
+    if [ -z "$_t" ]; then _t=0
+    elif [ "${#_t}" -gt 9 ]; then _t=$4; return 0
+    fi
+    if [ "$_t" -gt "$4" ]; then _t=$4
+    elif [ "$_t" -lt "$3" ]; then _t=$3
+    fi
+}
+
+# 1-168 h. 0 used to mean every minute: opkg, the operator GET to the modem,
+# the Wi-Fi card queries and the service discovery on every run.
+bk_cfg_uint "$HEAVY_OP_INTERVAL_HOURS" 24 1 168; HEAVY_OP_INTERVAL_HOURS=$_t
 HEAVY_OP_INTERVAL_SEC=$(( HEAVY_OP_INTERVAL_HOURS * 3600 ))
 
 # How often a disk may be woken for a SMART reading, and how long one smartctl
 # may run before the watchdog kills it. The interval has a floor of an hour:
-# a spin-up every minute would wear out the very disk the reading watches. The
-# timeout is clamped 10-180 s, because busybox has no `timeout` applet and the
-# watchdog below is what stands between a hung USB bridge and a stuck agent.
-case "$SMART_INTERVAL_MINUTES" in ''|*[!0-9]*) SMART_INTERVAL_MINUTES=60 ;; esac
-[ "$SMART_INTERVAL_MINUTES" -lt 60 ] && SMART_INTERVAL_MINUTES=60
+# a spin-up every minute would wear out the very disk the reading watches. Its
+# ceiling is a week. The timeout is clamped 10-180 s, because busybox has no
+# `timeout` applet and the watchdog below is what stands between a hung USB
+# bridge and a stuck agent.
+bk_cfg_uint "$SMART_INTERVAL_MINUTES" 60 60 10080; SMART_INTERVAL_MINUTES=$_t
 SMART_INTERVAL_SEC=$(( SMART_INTERVAL_MINUTES * 60 ))
-case "$SMART_TIMEOUT_SEC" in ''|*[!0-9]*) SMART_TIMEOUT_SEC=60 ;; esac
-[ "$SMART_TIMEOUT_SEC" -lt 10 ] && SMART_TIMEOUT_SEC=10
-[ "$SMART_TIMEOUT_SEC" -gt 180 ] && SMART_TIMEOUT_SEC=180
+bk_cfg_uint "$SMART_TIMEOUT_SEC" 60 10 180; SMART_TIMEOUT_SEC=$_t
 
 # LTE_API=off: not one request to the LTE modem's web API (HiLink, below);
 # what netifd and /proc/net/dev say about the link is still reported. Only
@@ -238,6 +256,7 @@ for arg in "$@"; do
             echo "Konfigurace:"
             echo "  Cte nastaveni ze souboru agent_openwrt.cfg nebo z promendych prostredi:"
             echo "  STATUS_API_URL, STATUS_AGENT_KEY, STATUS_AUTO_UPDATE, STATUS_HEAVY_OP_INTERVAL_HOURS"
+            echo "  HEAVY_OP_INTERVAL_HOURS 1-168 (vychozi 24), SMART_INTERVAL_MINUTES 60-10080, SMART_TIMEOUT_SEC 10-180"
             echo "  LOG_LINES_ENABLED=0 v agent_openwrt.cfg: radky chyb z logu neopusti router, posila se jen jejich pocet"
             echo "  LTE_API=off v agent_openwrt.cfg: zadny dotaz na webove API LTE modemu (HiLink); stav linky hlasi dal netifd"
             echo ""

@@ -276,7 +276,8 @@ the next run merges. So the report never waits for a drive - busybox has no
 that follow the rules worth knowing:
 
 - A disk is read at most once per `SMART_INTERVAL_MINUTES` (`agent_openwrt.cfg`,
-  default and floor 60).
+  default and floor 60, ceiling 10080 = a week; a leading zero is decimal,
+  090 is 90).
 - A SPINNING disk that nobody is using is not read at all: waking it every hour
   is exactly the wear the check exists to watch. Its state is `idle_skipped`
   until the first minute its counters move, and `smartctl -n standby,3` is a

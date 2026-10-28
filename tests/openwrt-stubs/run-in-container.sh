@@ -28,8 +28,9 @@
 # wupd1..11 with wprob1..7, wconf0..2, wlim0..1 and wreb0..5 (the self-update:
 # swap, end mark, self-check, direction, probation, rollback, a reboot in the
 # probation), wcron0/wcron (a cron PATH without sbin), wlte1..2 (LTE_API),
-# whl1..5, wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session,
-# what is cached of its answers), wst1..3 (the modem's answer changing, in
+# wcfg1..5 with wcfgu (the cfg's integers are decimal and clamped), whl1..5,
+# wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session, what is
+# cached of its answers), wst1..3 (the modem's answer changing, in
 # syslog) - and the hardening runs (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
@@ -1586,6 +1587,41 @@ fresh
 # --help says what a dry run really does - it asks the modem and the radios
 # like a cron run - and names the switch.
 sh agent_openwrt.sh --help > $OUT/help.txt 2>&1
+
+# --- wcfg1..5, wcfgu: the cfg's integers are decimal and clamped -----------
+# ash reads a leading 0 as octal: 08 ended the run before its first log line,
+# 024 went out as a bare 024 the server refuses, and 0 asked the modem for
+# the operator every minute. Each run is `|| true`: a run that aborts fails
+# its own checks, not the whole harness under `set -e`.
+#   wcfg1  HEAVY_OP_INTERVAL_HOURS=08: 8 h
+#   wcfg2  024: 24 h, in valid JSON
+#   wcfg3  0, cold: 1 h, and the operator is asked
+#   wcfg4  0 again: the operator cache holds for that hour
+#   wcfg5  SMART 090 and 010 in the cfg, 20 digits from the environment: 168 h
+fresh
+echo "HEAVY_OP_INTERVAL_HOURS=08" > /root/agent/agent_openwrt.cfg
+hl wcfg1 || true
+echo "HEAVY_OP_INTERVAL_HOURS=024" > /root/agent/agent_openwrt.cfg
+hl wcfg2 || true
+fresh
+echo "HEAVY_OP_INTERVAL_HOURS=0" > /root/agent/agent_openwrt.cfg
+hl wcfg3 || true
+hl wcfg4 || true
+printf 'SMART_INTERVAL_MINUTES=090\nSMART_TIMEOUT_SEC=010\n' > /root/agent/agent_openwrt.cfg
+( export STATUS_HEAVY_OP_INTERVAL_HOURS=99999999999999999999; hl wcfg5 ) || true
+rm -f /root/agent/agent_openwrt.cfg
+fresh
+# The helper itself on the busybox ash of this image, taken from the agent.
+{ sed -n '/^bk_cfg_uint() {/,/^}/p' agent_openwrt.sh
+  cat <<'M'
+for v in 08 024 0 000 1 168 169 999999999 000000000008 99999999999999999999 "" abc -1 7.5; do
+    bk_cfg_uint "$v" 24 1 168; printf '[%s]=%s\n' "$v" "$_t"
+done
+bk_cfg_uint 090 60 60 10080; printf 'smart[090]=%s\n' "$_t"
+bk_cfg_uint 010 60 10 180; printf 'timeout[010]=%s\n' "$_t"
+M
+} > /tmp/wcfgu.sh
+sh /tmp/wcfgu.sh > $OUT/wcfgu.txt 2> $OUT/wcfgu.err || true
 
 # --- whl*, wlogin*, wnoplmn*, wcut*, wdead: session and caches (0.1.12.1) ----
 # A token firmware (E3372h-320) refuses every GET without the session that

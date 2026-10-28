@@ -273,6 +273,13 @@ with nobody on it.
   one session a run and cache nothing; `wnoplmn1..2` do not cache an error
   as the operator, `wcut1..2` no answer cut short. No file the runs leave
   may hold the stub's session or token.
+- **The cfg's integers (`wcfg1..5`, `wcfgu`).** ash reads a leading 0 as
+  octal, so `HEAVY_OP_INTERVAL_HOURS` 08, 024 and 0 must give 8, 24 and 1 h
+  in valid JSON; with 0, `wcfg4` must not ask the modem for the operator
+  again. `wcfg5` sets SMART 090/010 in the cfg and 20 digits in the
+  environment: the run must not end, and the interval is 168 h. Each run is
+  `|| true`, so an abort fails its own checks, not the harness. `wcfgu` runs
+  `bk_cfg_uint`, taken from the agent, on this image's busybox ash.
 - **Syslog (`bin/logger`).** Every call lands in `logger.log` as
   `TAG: MESSAGE`, filed by `# TAG` lines like the modem calls. `wst1..3`
   (the modem answers, goes silent, answers again) are exactly two lines and

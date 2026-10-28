@@ -1560,6 +1560,33 @@ checks.update({
         and lte(hlp["wdead"], "lte_connected", "lte_rsrp", "lte_up") == [None, None, True],
     "hilink: the session and the token are in no log, payload or other file the runs leave": hl_secret_files == [],
 })
+# The cfg's integers (wcfg1..5, wcfgu). 0.1.13 read a leading 0 as octal:
+# 08 and SMART 090 ended the run (no payload), 024 went out as a bare 024
+# that json refuses like the server does (maybe() is None), and 0 asked the
+# modem for the operator every run.
+wcfg = {n: maybe(f"wcfg{n}") for n in "12345"}
+def heavy(n):
+    return None if wcfg[n] is None else wcfg[n].get("heavy_op_interval_hours")
+def plmn_asked(tag):
+    return any(c.endswith("net/current-plmn") for c in hl_calls.get(tag) or [])
+def cfg_ended(tag):
+    """busybox's words for an octal number in $(( )) and a long one in `[`."""
+    return re.search(r"arithmetic|out of range", err(tag)) is not None
+WCFGU = ("[08]=8 [024]=24 [0]=1 [000]=1 [1]=1 [168]=168 [169]=168 [999999999]=168 [000000000008]=8"
+         " [99999999999999999999]=168 []=24 [abc]=24 [-1]=24 [7.5]=24 smart[090]=90 timeout[010]=10")
+checks.update({
+    "cfg: HEAVY_OP_INTERVAL_HOURS=08 is 8 h, not an octal error that ends the run before its first log line (wcfg1)":
+        heavy("1") == 8 and not cfg_ended("wcfg1"),
+    "cfg: 024 is 24 h and goes out as a plain 24 - a bare 024 made the server refuse every report (wcfg2)":
+        heavy("2") == 24 and '"heavy_op_interval_hours": 24,' in (text("wcfg2.json") or ""),
+    "cfg: 0 is 1 h, no longer every minute - the cold run asks for the operator, the next one has it cached (wcfg3, wcfg4)":
+        heavy("3") == heavy("4") == 1 and plmn_asked("wcfg3") and not plmn_asked("wcfg4")
+        and hl_calls.get("wcfg4") == hl_expect("monitoring/status", "device/signal"),
+    "cfg: SMART 090 and 010 in the cfg and 20 digits from the environment do not end the run, the interval is 168 h (wcfg5)":
+        heavy("5") == 168 and not cfg_ended("wcfg5"),
+    "cfg: bk_cfg_uint on busybox ash - a leading 0 is decimal, 0 is the floor, more than 9 digits the ceiling, junk the default (wcfgu)":
+        " ".join((text("wcfgu.txt") or "").split()) == WCFGU and err("wcfgu") == "",
+})
 # What went to syslog: bin/logger writes "TAG: MESSAGE" per call to
 # logger.log, and the runs that are checked file theirs by "# TAG" lines.
 sys_lines = by_run("logger.log")
