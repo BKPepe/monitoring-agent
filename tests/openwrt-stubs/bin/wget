@@ -12,6 +12,11 @@
 #              connection dropped mid-answer), every value read still whole;
 #              device/signal answers whole
 #   dead       nothing at all (exit 1, no body): a hung or rebooting modem
+#   badnum     numbers no JSON parser takes: two RSRP values in one tag, 1.2.3,
+#              a leading zero (SINR, the connection and service codes, the PIN
+#              tries), a hex PCI, a cell id ending in a dot; RSSI is the bound
+#              "&gt;=-51dBm" a modem prints above its scale. current-plmn and
+#              the SIM status (1) and state (257) answer as canonical
 for last; do :; done
 url="$last"
 ses="SessionID=stub-ses-0001"; tok="stub-tok-0001"
@@ -38,6 +43,12 @@ case "$mode" in
       */api/monitoring/status) printf '<response><ConnectionStatus>901</ConnectionStatus><SimStatus>1</SimStatus><ServiceStatus>2</ServiceStatus><CurrentNetw'; exit 0 ;;
       */api/pin/status) printf '<response><SimState>257</SimState><SimPinTimes>3</SimPinTimes><SimPu'; exit 0 ;;
       */api/net/current-plmn) printf '<response><FullName>T-Mobile CZ</FullName><ShortNa'; exit 0 ;;
+    esac ;;
+  badnum)
+    case "$url" in
+      */api/monitoring/status) printf '<response><ConnectionStatus>0901</ConnectionStatus><SimStatus>1</SimStatus><ServiceStatus>02</ServiceStatus><CurrentNetworkType>19</CurrentNetworkType></response>\n'; exit 0 ;;
+      */api/pin/status) printf '<response><SimState>257</SimState><SimPinTimes>03</SimPinTimes></response>\n'; exit 0 ;;
+      */api/device/signal) printf '<response><rsrp>-95dBm/-97dBm</rsrp><rsrq>1.2.3dB</rsrq><sinr>007dB</sinr><rssi>&gt;=-51dBm</rssi><band>20</band><plmn>23001</plmn><dlbandwidth>20MHz</dlbandwidth><pci>0x1A2B</pci><cell_id>12.</cell_id></response>\n'; exit 0 ;;
     esac ;;
 esac
 case "$url" in

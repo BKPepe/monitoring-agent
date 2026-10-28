@@ -134,7 +134,7 @@ wk1, wk2, wk3, wk4, wk5 = (payload(f"wwalk{n}") for n in range(1, 6))
 wack = [payload(f"wack{n}") for n in range(1, 7)]
 wactive = payload("wactive")
 wspeedfb, wspeed60, wspeedold = (payload(n) for n in ("wspeedfb", "wspeed60", "wspeedold"))
-wpath = [payload(f"wpath{n}") for n in range(1, 13)]
+wpath = [payload(f"wpath{n}") for n in range(1, 14)]
 wupl = {n: payload(f"wupl{n}") for n in (1, 3, 4, 6, 7)}
 # The gap runs of INDEX 5.1 step 7: what "the firewall is up" is read from
 # (G20), the DNS probe's exit status (G41), and the run's own clock together
@@ -391,6 +391,9 @@ checks = {
     "lte: interface found by name, address and uptime read": d["lte_up"] is True and d["lte_ipv4"] == "192.168.8.100" and d["lte_uptime"] == 700,
     "hilink: registration and SIM verdict": d["lte_connected"] is True and d["lte_sim_state"] == "ready" and d["lte_conn_code"] == 901 and d["lte_service_code"] == 2 and d["lte_sim_status_code"] == 1 and d["lte_sim_pin_left"] == 3,
     "hilink: signal, band, PLMN, operator": d["lte_rsrp"] == -85 and d["lte_band"] == "B20" and d["lte_plmn"] == "23001" and d["lte_carrier"] == "T-Mobile CZ",
+    # The number and its unit are read now, not the digits of the whole text:
+    # the stub's plain values come through unchanged.
+    "hilink: RSSI, PCI and cell id as the modem printed them": (d["lte_rssi"], d["lte_pci"], d["lte_cell_id"]) == (-61, 123, 1234567),
     # r1, r2, r2b, r4, r5; r3 has no interface at all and so no modem to ask
     "hilink: registration asked every run": hilink_calls("/api/monitoring/status") == 5,
     "hilink: SIM state and operator asked once, then served from the cache": hilink_calls("/api/pin/status") == 1 and hilink_calls("/api/net/current-plmn") == 1,
@@ -541,7 +544,7 @@ checks = {
         '[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_UPDATE" ] && BK_TEST_UPDATE="$STATUS_TEST_UPDATE"'],
     "wifi: every iwinfo call carries exactly one command": len(iwinfo_calls) > 0 and all(len(c.split()) <= 2 for c in iwinfo_calls),
     "wifi: iwinfo was never asked to scan": log_lines("iwinfo_scan.log") == [],
-    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 92 checks)": len(selftest) == 92 and all(l.startswith("ok ") for l in selftest),
+    "harness: the stubs refuse and answer like the real tools (openwrt-stubs/selftest.sh, 93 checks)": len(selftest) == 93 and all(l.startswith("ok ") for l in selftest),
     "harness: all six payload runs produced a payload of this version": all(x.get("version") == d["version"] for x in (d1, d2b, d3, d4, d5)),
     "wan: PPPoE over a VLAN (the owner's line) - the l3 device is the ppp netdev": (wpppoe["wan_proto"], wpppoe["wan_l3_device"], wpppoe["wan_up"]) == ("pppoe", "pppoe-wan", True),
     # --- W-A2 the WAN device walk (WAN 3.1.1; WAN e2e #5) ---
@@ -703,6 +706,8 @@ checks = {
         [path_of(wpath[10], k) for k in SFP_KEYS] == [None] * 6 + [False],
     "sfp: two cages - nothing says which module is the WAN's, so every module value and the PHY flag are null (wpath12)":
         [path_of(wpath[11], k) for k in SFP_KEYS] == [None] * 7,
+    "sfp: a zero-padded reading is null on its own - 049000, -075000 and 0350 are no JSON numbers; 70000, 50 and a plain 0 are still sent (wpath13)":
+        [path_of(wpath[12], k) for k in SFP_KEYS] == [None, 70000, None, None, 50, 0, True],
     "sfp: the module is read without ethtool too - it is sysfs, not the MIB (wpath4)":
         [path_of(wpath[3], k) for k in SFP_KEYS] == [49000, 70000, 75000, None, None, None, True],
     "sfp: nothing that names a module leaves the router - no serial, vendor, part or EEPROM key in the path object":
@@ -1559,6 +1564,39 @@ checks.update({
         hl_calls.get("wdead") == hl_expect("monitoring/status")
         and lte(hlp["wdead"], "lte_connected", "lte_rsrp", "lte_up") == [None, None, True],
     "hilink: the session and the token are in no log, payload or other file the runs leave": hl_secret_files == [],
+})
+# A value that is no JSON number is null on its own (wnum1, wjnum). 0.1.13
+# kept 0-9 . - from anywhere in the modem's text and let 007, 1. and 1.2.3
+# through; json refuses each of them as the server does, and with one of them
+# the whole minute report was lost. strict() is that json: NaN and Infinity,
+# which Python takes by default, are refused too.
+def strict(name):
+    def no_constant(c):
+        raise ValueError(c)
+    try:
+        return json.load(open(f"{out}/{name}.json"), parse_constant=no_constant)
+    except (FileNotFoundError, ValueError):
+        return None
+wnum1 = strict("wnum1")
+WJNUM = ("u[0]=y u[10]=y u[123456789012345678]=y u[]=n u[007]=n u[08]=n u[1.2.3]=n u[-5]=n u[1234567890123456789]=n"
+         " j[0]=y j[-0]=y j[7]=y j[-95]=y j[12.5]=y j[-10.0]=y j[0.05]=y j[1234567]=y"
+         " j[]=n j[-]=n j[--]=n j[007]=n j[01]=n j[00.5]=n j[1.]=n j[-1.]=n j[.5]=n j[-.5]=n j[1.2.3]=n"
+         " j[-95-97]=n j[0x1A2B]=n j[1e5]=n j[inf]=n j[nan]=n j[0123]=n j[1 2]=n"
+         " x[-85dBm]=-85 x[-6.0dB]=-6.0 x[&gt;=-51dBm]=-51 x[&lt;=-140dBm]=-140 x[-95 dBm]=-95 x[ -85dBm ]=-85"
+         " x[-95dBm/-97dBm]=null x[0x1A2B3C]=null x[1234ABCD]=null x[007]=null x[12.]=null x[Unknown]=null x[N/A]=null x[]=null")
+checks.update({
+    "number: a modem that garbles its numbers no longer voids the report - the payload is JSON the server takes (wnum1)":
+        wnum1 is not None and all(v != "null" for v in wnum1.values()),
+    "number: two RSRP values, 1.2.3, 007, a hex PCI, a cell id ending in a dot and codes with a leading zero are each null (wnum1)":
+        lte(wnum1, "lte_rsrp", "lte_rsrq", "lte_sinr", "lte_pci", "lte_cell_id",
+            "lte_conn_code", "lte_service_code", "lte_sim_pin_left") == [None] * 8,
+    "number: ... while RSSI's bound >=-51dBm keeps its -51, and the plain codes and the rest of the modem's answer stay (wnum1)":
+        lte(wnum1, "lte_rssi", "lte_sim_status_code", "lte_sim_code", "lte_sim_state", "lte_band", "lte_plmn", "lte_carrier")
+        == [-51, 1, 257, "ready", "B20", "23001", "T-Mobile CZ"],
+    "number: connection code 0901 is not 901 - the registration is unknown, not connected (wnum1)":
+        lte(wnum1, "lte_connected") == [None],
+    "number: bk_uint, bk_jnum and bk_xml_num on busybox ash - JSON's grammar, dB or dBm after the number, anything else null (wjnum)":
+        " ".join((text("wjnum.txt") or "").split()) == WJNUM and err("wjnum") == "",
 })
 # The cfg's integers (wcfg1..5, wcfgu). 0.1.13 read a leading 0 as octal:
 # 08 and SMART 090 ended the run (no payload), 024 went out as a bare 024

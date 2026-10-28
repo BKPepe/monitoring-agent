@@ -19,7 +19,7 @@
 # Then, on a clean private directory, the scenario runs - wpppoe and wwalk1..5
 # (one branch of the WAN walk each), wsmart, wlock, wspeed*/wack* (where the
 # speedtest results come from and what a 200 really acknowledges), wupl1..7
-# (which uplink carried a speedtest), wpath1..12 (the path the packets take,
+# (which uplink carried a speedtest), wpath1..13 (the path the packets take,
 # the port's MIB split and the SFP module), wfw1..3 (what "the firewall is up"
 # is read from), wdns1/wdns3 (the DNS probe's exit status), wrun1..7 (the
 # run's own clock and the runs that produced no report) and wlog1..9 (the
@@ -30,8 +30,9 @@
 # probation), wcron0/wcron (a cron PATH without sbin), wlte1..2 (LTE_API),
 # wcfg1..5 with wcfgu (the cfg's integers are decimal and clamped), whl1..5,
 # wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session, what is
-# cached of its answers), wst1..3 (the modem's answer changing, in
-# syslog) - and the hardening runs (runs-g28.sh, remote actions w19_1..18).
+# cached of its answers), wnum1 with wjnum (a value that is no JSON number is
+# null), wst1..3 (the modem's answer changing, in syslog) - and the hardening
+# runs (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -514,6 +515,16 @@ echo 31000 > /tmp/fakeroot/sys/class/hwmon/hwmon99/temp1_input
 BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath12.json 2> $OUT/wpath12.err
 rm -rf /tmp/fakeroot/sys/class/hwmon/hwmon99
 stub_off ethtool
+fresh
+# wpath13: zero-padded readings of the one module. A bare 049000 is no JSON
+# number and the server refused the whole report for it; each file that holds
+# one is null on its own, while the plain values next to it - 0 included -
+# are still sent. Read without ethtool, as wpath4 shows the module is.
+echo 049000 > "$_sfp/temp1_input"; printf '%s\n' -075000 > "$_sfp/temp1_crit"
+echo 0350 > "$_sfp/power2_input"; echo 50 > "$_sfp/power2_min"; echo 0 > "$_sfp/power2_lcrit"
+BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath13.json 2> $OUT/wpath13.err
+echo 49000 > "$_sfp/temp1_input"; echo 75000 > "$_sfp/temp1_crit"
+rm -f "$_sfp/power2_input" "$_sfp/power2_min" "$_sfp/power2_lcrit"
 fresh
 
 # --- wport1..wport3: the wired switch ports ---------------------------------
@@ -1675,6 +1686,31 @@ hl wcut2 cut; hlfiles wcut2
 fresh
 hl wdead dead; hlfiles wdead
 fresh
+# --- wnum1, wjnum: a value that is no JSON number is null -------------------
+# One member the server's json_decode refuses voids the whole minute report.
+# The modem garbles every number it can (bin/wget badnum): each such value is
+# null on its own, the bound ">=-51dBm" keeps its -51, and the rest of the
+# payload still parses.
+hl wnum1 badnum
+fresh
+# The helpers themselves on the busybox ash of this image, taken from the
+# agent; bk_xml_num with the XML lookup replaced by $XV. The newline case
+# prints over two lines, which the check reads as "j[1 2]".
+{ sed -n -e '/^bk_uint() {/,/^}/p' -e '/^bk_jnum() {/,/^}/p' \
+      -e '/^        bk_xml_num() {/,/^        }/p' agent_openwrt.sh
+  cat <<'M'
+bk_xml_tag() { _xr=$XV; }
+u() { if bk_uint "$1"; then printf 'u[%s]=y\n' "$1"; else printf 'u[%s]=n\n' "$1"; fi; }
+j() { if bk_jnum "$1"; then printf 'j[%s]=y\n' "$1"; else printf 'j[%s]=n\n' "$1"; fi; }
+x() { XV=$1; bk_xml_num rsrp; printf 'x[%s]=%s\n' "$1" "$_xr"; }
+for v in 0 10 123456789012345678 "" 007 08 1.2.3 -5 1234567890123456789; do u "$v"; done
+for v in 0 -0 7 -95 12.5 -10.0 0.05 1234567 "" - -- 007 01 00.5 1. -1. .5 -.5 1.2.3 -95-97 0x1A2B 1e5 inf nan 0123; do j "$v"; done
+j "1
+2"
+for v in -85dBm -6.0dB '&gt;=-51dBm' '&lt;=-140dBm' '-95 dBm' ' -85dBm ' -95dBm/-97dBm 0x1A2B3C 1234ABCD 007 12. Unknown N/A ""; do x "$v"; done
+M
+} > /tmp/wjnum.sh
+sh /tmp/wjnum.sh > $OUT/wjnum.txt 2> $OUT/wjnum.err || true
 # --- wst1..3: the modem stops answering and answers again (0.1.12.1) --------
 # A modem that answers writes nothing (no hilink.state, no line); one that
 # goes silent and comes back is one line each way in syslog, and the state

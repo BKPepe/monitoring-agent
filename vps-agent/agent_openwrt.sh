@@ -472,6 +472,29 @@ bk_js() {
 bk_jv() {
     if [ -z "$1" ] || [ "$1" = "null" ]; then _jr=null; else bk_js "$1"; _jr="\"$_jr\""; fi
 }
+# 0 when $1 is a plain unsigned decimal that $(( )), `[` and the server's
+# json_decode all read as written: digits only (no sign, blank or newline),
+# no leading zero (ash reads 010 as octal 8 and ends the run on 08, and JSON
+# forbids it), at most 18 digits (ash wraps past 2^63, `[` refuses).
+bk_uint() {
+    case "$1" in
+        0) return 0 ;;
+        ''|0*|*[!0-9]*|???????????????????*) return 1 ;;
+    esac
+    return 0
+}
+# 0 when $1 is a number in JSON's own grammar, -?(0|[1-9][0-9]*)(\.[0-9]+)?,
+# without the exponent nothing here prints: bk_uint with a sign and a
+# fraction. The old test let 007, 1., .5 and 1.2.3 through, and any one of
+# them made the server refuse the whole minute report. Builtins only.
+bk_jnum() {
+    _jn=${1#-}; _ji=${_jn%%.*}
+    bk_uint "$_ji" || return 1
+    [ "$_ji" = "$_jn" ] && return 0
+    _jn=${_jn#"$_ji".}
+    case "$_jn" in ''|*[!0-9]*) return 1 ;; esac
+    return 0
+}
 
 json_str() {
     bk_js "$1"; printf '%s' "$_jr"
@@ -1888,17 +1911,19 @@ fi
 # and tx_dropped only), and a zero nobody measured is not data.
 #
 # Reads one sysfs number into $_wv, no fork; empty when the file cannot be
-# read or does not hold a plain number.
+# read or does not hold a plain number (bk_uint). The kernel never prints
+# one with a leading zero; a 007 would go out as a bare 007 the server
+# refuses, and $(( )) would read it as octal.
 bk_netnum() {
     _wv=""
     [ -r "$1" ] && read -r _wv < "$1" 2>/dev/null
-    case "$_wv" in ''|*[!0-9]*) _wv="" ;; esac
+    bk_uint "$_wv" || _wv=""
 }
 # The same for a sysfs number that may be negative (a hwmon temperature).
 bk_sysint() {
     _wv=""
     [ -r "$1" ] && read -r _wv < "$1" 2>/dev/null
-    case "${_wv#-}" in ''|*[!0-9]*) _wv="" ;; esac
+    bk_uint "${_wv#-}" || _wv=""
 }
 wan_link_dev=""; wan_link_mbit="null"; wan_carrier_down_count="null"
 # Every netdev the walk passed through, for the SQM match of the path cache:
@@ -4242,7 +4267,7 @@ bk_xml_tag() {
         esac
     done
 }
-# Only the characters of bracket class $1 (0-9, or 0-9.-) of $_xr, as
+# Only the characters of bracket class $1 (0-9) of $_xr, as
 # `sed 's/[^0-9]//g'` left them.
 bk_xml_keep() {
     while :; do
@@ -4495,9 +4520,25 @@ elif [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; 
         # Hodnoty nesou jednotky primo v textu ("-83dBm", "-6.0dB"), tak se
         # necha jen cislo. Prazdny tag = udaj modem nehlasi -> null.
         # Builtins into $_xr: the $(...) versions cost 8-9 forks a field.
+        # The number and its unit, never a number glued together from the
+        # characters of something else: keeping 0-9 . - from anywhere made
+        # 0x1A2B a 012 and "-95dBm/-97dBm" a -95-97, and either one got the
+        # whole report refused. What is not a JSON number (bk_jnum) is null.
         bk_xml_num() {
-            bk_xml_tag "$lte_sig_xml" "$1"; bk_xml_keep 0-9.-
-            case "$_xr" in ''|-|.|--) _xr=null ;; esac
+            bk_xml_tag "$lte_sig_xml" "$1"
+            _xr=${_xr#"${_xr%%[! ]*}"}; _xr=${_xr%"${_xr##*[! ]}"}
+            # RSSI above the modem's scale reads ">=-51dBm", escaped "&gt;="
+            # in the XML: a bound keeps its number, as it did.
+            case "$_xr" in
+                '&gt;='*|'&lt;='*) _xr=${_xr#?????} ;;
+                '>='*|'<='*) _xr=${_xr#??} ;;
+            esac
+            # The unit after the last digit, one blank before it: dBm or dB,
+            # the two the modem prints; pci and cell_id carry none. Other
+            # letters are no unit, so a bare-hex 1234ABCD is null, not 1234.
+            _xu=${_xr##*[0-9]}
+            case "${_xu# }" in ''|dB|dBm) _xr=${_xr%"$_xu"} ;; *) _xr="" ;; esac
+            bk_jnum "$_xr" || _xr=null
         }
         bk_xml_str() {
             bk_xml_tag "$lte_sig_xml" "$1"
@@ -5816,15 +5857,14 @@ fi
 [ -z "$mwan3_active_gw" ] && mwan3_active_gw="null"
 
 # Sanitace všech numerických proměnných
-for var in cpu ram ram_total_mb ram_used_mb ram_available_mb ram_free_mb swap_pct entropy conntrack_pct upgradable_packages wifi_clients_count dhcp_leases_count dhcp_reservations_count dns_queries dns_cache_hits dns_cache_misses fw_accepted fw_dropped fw_rejected net net_ipv4_kbps net_ipv6_kbps hdd disk_io_write btrfs_errors load1 load5 load15 uptime_sec temperature wan_uptime sqm_download_kbps sqm_upload_kbps sqm_dropped sqm_ecn lte_rsrp lte_rsrq lte_sinr wan_reconnect_count wan_last_reconnect installed_packages log_errors_24h log_warnings_24h log_window_secs; do
+for var in cpu ram ram_total_mb ram_used_mb ram_available_mb ram_free_mb swap_pct entropy conntrack_pct upgradable_packages wifi_clients_count dhcp_leases_count dhcp_reservations_count dns_queries dns_cache_hits dns_cache_misses fw_accepted fw_dropped fw_rejected net net_ipv4_kbps net_ipv6_kbps hdd disk_io_write btrfs_errors load1 load5 load15 uptime_sec temperature wan_uptime sqm_download_kbps sqm_upload_kbps sqm_dropped sqm_ecn lte_rsrp lte_rsrq lte_sinr wan_reconnect_count wan_last_reconnect installed_packages log_errors_24h log_warnings_24h log_window_secs \
+        lte_rssi lte_pci lte_cell_id lte_conn_code lte_sim_code lte_service_code lte_sim_status_code lte_sim_pin_left; do
     eval "val=\$$var"
-    # A case pattern instead of `echo | grep` - that was ~45 pipelines a run.
-    _num="${val#-}"
-    case "$_num" in
-        ''|*[!0-9.]*) eval "$var=\"null\"" ;;
-        *[0-9]*) : ;;
-        *) eval "$var=\"null\"" ;;
-    esac
+    # bk_jnum instead of `echo | grep` - that was ~45 pipelines a run. A value
+    # that is no JSON number (007, 1., 1.2.3) is null: one such member made
+    # the server refuse the whole report. The modem's codes come from
+    # bk_xml_keep 0-9, which keeps a leading zero, and are checked only here.
+    bk_jnum "$val" || eval "$var=null"
 done
 
 # TCP Retransmissions & Conntrack Count & Inode Usage for OpenWrt

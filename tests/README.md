@@ -172,6 +172,9 @@ with nobody on it.
   hwmon, and `wpath12` one with a second cage (`sfp1`), where nothing says
   which module is the WAN's and every module value is null. The stub logs
   its calls: one `-S` per hourly read, never a second one for the split.
+  `wpath13`, without `ethtool`, zero-pads three of the module's files
+  (049000, -075000, 0350): each is null on its own, and the plain values
+  next to them, a 0 included, are still sent.
 - **The gap runs `wfw1..3`, `wdns1`/`wdns3`, `wrun1..7`.** What "the firewall
   is up" is read from: the `nft` stub serves three rulesets - fw4 (every other
   run), `BK_STUB_NFT=foreign` (mwan3's table and nothing else) and
@@ -264,7 +267,8 @@ with nobody on it.
   `token` refuses a GET without the session `/api/webserver/SesTokInfo`
   hands out (125002) and one it never handed out (125003); `login` refuses
   everything with 100003; `noplmn` refuses only `current-plmn`; `cut` breaks
-  off status, pin and operator before `</response>`; `dead` answers nothing.
+  off status, pin and operator before `</response>`; `dead` answers nothing;
+  `badnum` garbles every number it can (see below).
   Each run files its modem calls between `# TAG` and `# end` in
   `hilink_calls.log`, a call that carried the session with `tok ` in front.
   `wlte1` sets `LTE_API=off` (not one call, the link still reported),
@@ -280,6 +284,14 @@ with nobody on it.
   environment: the run must not end, and the interval is 168 h. Each run is
   `|| true`, so an abort fails its own checks, not the harness. `wcfgu` runs
   `bk_cfg_uint`, taken from the agent, on this image's busybox ash.
+- **A value that is no JSON number (`wnum1`, `wjnum`).** One member the
+  server's json_decode refuses voids the whole minute report. In `wnum1` the
+  modem (`badnum`) prints two RSRP values in one tag, 1.2.3, 007, a hex PCI,
+  a cell id ending in a dot and codes with a leading zero: each of them must
+  be null, the RSSI bound `&gt;=-51dBm` keeps its -51, and the payload must
+  load with a json as strict as the server's. `wjnum` runs `bk_uint`,
+  `bk_jnum` and `bk_xml_num`, taken from the agent, on this image's busybox
+  ash. The canonical runs pin RSSI, PCI and cell id as the modem printed them.
 - **Syslog (`bin/logger`).** Every call lands in `logger.log` as
   `TAG: MESSAGE`, filed by `# TAG` lines like the modem calls. `wst1..3`
   (the modem answers, goes silent, answers again) are exactly two lines and
