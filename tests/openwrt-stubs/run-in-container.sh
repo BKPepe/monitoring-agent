@@ -24,6 +24,7 @@
 # is read from), wdns1/wdns3 (the DNS probe's exit status), wrun1..7 (the
 # run's own clock and the runs that produced no report) and wlog1..9 (the
 # masked error lines behind the log count, and who may switch them off),
+# wsc1 (which socket counts as a listening port),
 # wupd1..11 with wprob1..7, wconf0..2, wlim0..1 and wreb0..5 (the self-update:
 # swap, end mark, self-check, direction, probation, rollback, a reboot in the
 # probation), wcron0/wcron (a cron PATH without sbin), wlte1..2 (LTE_API),
@@ -841,6 +842,55 @@ pl wdl1
 BK_STUB_UPTIME_ADD=40 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl1.json 2> $OUT/wdl1.err
 pl wdl2
 BK_STUB_UPTIME_ADD=50 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl2.json 2> $OUT/wdl2.err
+fresh
+
+# --- wsc1: what "the port listens" is read from (R6) --------------------------
+# A service check asks for the port when its process is not found, and Service
+# Discovery counts a listening port as evidence. A port also stands in the
+# remote column of every outgoing connection: the agent's own HTTPS POST
+# leaves a TIME_WAIT socket with remote :01BB (443) for a minute, and that
+# kept a stopped service on 443 UP. Only the local column counts, for TCP in
+# LISTEN (0A) only, for UDP a bound socket without a peer (07). Every port the
+# old grep would have credited stands in the fake tables:
+#   443   only the remote port of a TIME_WAIT            -> not running
+#   22    LISTEN on 0.0.0.0                              -> running
+#   80    LISTEN on :: (tcp6)                            -> running
+#   53    UDP bound on 0.0.0.0                           -> running
+#   5353  UDP bound on :: (udp6, a dual-stack daemon)    -> running
+#   8080  CLOSE_WAIT left by a server that stopped       -> not running
+#   1883  the local port of a connected UDP socket (01), and the remote port
+#         of an outgoing TCP session to a broker         -> not running
+# Discovery runs with its cache set aside and a config for Dropbear and
+# Mosquitto: Dropbear has its port (22); Mosquitto's 1883 is only the client
+# session and the connected socket, so it stays below the 50 % a report needs.
+PNH='  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'
+UNH='   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops'
+{ echo "$PNH"
+  echo '   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1001 1 0000000000000000 100 0 0 10 0'
+  echo '   1: 0101A8C0:C350 0A0200C0:01BB 06 00000000:00000000 03:00000F9B 00000000     0        0 0 3 0000000000000000'
+  echo '   2: 0101A8C0:1F90 0B0200C0:D431 08 00000000:00000000 00:00000000 00000000     0        0 1003 1 0000000000000000 20 4 0 10 -1'
+  echo '   3: 0101A8C0:D6D8 0C0200C0:075B 01 00000000:00000000 02:000005DC 00000000     0        0 1007 2 0000000000000000 20 4 30 10 -1'
+} > /tmp/fakeroot/proc/net/tcp
+{ echo "$PNH"
+  echo '   0: 00000000000000000000000000000000:0050 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1004 1 0000000000000000 100 0 0 10 0'
+} > /tmp/fakeroot/proc/net/tcp6
+{ echo "$UNH"
+  echo '  10: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1005 2 0000000000000000 0'
+  echo '  11: 0101A8C0:075B 0A0200C0:E1F0 01 00000000:00000000 00:00000000 00000000     0        0 1006 2 0000000000000000 0'
+} > /tmp/fakeroot/proc/net/udp
+{ echo "$UNH"
+  echo '  20: 00000000000000000000000000000000:14E9 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1008 2 0000000000000000 0'
+} > /tmp/fakeroot/proc/net/udp6
+SVC_CACHE=/tmp/status-agent-openwrt-services.cache
+if [ -f "$SVC_CACHE" ]; then mv "$SVC_CACHE" "$SVC_CACHE.keep"; fi
+mkdir -p /etc/mosquitto
+: > /etc/config/dropbear; : > /etc/mosquitto/mosquitto.conf
+resp 200 '{"status":"ok","service_checks":[{"monitor_id":7,"process":"","port":443},{"monitor_id":8,"process":"","port":22},{"monitor_id":9,"process":"","port":80},{"monitor_id":10,"process":"","port":53},{"monitor_id":11,"process":"","port":8080},{"monitor_id":12,"process":"","port":1883},{"monitor_id":13,"process":"","port":5353}]}'
+pl wsc1
+STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wsc1.json 2> $OUT/wsc1.err
+rm -f /tmp/fakeroot/proc/net/tcp /tmp/fakeroot/proc/net/tcp6 /tmp/fakeroot/proc/net/udp /tmp/fakeroot/proc/net/udp6 \
+    /etc/config/dropbear /etc/mosquitto/mosquitto.conf "$SVC_CACHE"
+if [ -f "$SVC_CACHE.keep" ]; then mv "$SVC_CACHE.keep" "$SVC_CACHE"; fi
 fresh
 
 # --- wupd1, wupd2: the self-update swap (IO-07) ------------------------------

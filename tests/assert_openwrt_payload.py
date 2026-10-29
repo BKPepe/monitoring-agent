@@ -929,6 +929,7 @@ ws1, ws2, ws2b, ws2c = maybe("wskip1"), maybe("wskip2"), maybe("wskip2b"), maybe
 wlp1, wlp3 = maybe("wlp1"), maybe("wlp3")
 wlp1_kept, wlp3_kept = load_kept("wlp1_last.json"), load_kept("wlp3_last.json")
 wdl2 = maybe("wdl2")
+wsc1 = maybe("wsc1")
 ns_core = log_lines("nslookup_calls.log", core_only=True)
 wt6a, wt6, wt8 = maybe("wtake6a"), maybe("wtake6"), maybe("wtake8")
 try:
@@ -993,6 +994,13 @@ checks.update({
         "(limit 5 s)" in err("wdl2") and "zbyva 8 s" in err("wdl2")
         and "Odeslany vysledky agent-side kontrol sluzeb." not in err("wdl2")
         and wdl2 is not None and wdl2["agent_run_ms"] == 50000,
+    "service checks: only a listening local port counts (TCP LISTEN, UDP bound, IPv4 and IPv6), not the remote :443 of a TIME_WAIT, a CLOSE_WAIT or a connected UDP socket (wsc1)":
+        all(f'"monitor_id":{m},"running":{v}' in err("wsc1")
+            for m, v in ((7, "false"), (8, "true"), (9, "true"), (10, "true"), (11, "false"), (12, "false"), (13, "true"))),
+    "discovery: Dropbear has its listening port; Mosquitto's 1883 is only a client session and a connected socket, so it is not reported (wsc1)":
+        wsc1 is not None
+        and [s["evidence"] for s in wsc1["discovered_services"] if s["name"] == "Dropbear SSH"] == [["port", "config"]]
+        and not any(s["name"] == "Mosquitto MQTT" for s in wsc1["discovered_services"]),
     "dns: každý běh s payloadem se ptá bez -timeout - resolver, který odpoví za 2-5 s, je pomalý, ne mrtvý (dns_resolver_ok zůstává, co byl v 0.1.8)":
         len(ns_core) > 0 and set(ns_core) == {"example.com 127.0.0.1"},
     "update: the swap across filesystems is a rename - never a missing or short agent, no .bak, no .new, the old file kept as a hard-linked .prev (wupd1)":

@@ -213,6 +213,11 @@ with nobody on it.
   removed after an accepted one and kept by `last-payload.on`. `wdl0..2`
   reach the POST 0, 40 and 50 s late (`BK_STUB_UPTIME_ADD` on the `logread`
   stub) and read the POST limit and the skipped service checks from the log.
+  `wsc1` plants `proc/net/tcp`, `tcp6`, `udp` and `udp6` with one listening
+  socket each, plus port numbers that only stand as a TIME_WAIT's remote end,
+  a CLOSE_WAIT, an outgoing TCP session and a connected UDP socket: the
+  service checks and Service Discovery may count only the local end in LISTEN
+  (TCP) or bound without a peer (UDP).
   Every payload run's `nslookup` call must come without `-timeout`: a
   resolver that answers in 2-5 s is slow, not dead.
   `wupd1/2` run the self-update swap, taken out of the agent by name, across

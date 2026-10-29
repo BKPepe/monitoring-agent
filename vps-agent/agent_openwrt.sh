@@ -5293,6 +5293,28 @@ fi
 # value becomes null below.
 
 
+# Does a socket on this router listen on port $1 (decimal)? Only the local
+# address counts, and for TCP only the LISTEN state (0A); UDP has no listen
+# state, so a bound socket without a peer (07) is the service. A bare grep for
+# ":01BB" also hit the remote column of every outgoing connection: the HTTPS
+# POST of this very agent leaves a TIME_WAIT socket with remote :01BB for a
+# minute, so a stopped service on 443 was reported running and its monitor
+# never went DOWN. One awk over the four tables; a missing one (no IPv6) is
+# left out, not an error. Through $BK_PROC, so the e2e can plant the tables.
+# The files go to awk as "$@", not as a string to split: the service checks
+# call this inside a loop that runs with IFS='|'.
+bk_port_listens() {
+    _pl_port=$1
+    set --
+    for _pl_t in tcp tcp6 udp udp6; do
+        [ -r "$BK_PROC/net/$_pl_t" ] && set -- "$@" "$BK_PROC/net/$_pl_t"
+    done
+    [ $# -gt 0 ] || return 1
+    awk -v port="$_pl_port" '
+        BEGIN { p = sprintf(":%04X", port) }
+        FNR > 1 && substr($2, length($2) - 4) == p && $4 == (FILENAME ~ /udp6?$/ ? "07" : "0A") { f = 1; exit }
+        END { exit !f }' "$@" 2>/dev/null
+}
 
 # --- Service Discovery Scanner (cached for HEAVY_OP_INTERVAL_HOURS) ---
 discovered_services_json="[]"
@@ -5330,11 +5352,13 @@ else
         #
         # Bez portu se tedy nehodnoti ani jako nalezeny, ani jako chybejici -
         # ta sluzba zadny nema, takze to o ni nic nevypovida.
+        #
+        # The hex column only says that the service has a port to look for;
+        # bk_port_listens reads the tables for the decimal one. The grep it
+        # replaces matched "0035" anywhere in a line, a remote port included.
         if [ -z "$_porthex" ]; then
             :
-        elif [ -f /proc/net/tcp ] && grep -qi "$_porthex" /proc/net/tcp 2>/dev/null; then
-            _conf=$((_conf + 25)); _evidence="${_evidence}\"port\","
-        elif [ -f /proc/net/tcp6 ] && grep -qi "$_porthex" /proc/net/tcp6 2>/dev/null; then
+        elif bk_port_listens "$_portdec"; then
             _conf=$((_conf + 25)); _evidence="${_evidence}\"port\","
         else
             _missing="${_missing}\"port\","
@@ -5352,7 +5376,7 @@ else
                 if command -v nc >/dev/null 2>&1 && echo "version" | nc -w2 127.0.0.1 ${_portdec:-10011} 2>/dev/null | grep -qi "TS3"; then _active_ok=1; fi
                 ;;
             minecraft)
-                if [ -f /proc/net/tcp ] && grep -qi "63DD" /proc/net/tcp 2>/dev/null; then _active_ok=1; fi
+                if bk_port_listens 25565; then _active_ok=1; fi
                 ;;
             docker)
                 if [ -S /var/run/docker.sock ]; then _active_ok=1; fi
@@ -6325,7 +6349,7 @@ if [ "$http_code" = "200" ]; then
     # --- 5c. Agent-side kontroly sluzeb (LAN cile nedosazitelne z hostingu) ---
     # Server v odpovedi posila seznam 'agent_service' monitoru tohoto assetu.
     # Agent kazdy overi lokalne - bezici proces (pidof) a naslouchajici port
-    # (/proc/net/tcp, tcp6 i udp) - a vysledky posle zpet jako
+    # (bk_port_listens: TCP v LISTEN, UDP navazany) - a vysledky posle zpet jako
     # service_check_results. Zadna latence se nemeri; posila se jen fakt,
     # jestli sluzba bezi (vymyslene 0 ms by bylo horsi nez nic).
     # A substring test is what `echo | grep -q` answered: the pattern holds no
@@ -6357,8 +6381,7 @@ if [ "$http_code" = "200" ]; then
                 sc_detail="Proces $sc_proc bezi"
             fi
             if [ "$sc_running" = "0" ] && [ -n "$sc_port" ] && [ "$sc_port" != "0" ]; then
-                sc_hex=$(printf ':%04X' "$sc_port" 2>/dev/null)
-                if grep -qi "$sc_hex" /proc/net/tcp 2>/dev/null || grep -qi "$sc_hex" /proc/net/tcp6 2>/dev/null || grep -qi "$sc_hex" /proc/net/udp 2>/dev/null; then
+                if bk_port_listens "$sc_port"; then
                     sc_running=1
                     sc_detail="Port $sc_port nasloucha"
                 fi
@@ -6375,6 +6398,7 @@ if [ "$http_code" = "200" ]; then
             sc_results="${sc_results}{\"monitor_id\":$sc_id,\"running\":$sc_bool,\"detail\":\"$_jr\"}"
         done
         IFS=$SC_OLD_IFS
+        log_debug "Vysledky kontrol sluzeb: $sc_results"
 
         if [ -n "$sc_results" ]; then
             bk_js "$AGENT_KEY"
