@@ -195,7 +195,7 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     fi
 fi
 
-AGENT_VERSION="0.1.12.1"
+AGENT_VERSION="0.1.13"
 LOG_FILE="/tmp/status-agent-openwrt.log"
 NET_STATE_FILE="/tmp/status-agent-openwrt-net.state"
 
@@ -6561,4 +6561,4 @@ fi
 # download cut short, or a file of another version, stops there. It stays
 # the last line and changes together with AGENT_VERSION (the e2e harness
 # checks both).
-# bk-agent-end 0.1.12.1
+# bk-agent-end 0.1.13
