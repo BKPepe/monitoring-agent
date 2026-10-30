@@ -7,18 +7,20 @@ through separate API endpoints.
 
 ## 1. Distributed HTTP probes (this directory)
 
-Check whether a **web/HTTP(S) target is reachable from the outside**, from several
-independent network locations at once — the "is my site up, and from where does it
-look down?" question. Two probes, same secrets, configured once in GitHub:
+Check whether a **web/HTTP(S) target is reachable from the outside**, from a
+network other than the hosting's own — the "is my site up, or is only the hosting
+unable to reach it?" question. One probe, configured once in GitHub:
 
 | Agent | Trigger | Tests |
 |-------|---------|-------|
-| GitHub Actions (`monitor.yml`) | every 5 min | HTTP/HTTPS |
 | Cloudflare Worker (`cloudflare-agent.js`) | every 5 min (cron) | HTTP/HTTPS |
 
-Both post results to `node_api.php` (the "Distributed Node API" on the status
-dashboard) and both auto-detect their own runner location (city/country/ASN) so the
-dashboard can show latency broken down per region.
+It posts results to `node_api.php` (the "Distributed Node API" on the status
+dashboard) and detects its own location from Cloudflare's trace, so the dashboard
+can show latency per region next to the hosting's own checks.
+
+A second probe on a GitHub Actions schedule (`monitor.yml`) was dropped: GitHub ran
+its 5-minute schedule only every 4-6 hours, so it added a handful of points a day.
 
 ### Setup (one-time)
 
