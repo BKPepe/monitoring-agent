@@ -59,8 +59,6 @@ $REMOTE_ACTIONS_ENABLED = "0" # Opt-in: povolení HMAC-podepsaných vzdálených
 $ALLOWED_ACTIONS = "restart_service,reboot_server" # Whitelist povolených akcí (čárkou oddělené)
 # ===========================
 
-if ($Update) { $AUTO_UPDATE = "1" }
-
 # Načtení z Environment proměnných
 if ($env:STATUS_API_URL) { $API_URL = $env:STATUS_API_URL }
 if ($env:STATUS_AGENT_KEY) { $AGENT_KEY = $env:STATUS_AGENT_KEY }
@@ -88,6 +86,10 @@ if (Test-Path $CfgPath) {
         }
     }
 }
+
+# -Update forces a check whatever the configuration says. Applied before the
+# environment and agent.cfg were read, AUTO_UPDATE=0 there silently undid it.
+if ($Update) { $AUTO_UPDATE = "1" }
 
 $LogFile = Join-Path $ScriptPath "agent.log"
 $NetStateFile = Join-Path $ScriptPath "agent_net.state"

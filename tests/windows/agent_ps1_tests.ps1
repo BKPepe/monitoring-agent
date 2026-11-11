@@ -376,6 +376,16 @@ Reset-MockLogs
 $r = Invoke-Agent $x.Sb
 Check "update, sha mismatch: tried again next run" ((Get-Downloads).Count -eq 1 -and -not (Test-Path (Join-Path $x.Sb "agent.ps1.rejected")))
 
+# -Update forces the check even with AUTO_UPDATE=0 in agent.cfg. It used to
+# be applied before agent.cfg was read, which then switched it off again.
+New-UpdateFile "forced.ps1" "9.9.9" | Out-Null
+Reset-MockLogs
+Set-Response 200 (New-UpdateAnswer "forced.ps1" "9.9.9" ("ab" * 32))
+$s = New-Sandbox "upd-forced" -AutoUpdate "0"
+$r = Invoke-Agent $s @("-Update")
+Check "-Update with AUTO_UPDATE=0 in agent.cfg: the update is checked" ((Get-Downloads).Count -eq 1) "downloads $((Get-Downloads).Count)"
+Check-Untouched "-Update, sha mismatch" $s $srcSha
+
 New-UpdateFile "nosent.ps1" "9.9.9" -NoSentinel | Out-Null
 $x = Invoke-UpdateCase "nosent" (New-UpdateAnswer "nosent.ps1" "9.9.9")
 Check "update, no sentinel: refused" ($x.Run.Out -match "nekončí řádkem '# bk-agent-end 9.9.9'")
