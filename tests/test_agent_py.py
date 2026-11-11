@@ -109,6 +109,28 @@ class Rules(AgentTestCase):
         self.assertFalse(ok('["python","0.1.4"]\n', "0.1.4"))
 
 
+class CloudProvider(AgentTestCase):
+    # R77: a guess from DMI was shown as a fact - every Hyper-V machine read
+    # "Azure". Only a marker no other host carries names a provider.
+    def provider(self, vendor="", product="", bios="", asset_tag=""):
+        return self.agent.cloud_provider_from_dmi(vendor, product, bios, asset_tag)
+
+    def test_azure_only_with_its_asset_tag(self):
+        self.assertEqual(self.provider("Microsoft Corporation", "Virtual Machine", "Microsoft Corporation",
+                                       "7783-7084-3265-9085-8269-3286-77"), "Azure")
+        self.assertIsNone(self.provider("Microsoft Corporation", "Virtual Machine", "Microsoft Corporation", ""))
+
+    def test_named_vendors(self):
+        self.assertEqual(self.provider("Amazon EC2", "m5.large", "Amazon EC2"), "AWS")
+        self.assertEqual(self.provider("Google", "Google Compute Engine", "Google"), "Google Cloud")
+        self.assertEqual(self.provider("DigitalOcean", "Droplet", "DigitalOcean"), "DigitalOcean")
+        self.assertEqual(self.provider("Hetzner", "vServer", "Hetzner"), "Hetzner")
+
+    def test_a_plain_hypervisor_is_no_provider(self):
+        self.assertIsNone(self.provider("Xen", "HVM domU", "Xen"))
+        self.assertIsNone(self.provider("QEMU", "Standard PC (Q35 + ICH9, 2009)", "SeaBIOS"))
+
+
 class NonceGate(AgentTestCase):
     def gate(self, nonce="abc123", act_type="restart_service", svc="nginx", now=None):
         return self.agent._action_gate(act_type, nonce, svc, int(time.time()) if now is None else now)

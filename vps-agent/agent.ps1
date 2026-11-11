@@ -701,9 +701,10 @@ try {
     $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
     $manufacturer = ($cs.Manufacturer | Out-String).Trim().ToLower()
     $model = ($cs.Model | Out-String).Trim().ToLower()
+    # Only a vendor no other host carries: a Xen HVM guest is not AWS by
+    # itself, and the guess was shown as a fact.
     if ($manufacturer -match "amazon") { $cloud_provider = "AWS" }
     elseif ($manufacturer -match "google") { $cloud_provider = "Google Cloud" }
-    elseif ($model -match "hvm domu|xen") { $cloud_provider = "AWS" }
     if ($model -match "virtual machine" -and $manufacturer -match "microsoft") { $virtualization = "Hyper-V" }
     elseif ($manufacturer -match "vmware") { $virtualization = "VMware" }
     elseif ($model -match "kvm" -or $manufacturer -match "qemu") { $virtualization = "KVM" }

@@ -670,6 +670,30 @@ def get_temperature():
         pass
     return round(max_temp, 1) if max_temp is not None else None
 
+# Azure's fixed chassis asset tag: every Hyper-V guest says "Microsoft" in
+# its DMI, only an Azure one carries this tag.
+AZURE_ASSET_TAG = '7783-7084-3265-9085-8269-3286-77'
+
+
+def cloud_provider_from_dmi(sys_vendor, product_name, bios_vendor, chassis_asset_tag):
+    """The cloud provider a host's DMI names, or None.
+
+    Only a marker no other host carries counts. "Microsoft" in the vendor is
+    any Hyper-V guest, so Azure needs its asset tag; a plain hypervisor (Xen,
+    KVM, QEMU) names no provider. A guess shown as a fact said "Azure" for
+    every Hyper-V machine.
+    """
+    if (chassis_asset_tag or '').strip() == AZURE_ASSET_TAG:
+        return 'Azure'
+    text = ' '.join((sys_vendor or '', product_name or '', bios_vendor or '')).lower()
+    for hint, name in (('amazon', 'AWS'), ('google', 'Google Cloud'), ('digitalocean', 'DigitalOcean'),
+                       ('hetzner', 'Hetzner'), ('vultr', 'Vultr'), ('linode', 'Linode'),
+                       ('scaleway', 'Scaleway')):
+        if hint in text:
+            return name
+    return None
+
+
 def get_system_identity():
     """Statická identita hostitele kešovaná v RAM."""
     cache_file = os.path.join(STATE_DIR, 'vps_agent_identity.json' + _STATE_SUFFIX)
@@ -734,24 +758,19 @@ def get_system_identity():
     except Exception:
         pass
 
-    # Best-effort rozpoznání cloud poskytovatele dle DMI řetězců - nepokrývá
-    # všechny poskytovatele (OVH typicky vystavuje jen obecné KVM DMI bez
-    # rozlišujícího řetězce), jde o orientační informaci, ne spolehlivý fakt.
+    # The cloud provider, only from a marker no other host carries
+    # (cloud_provider_from_dmi). Providers without one (OVH shows plain KVM)
+    # stay null.
     try:
-        dmi_text = ''
-        for dmi_file in ('/sys/class/dmi/id/sys_vendor', '/sys/class/dmi/id/product_name', '/sys/class/dmi/id/bios_vendor'):
+        dmi = {}
+        for name in ('sys_vendor', 'product_name', 'bios_vendor', 'chassis_asset_tag'):
+            dmi_file = '/sys/class/dmi/id/' + name
+            dmi[name] = ''
             if os.path.exists(dmi_file):
                 with open(dmi_file, 'r') as f:
-                    dmi_text += f.read().strip().lower() + ' '
-        provider_hints = [
-            ('amazon', 'AWS'), ('google', 'Google Cloud'), ('microsoft', 'Azure'),
-            ('digitalocean', 'DigitalOcean'), ('hetzner', 'Hetzner'),
-            ('vultr', 'Vultr'), ('linode', 'Linode'), ('scaleway', 'Scaleway'),
-        ]
-        for hint, name in provider_hints:
-            if hint in dmi_text:
-                identity['cloud_provider'] = name
-                break
+                    dmi[name] = f.read().strip()
+        identity['cloud_provider'] = cloud_provider_from_dmi(
+            dmi['sys_vendor'], dmi['product_name'], dmi['bios_vendor'], dmi['chassis_asset_tag'])
     except Exception:
         pass
 

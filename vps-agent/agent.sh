@@ -652,15 +652,22 @@ if command -v systemd-detect-virt >/dev/null 2>&1; then
     virt=$(systemd-detect-virt 2>/dev/null)
     [ -n "$virt" ] && [ "$virt" != "none" ] && virtualization_json="\"$(json_str "$virt")\""
 fi
+# The cloud provider, only from a marker no other host carries. "Microsoft"
+# is in the DMI of every Hyper-V guest, so Azure needs its fixed chassis
+# asset tag; a plain hypervisor (Xen, KVM) names no provider. A guess shown
+# as a fact said "Azure" for every Hyper-V machine.
 cloud_provider_json="null"
 dmi_text=""
 for dmi_file in /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/bios_vendor; do
     [ -r "$dmi_file" ] && dmi_text="$dmi_text $(tr '[:upper:]' '[:lower:]' < "$dmi_file" 2>/dev/null)"
 done
+dmi_asset_tag=""
+[ -r /sys/class/dmi/id/chassis_asset_tag ] && read -r dmi_asset_tag < /sys/class/dmi/id/chassis_asset_tag 2>/dev/null
+[ "$dmi_asset_tag" = "7783-7084-3265-9085-8269-3286-77" ] && dmi_text="$dmi_text azure-asset-tag"
 case "$dmi_text" in
+    *azure-asset-tag*) cloud_provider_json="\"Azure\"" ;;
     *amazon*) cloud_provider_json="\"AWS\"" ;;
     *google*) cloud_provider_json="\"Google Cloud\"" ;;
-    *microsoft*) cloud_provider_json="\"Azure\"" ;;
     *digitalocean*) cloud_provider_json="\"DigitalOcean\"" ;;
     *hetzner*) cloud_provider_json="\"Hetzner\"" ;;
     *vultr*) cloud_provider_json="\"Vultr\"" ;;
