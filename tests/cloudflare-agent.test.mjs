@@ -110,3 +110,34 @@ test('/run nic nespustí: bez přihlášení nikdo nesmí poslat kolo sond s kl�
   assert.equal(body.status, 'ok');
   assert.doesNotMatch(JSON.stringify(body), /\/run/);
 });
+
+test('sonda, která neodpověděla, nemá dobu odezvy: výpadek nesmí vypadat jako nejrychlejší bod', async () => {
+  const results = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url === 'https://cloudflare.com/cdn-cgi/trace') return new Response(trace('FRA'));
+    if (url.startsWith(`${API_URL}?action=get_monitors`)) {
+      return Response.json({ monitors: [
+        { id: 7, type: 'web', target: 'https://down.example/' },
+        { id: 8, type: 'web', target: 'https://error.example/' },
+      ] });
+    }
+    if (url.startsWith(`${API_URL}?action=post_results`)) {
+      results.push(...JSON.parse(init.body).results);
+      return Response.json({ status: 'ok' });
+    }
+    if (url === 'https://down.example/') throw new TypeError('network connection lost');
+    if (url === 'https://error.example/') return new Response('oops', { status: 502 });
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  const pending = [];
+  await worker.scheduled({ cron: '*/5 * * * *' }, env, { waitUntil: (p) => pending.push(p) });
+  await Promise.all(pending);
+  const byId = Object.fromEntries(results.map((r) => [r.id, r]));
+  assert.equal(byId[7].status, 'down');
+  assert.equal(byId[7].response_time, null);
+  assert.equal(byId[7].error, 'network connection lost');
+  // An HTTP error is an answer: it keeps the time it took.
+  assert.equal(byId[8].status, 'down');
+  assert.equal(typeof byId[8].response_time, 'number');
+});

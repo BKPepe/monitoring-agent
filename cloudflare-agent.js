@@ -200,10 +200,12 @@ async function checkMonitor(monitor) {
       return { id: monitor.id, status: 'down', response_time: rt, error: `HTTP ${resp.status}` };
     }
   } catch (e) {
+    // No answer, no response time: the time until the failure drew an outage
+    // as the fastest points of the chart (a refused connection takes 20 ms).
     return {
       id: monitor.id,
       status: 'down',
-      response_time: Date.now() - startMs,
+      response_time: null,
       error: e.name === 'AbortError' ? `Timeout after ${CHECK_TIMEOUT_MS}ms` : e.message
     };
   }
