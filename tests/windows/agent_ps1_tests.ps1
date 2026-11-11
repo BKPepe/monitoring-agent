@@ -270,6 +270,14 @@ $r = Invoke-Agent $sb @("-SelfCheck")
 Check "self-check without BK_UPDATE_SELFCHECK: exit 2, no JSON" ($r.Code -eq 2 -and $r.Out.Trim() -eq "") "exit $($r.Code) out '$($r.Out)'"
 Check "self-check without BK_UPDATE_SELFCHECK: nothing sent, no log" ((Get-Posts).Count -eq 0 -and -not (Test-Path (Join-Path $sb "agent.log")))
 
+# Two runs in one sandbox: the second has the first's CPU times to compare
+# with. Under pwsh 7 the ids came back as Int64 and never matched (R245).
+$sb = New-Sandbox "topcpu"
+$null = Invoke-Agent $sb @("-DryRun")
+$burn = [System.Diagnostics.Stopwatch]::StartNew(); while ($burn.ElapsedMilliseconds -lt 1500) { $null = [math]::Sqrt(2) }
+$j2 = Get-DryRunJson (Invoke-Agent $sb @("-DryRun")).Out
+Check "top CPU: the second run ranks processes" (@($j2.top_cpu_processes).Count -gt 0) ($j2.top_cpu_processes | ConvertTo-Json -Compress)
+
 # ------------------------------------------------------------ plain report ---
 Reset-MockLogs
 Set-Response 200 $okAnswer

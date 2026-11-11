@@ -706,7 +706,10 @@ try {
         try {
             $json = Get-Content $stateFile -Raw | ConvertFrom-Json
             $prevTicks = $json.ticks
-            foreach ($p in $json.procs) { $prevProcMap[$p.id] = $p.cpuMs }
+            # [int] keys: ConvertFrom-Json gives pwsh 7 an Int64 id, Get-Process
+            # an Int32 one, and a hashtable tells them apart - the top list
+            # came out empty there on every run.
+            foreach ($p in $json.procs) { $prevProcMap[[int]$p.id] = $p.cpuMs }
         } catch {}
     }
 
@@ -724,8 +727,8 @@ try {
         $elapsedSec = ($nowTicks - $prevTicks) / 10000000.0
         if ($elapsedSec -gt 0.1) {
             $cpuRanked = foreach ($p in $procSample2) {
-                if ($p.TotalProcessorTime -and $prevProcMap.ContainsKey($p.Id)) {
-                    $deltaMs = $p.TotalProcessorTime.TotalMilliseconds - $prevProcMap[$p.Id]
+                if ($p.TotalProcessorTime -and $prevProcMap.ContainsKey([int]$p.Id)) {
+                    $deltaMs = $p.TotalProcessorTime.TotalMilliseconds - $prevProcMap[[int]$p.Id]
                     if ($deltaMs -gt 0 -and $cpuCores -gt 0) {
                         [PSCustomObject]@{ name = $p.ProcessName; cpu = [math]::Round(($deltaMs / 1000.0 / $elapsedSec / $cpuCores) * 100, 1) }
                     }
