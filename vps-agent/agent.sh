@@ -1212,7 +1212,9 @@ if command -v upsc >/dev/null 2>&1; then
     if [ -n "$ups_name" ]; then
         ups_data=$(upsc "$ups_name" 2>/dev/null)
         ups_st=$(echo "$ups_data" | sed -n 's/^ups.status: //p' | head -1)
-        ups_bat=$(echo "$ups_data" | sed -n 's/^battery.charge: //p' | head -1 | tr -cd '0-9')
+        # A whole percentage, as agent.py sends it: NUT reports "99.5", and
+        # stripping every non-digit made that 995.
+        ups_bat=$(echo "$ups_data" | awk -F': ' '$1 == "battery.charge" && $2 ~ /^[0-9]+(\.[0-9]+)?$/ { printf "%d", $2; exit }')
         [ -n "$ups_st" ] && ups_status_json="\"$ups_st\""
         [ -n "$ups_bat" ] && ups_battery_json="$ups_bat"
     fi

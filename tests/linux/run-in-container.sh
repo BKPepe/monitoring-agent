@@ -52,6 +52,13 @@ python3 /cron/i/agent.py --dry-run > /work/out/cron_py_i.json 2>/work/out/cron_p
 env -i PATH=/usr/bin:/bin HOME=/root python3 /cron/c/agent.py --dry-run > /work/out/cron_py_c.json 2>/work/out/cron_py_c.err
 rm -f /usr/sbin/zerotier-cli
 
+# A NUT server with a fractional charge: "99.5" lost its point and read 995 %.
+mkdir -p /ups/bin
+printf '#!/bin/sh\ncase "$1" in -l) echo myups ;; *) printf "battery.charge: 99.5\\nups.status: OL\\n" ;; esac\n' > /ups/bin/upsc
+chmod +x /ups/bin/upsc
+PATH="/ups/bin:$PATH" bash agent.sh --dry-run > /work/out/sh_ups.json 2>/work/out/sh_ups.err
+PATH="/ups/bin:$PATH" python3 agent.py --dry-run > /work/out/py_ups.json 2>/work/out/py_ups.err
+
 # A run as an ordinary user: /proc/1/io is root's alone, and the agent read
 # "the kernel cannot account I/O" from not being able to open it.
 mkdir -p /nonroot && cp agent.sh /nonroot/ && chown -R nobody /nonroot
