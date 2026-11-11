@@ -1,8 +1,8 @@
 // Unit tests of the Cloudflare Worker agent (cloudflare-agent.js), run with
 // `node --test tests/*.test.mjs` before every Worker deploy.
 //
-// The Worker has no seam of its own, so the tests drive its two real entry
-// points (the cron `scheduled` handler and `/run`) against a stubbed global
+// The Worker has no seam of its own, so the tests drive its real entry
+// points (the cron `scheduled` handler and the plain fetch) against a stubbed global
 // fetch and read the `location` it posts to node_api.php. That string ends up
 // unchanged in monitor_logs.checked_from and on the public status page, so a
 // wrong country here is a wrong flag in front of every visitor.
@@ -98,15 +98,15 @@ test('trace nedostupný: „Cloudflare Edge“ s neutrální vlajkou', async () 
   assert.equal(await cronLocation(new TypeError('network down')), '🌐 Cloudflare Edge (AS13335 Cloudflare)');
 });
 
-test('ruční /run: poloha colo, kde Worker běží, ne toho, kdo /run zavolal', async () => {
-  const posted = stubFetch(trace('FRA', 'US'));
-  // request.cf describes the caller: here someone in Prague on their own ISP.
-  const request = {
-    url: 'https://worker.example/run',
-    cf: { country: 'CZ', city: 'Prague', asn: 64500, asOrganization: 'Example Access Network' },
+test('/run nic nespustí: bez přihlášení nikdo nesmí poslat kolo sond s klíčem API', async () => {
+  const calls = [];
+  globalThis.fetch = async (input) => {
+    calls.push(String(input));
+    throw new Error(`unexpected fetch ${input}`);
   };
-  const resp = await worker.fetch(request, env, { waitUntil() {} });
+  const resp = await worker.fetch({ url: 'https://worker.example/run' }, env, { waitUntil() {} });
   const body = await resp.json();
-  assert.deepEqual(posted, ['🇩🇪 Frankfurt, DE (AS13335 Cloudflare)']);
-  assert.equal(body.location, posted[0]);
+  assert.deepEqual(calls, []);
+  assert.equal(body.status, 'ok');
+  assert.doesNotMatch(JSON.stringify(body), /\/run/);
 });

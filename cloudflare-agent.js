@@ -84,21 +84,13 @@ async function detectLocation() {
 }
 
 export default {
-  // HTTP handler – manual trigger via /run endpoint
+  // HTTP handler: says the Worker is up, and nothing else. It had a /run that
+  // started a whole round of checks posted with the API key, open to anyone
+  // who found the Worker's address; nothing called it, the cron does the work.
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (url.pathname === '/run') {
-      // Same label as the cron run. request.cf describes whoever called /run
-      // (their city, country and ISP), not where the checks are made from.
-      const location = await detectLocation();
-      const result   = await runMonitoring(env, location);
-      return new Response(JSON.stringify(result, null, 2), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
     return new Response(JSON.stringify({
       status: 'ok',
-      message: 'Monitoring Worker is running. Use /run to trigger manually.'
+      message: 'Monitoring Worker is running. Checks run on its cron schedule.'
     }), { headers: { 'Content-Type': 'application/json' } });
   },
 
