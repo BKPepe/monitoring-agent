@@ -66,7 +66,7 @@ try {
 # exercise the shipped code, not a copy.
 foreach ($fn in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
     if ($fn.Name -in @("Test-ServiceName", "Compare-AgentVersion", "Test-AgentSentinel", "Get-UnixNow", "Save-StateText",
-            "Get-RejectedLines", "Test-RejectedSha", "Add-RejectedSha")) {
+            "Get-RejectedLines", "Test-RejectedSha", "Add-RejectedSha", "Get-NetstatListenPorts")) {
         . ([scriptblock]::Create($fn.Extent.Text))
     }
 }
@@ -83,6 +83,23 @@ Check "version: 0.0.9 older than 0.1.0" ((Compare-AgentVersion "0.0.9" "0.1.0") 
 Check "version: '1.0-beta' unparsable" ($null -eq (Compare-AgentVersion "1.0-beta" "0.1.0"))
 Check "version: '' unparsable" ($null -eq (Compare-AgentVersion "" "0.1.0"))
 Check "version: '0.1.1\n' unparsable" ($null -eq (Compare-AgentVersion "0.1.1`n" "0.1.0"))
+
+# netstat's state column is localized; the listening sockets are told by the
+# foreign address (R247). Nothing readable is null, not "nothing listens".
+$nsEn = @("Active Connections", "", "  Proto  Local Address          Foreign Address        State",
+    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING",
+    "  TCP    127.0.0.1:5939         0.0.0.0:0              LISTENING",
+    "  TCP    10.0.0.5:49702         203.0.113.10:443           ESTABLISHED",
+    "  TCP    [::]:445               [::]:0                 LISTENING",
+    "  UDP    0.0.0.0:500            *:*")
+$nsCs = @("Aktivní připojení", "", "  Proto  Místní adresa          Cizí adresa            Stav",
+    "  TCP    0.0.0.0:3389           0.0.0.0:0              NASLOUCHÁNÍ",
+    "  TCP    10.0.0.5:50000         203.0.113.10:443           NAVÁZÁNO")
+Check "netstat, English: the listening ports" (((Get-NetstatListenPorts $nsEn) -join ",") -eq "135,445,5939")
+Check "netstat, Czech state column: still found" (((Get-NetstatListenPorts $nsCs) -join ",") -eq "3389")
+$nsNone = Get-NetstatListenPorts @("  TCP    10.0.0.5:1    198.51.100.7:443    ESTABLISHED")
+Check "netstat, TCP lines but none listening: an empty list" ($null -ne $nsNone -and $nsNone.Count -eq 0)
+Check "netstat, nothing readable: null" ($null -eq (Get-NetstatListenPorts @("netstat: command failed", "")))
 
 $sentDir = Join-Path $Work "sentinel"
 New-Item -ItemType Directory -Force -Path $sentDir | Out-Null

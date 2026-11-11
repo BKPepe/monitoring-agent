@@ -126,6 +126,25 @@ $REJECTED_SHA_KEEP = 8
 # PowerShell 5.1 start plus the CIM queries take several seconds on a small VM.
 $SELFCHECK_TIMEOUT_SEC = 60
 
+# The listening TCP ports in `netstat -an`: a TCP line whose foreign address is
+# 0.0.0.0:0 or [::]:0. The state column is localized ("LISTENING",
+# "NASLOUCHÁNÍ", ...), so it is not read. $null when no line is a TCP line at
+# all - an output this cannot read is no measurement.
+function Get-NetstatListenPorts([string[]]$Lines) {
+    $seen = $false
+    $found = @{}
+    foreach ($l in $Lines) {
+        if ($l -match '^\s*TCP\s+(\S+):(\d+)\s+(\S+)') {
+            $seen = $true
+            if ($Matches[3] -eq '0.0.0.0:0' -or $Matches[3] -eq '[::]:0') { $found[[int]$Matches[2]] = $true }
+        }
+    }
+    if (-not $seen) { return $null }
+    # The comma keeps an empty list a list: returned bare, PowerShell would
+    # unroll it into nothing, which reads as $null.
+    return ,@($found.Keys | Sort-Object)
+}
+
 function Write-AgentLog {
     param([string]$Message)
     # A self-check prints exactly one JSON object; any other line would make
@@ -759,15 +778,15 @@ try {
 } catch {}
 
 # --- Naslouchající TCP porty ---
-$ports = @()
+# null until one of the two ways answered: an empty list is "nothing listens",
+# and the server takes the services that watch a port for DOWN on it.
+$ports = $null
 try {
-    $ports = Get-NetTCPConnection -State Listen -ErrorAction Stop |
-        Select-Object -ExpandProperty LocalPort -Unique | Sort-Object
+    $ports = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+        Select-Object -ExpandProperty LocalPort -Unique | Sort-Object)
 } catch {
     try {
-        $ports = netstat -an | Select-String "LISTENING" | ForEach-Object {
-            if ($_ -match ':(\d+)\s') { [int]$Matches[1] }
-        } | Sort-Object -Unique
+        $ports = Get-NetstatListenPorts @(netstat -an)
     } catch {}
 }
 
@@ -940,7 +959,8 @@ $payload = @{
     temperature = $null
     uptime = $uptime
     smart = $smart
-    ports = @($ports)
+    # null stays null (nothing could tell); @($null) would send [null].
+    ports = $(if ($null -eq $ports) { $null } else { @($ports) })
     processes = @($processes)
     ts3_process = $ts3Process
     zombie_count = $null
