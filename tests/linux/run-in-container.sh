@@ -52,6 +52,11 @@ python3 /cron/i/agent.py --dry-run > /work/out/cron_py_i.json 2>/work/out/cron_p
 env -i PATH=/usr/bin:/bin HOME=/root python3 /cron/c/agent.py --dry-run > /work/out/cron_py_c.json 2>/work/out/cron_py_c.err
 rm -f /usr/sbin/zerotier-cli
 
+# A run as an ordinary user: /proc/1/io is root's alone, and the agent read
+# "the kernel cannot account I/O" from not being able to open it.
+mkdir -p /nonroot && cp agent.sh /nonroot/ && chown -R nobody /nonroot
+su -s /bin/bash nobody -c "bash /nonroot/agent.sh --dry-run" > /work/out/sh_nonroot.json 2>/work/out/sh_nonroot.err
+
 # agent.py's unit tests, on this image's Python.
 BK_AGENT_PY=/agent/agent.py python3 -m unittest discover -s /work/tests -p 'test_agent_py.py' > /work/out/py_unit.txt 2>&1 \
     || { cat /work/out/py_unit.txt >&2; exit 1; }

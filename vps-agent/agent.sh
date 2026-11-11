@@ -690,10 +690,18 @@ fi
 #
 # Hodnota je kumulativni od startu procesu: odpovida na "kdo toho nejvic
 # zapsal", ne "kdo zrovna pise".
+# Whether the kernel accounts I/O at all is asked of /proc/self/io: this
+# shell's own file, readable to any user. /proc/1/io is root's alone, so an
+# agent without root said the kernel lacked CONFIG_TASK_IO_ACCOUNTING. Without
+# root the list below holds only the processes this user may read.
 top_io_json="[]"
-io_accounting_json="false"
-if [ -r /proc/1/io ]; then
+io_accounting_json="null"
+if [ -r /proc/self/io ]; then
     io_accounting_json="true"
+elif [ -d /proc/self ]; then
+    io_accounting_json="false"
+fi
+if [ "$io_accounting_json" = "true" ]; then
     # One awk over every readable /proc/<pid>/io instead of two forks per
     # process - on a 300-process host that was ~600 forks a minute, the single
     # biggest cost of this script. Readability is checked with the builtin

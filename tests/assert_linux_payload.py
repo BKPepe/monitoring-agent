@@ -46,6 +46,11 @@ for kind in ("sh", "py"):
     lost = sorted(k for k in measured if rc.get(k) is None)
     check(f"{kind}: everything measured in an ordinary run is measured under cron's env{' (lost: ' + ', '.join(lost) + ')' if lost else ''}", not lost)
 
+# I/O accounting is the kernel's, not the user's: the same answer as root.
+nonroot = json.load(open(f"{out}/sh_nonroot.json"))
+check("sh: io_accounting as an ordinary user is root's answer",
+      nonroot.get("io_accounting") == json.load(open(f"{out}/sh2.json")).get("io_accounting"))
+
 sh2 = json.load(open(f"{out}/sh2.json"))
 top = sh2["top_cpu_processes"]
 check("sh: the busy `yes` tops the CPU ranking", bool(top) and top[0]["name"] == "yes" and top[0]["cpu"] >= 50)
