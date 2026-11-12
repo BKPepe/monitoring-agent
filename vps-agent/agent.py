@@ -875,6 +875,9 @@ def get_process_snapshot(limit=5):
         except Exception:
             clk_tck = 100
         elapsed = max(0.1, time.monotonic() - mono_prev)
+        # A share of the whole machine, as the system CPU and the other
+        # agents count it: per core, a process busy on one of eight read 100 %.
+        ncpu = os.cpu_count() or 1
         for pid, (state, ticks2) in stats2.items():
             # The agent itself never belongs in its own ranking.
             if pid == self_pid or pid not in prev_state or state == 'Z':
@@ -883,7 +886,7 @@ def get_process_snapshot(limit=5):
             delta_ticks = ticks2 - ticks1
             if delta_ticks <= 0:
                 continue
-            cpu_pct = round(((delta_ticks / clk_tck) / elapsed) * 100, 1)
+            cpu_pct = round(((delta_ticks / clk_tck) / elapsed / ncpu) * 100, 1)
             cpu_deltas.append({'name': names.get(pid, f'pid-{pid}'), 'cpu': cpu_pct, 'ram_mb': ram_mb(pid)})
 
     cpu_deltas.sort(key=lambda x: x['cpu'], reverse=True)

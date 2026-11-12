@@ -357,7 +357,7 @@ pb_new=""
 [ "$DRY_RUN" = "1" ] || bk_probation_check
 
 # Previous-run state, read as plain key=value lines - never eval'ed.
-st_boot_id=""; st_cpu=""; st_diskio=""; st_net=""; st_forks=""; st_ts3=""
+st_boot_id=""; st_cpu=""; st_diskio=""; st_net=""; st_forks=""; st_ts3=""; st_procs=""
 if [ -f "$STATE_FILE" ]; then
     while IFS='=' read -r st_k st_v; do
         case "$st_k" in
@@ -367,6 +367,7 @@ if [ -f "$STATE_FILE" ]; then
             net) st_net="$st_v" ;;
             forks) st_forks="$st_v" ;;
             ts3) st_ts3="$st_v" ;;
+            procs) st_procs="$st_v" ;;
         esac
     done < "$STATE_FILE"
 fi
@@ -375,7 +376,7 @@ fi
 # trusted only within the same boot.
 cur_boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 if [ -n "$st_boot_id" ] && [ "$st_boot_id" != "$cur_boot_id" ]; then
-    st_cpu=""; st_diskio=""; st_net=""; st_forks=""; st_ts3=""
+    st_cpu=""; st_diskio=""; st_net=""; st_forks=""; st_ts3=""; st_procs=""
 fi
 
 # 1. CPU usage from the /proc/stat delta against the previous run.
@@ -857,22 +858,63 @@ if [ -n "$bk_ps_raw" ]; then
         }')
 fi
 
-# Top lists built inside awk - no per-line forks. Both values in both lists so
-# no cell in the table stays empty; a value ps did not give is null, never 0.
-bk_top_json() {  # $1 = sort column: 4 = %cpu, 5 = rss
-    printf '%s\n' "$bk_ps_snapshot" | sort -k"$1","$1" -rn | head -n 5 | awk '
-        NF >= 6 {
-            name = $6; for (i = 7; i <= NF; i++) name = name " " $i;
-            gsub(/\\/, "\\\\", name); gsub(/"/, "\\\"", name); gsub(/[\t]/, " ", name);
-            cpu = ($4 ~ /^[0-9.]+$/) ? $4 : "null";
-            ram = ($5 ~ /^[0-9]+$/) ? sprintf("%.1f", $5 / 1024) : "null";
-            printf "%s{\"name\": \"%s\", \"cpu\": %s, \"ram_mb\": %s}", (c++ ? ", " : ""), name, cpu, ram
-        }'
-}
+# A process's CPU is its share of the whole machine between two runs, the
+# way the system CPU, agent.py and agent.ps1 count it. ps's %cpu is the
+# average over the process's whole life, per core: a service busy for the
+# last minute read 2 %, a stuck one on one core of eight read 100 %.
+# The ticks (utime + stime from /proc/<pid>/stat) of every listed process go
+# into the state file with /proc/uptime in hundredths, a clock no NTP step
+# moves; the first run has nothing to compare and ranks no CPU.
+bk_ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+case "$bk_ncpu" in ''|*[!0-9]*|0) bk_ncpu=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null) ;; esac
+case "$bk_ncpu" in ''|*[!0-9]*|0) bk_ncpu=1 ;; esac
+bk_clk=$(getconf CLK_TCK 2>/dev/null)
+case "$bk_clk" in ''|*[!0-9]*|0) bk_clk=100 ;; esac
+bk_up_cs=$(awk '{ printf "%d", $1 * 100 }' /proc/uptime 2>/dev/null)
+case "$bk_up_cs" in ''|*[!0-9]*) bk_up_cs="" ;; esac
+new_st_procs=""
 top_cpu_json=""; top_ram_json=""
 if [ -n "$bk_ps_snapshot" ]; then
-    top_cpu_json=$(bk_top_json 4)
-    top_ram_json=$(bk_top_json 5)
+    # The paths are data read with getline, as for /proc/<pid>/io below: a
+    # process gone since ps is skipped, not fatal. Fields after "comm) ":
+    # utime is the 12th, stime the 13th.
+    bk_ticks=$(printf '%s\n' "$bk_ps_snapshot" | awk '{ print $1 }' | awk '
+        /^[0-9]+$/ { f = "/proc/" $1 "/stat";
+          if ((getline line < f) > 0) { sub(/^.*\) /, "", line); split(line, a, " "); print $1, a[12] + a[13] }
+          close(f) }')
+    if [ -n "$bk_up_cs" ] && [ -n "$bk_ticks" ]; then
+        new_st_procs="$bk_up_cs $(printf '%s\n' "$bk_ticks" | awk 'NF == 2 { printf "%s%s:%s", (n++ ? " " : ""), $1, $2 }')"
+    fi
+    # Both top lists in one pass, both values in each so no cell in the table
+    # stays empty; a value nobody measured is null, never 0.
+    bk_tops=$( { printf '%s\n' "$bk_ticks" | sed 's/^/T /'; printf '%s\n' "$bk_ps_snapshot" | sed 's/^/P /'; } | awk \
+        -v prev="$st_procs" -v up="$bk_up_cs" -v clk="$bk_clk" -v ncpu="$bk_ncpu" '
+        function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/[\t]/, " ", s); return s }
+        function entry(pid) {
+            return sprintf("{\"name\": \"%s\", \"cpu\": %s, \"ram_mb\": %s}", esc(nm[pid]),
+                (pid in c) ? sprintf("%.1f", c[pid]) : "null",
+                (rss[pid] ~ /^[0-9]+$/) ? sprintf("%.1f", rss[pid] / 1024) : "null")
+        }
+        $1 == "T" && NF == 3 { t1[$2] = $3; next }
+        $1 == "P" && NF >= 7 && $4 !~ /^Z/ { name = $7; for (i = 8; i <= NF; i++) name = name " " $i; nm[$2] = name; rss[$2] = $6 }
+        END {
+            n = split(prev, p, " "); el = 0
+            if (n > 1 && up != "") el = (up - p[1]) / 100
+            for (i = 2; i <= n; i++) { split(p[i], kv, ":"); t0[kv[1]] = kv[2] }
+            if (el > 0) for (pid in t1) if ((pid in t0) && (pid in nm)) { d = t1[pid] - t0[pid]; if (d >= 0) c[pid] = d / clk / el / ncpu * 100 }
+            s = ""
+            for (k = 0; k < 5; k++) { bp = ""; best = 0
+                for (pid in c) if (!(pid in uc) && c[pid] > best) { best = c[pid]; bp = pid }
+                if (bp == "") break; uc[bp] = 1; s = s (k ? ", " : "") entry(bp) }
+            print s
+            s = ""
+            for (k = 0; k < 5; k++) { bp = ""; best = -1
+                for (pid in nm) if (!(pid in ur) && rss[pid] ~ /^[0-9]+$/ && rss[pid] + 0 > best) { best = rss[pid] + 0; bp = pid }
+                if (bp == "") break; ur[bp] = 1; s = s (k ? ", " : "") entry(bp) }
+            print s
+        }')
+    top_cpu_json=$(printf '%s\n' "$bk_tops" | sed -n 1p)
+    top_ram_json=$(printf '%s\n' "$bk_tops" | sed -n 2p)
 fi
 
 # One TeamSpeak ServerQuery exchange: bk_ts3_query PORT CMD [CMD...]
@@ -1327,6 +1369,7 @@ EOF
     if [ -n "$new_st_net" ]; then printf 'net=%s\n' "$new_st_net"; fi
     if [ -n "$new_st_forks" ]; then printf 'forks=%s\n' "$new_st_forks"; fi
     if [ -n "$new_st_ts3" ]; then printf 'ts3=%s\n' "$new_st_ts3"; fi
+    if [ -n "$new_st_procs" ]; then printf 'procs=%s\n' "$new_st_procs"; fi
 } > "$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null \
     || log_message "VAROVANI: stav se nepodarilo ulozit do $STATE_FILE - delta metriky (CPU, sit, disk) zustanou null."
 

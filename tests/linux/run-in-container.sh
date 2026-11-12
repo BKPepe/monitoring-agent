@@ -14,11 +14,13 @@ cd /agent
 python3 /agent/fake_ts3.py &
 ts3_pid=$!
 sleep 1
+# The busy `yes` runs through both runs: a process's CPU is its ticks between
+# two runs, so the ranking has it only when the first run saw it too.
+nproc > /work/out/nproc.txt
+yes > /dev/null & yp=$!
 bash agent.sh --dry-run > /work/out/sh1.json 2>/work/out/sh1.err
 python3 agent.py --dry-run > /work/out/py1.json 2>/work/out/py1.err
-sleep 2
-yes > /dev/null & yp=$!
-sleep 1
+sleep 3
 bash agent.sh --dry-run > /work/out/sh2.json 2>/work/out/sh2.err
 python3 agent.py --dry-run > /work/out/py2.json 2>/work/out/py2.err
 kill "$yp"

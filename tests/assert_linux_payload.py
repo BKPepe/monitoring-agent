@@ -58,7 +58,15 @@ check("sh: io_accounting as an ordinary user is root's answer",
 
 sh2 = json.load(open(f"{out}/sh2.json"))
 top = sh2["top_cpu_processes"]
-check("sh: the busy `yes` tops the CPU ranking", bool(top) and top[0]["name"] == "yes" and top[0]["cpu"] >= 50)
+# A share of the whole machine: `yes` keeps one core busy, so 100 % / cores,
+# with room for the scheduler.
+ncpu = max(1, int(open(f"{out}/nproc.txt").read().strip() or 1))
+check(f"sh: the busy `yes` tops the CPU ranking as a share of {ncpu} cores",
+      bool(top) and top[0]["name"] == "yes" and 50 / ncpu <= top[0]["cpu"] <= 100 / ncpu + 5)
+pytop = json.load(open(f"{out}/py2.json"))["top_cpu_processes"]
+check(f"py: the busy `yes` tops the CPU ranking as a share of {ncpu} cores",
+      bool(pytop) and pytop[0]["name"] == "yes" and 50 / ncpu <= pytop[0]["cpu"] <= 100 / ncpu + 5)
+check("sh: the first run has no CPU ranking to compare with", json.load(open(f"{out}/sh1.json"))["top_cpu_processes"] == [])
 check("sh: top entries carry both cpu and ram_mb", all("cpu" in p and "ram_mb" in p for p in top))
 print(f"{'all passed' if not failed else str(len(failed)) + ' failed'}")
 sys.exit(1 if failed else 0)

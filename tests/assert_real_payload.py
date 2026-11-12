@@ -122,6 +122,7 @@ VARIES = [
     ("*/*", "temperature", "the runner's thermal zones"),
     ("*/*", "cloud_provider", "the runner's DMI: none on Docker Desktop, Azure on GitHub's runner"),
     ("*/py", "top_cpu_processes", "the processes that used CPU in agent.py's short sample"),
+    ("ubuntu/sh rocky/sh", "top_cpu_processes", "the processes that used CPU between agent.sh's two runs: an idle container may have none"),
     ("alpine/sh */py", "dns_latency_ms", "the runner's resolver"),
 ]
 
