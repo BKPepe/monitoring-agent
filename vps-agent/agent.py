@@ -1009,6 +1009,7 @@ def _probe_smart_status():
         return "N/A (Nebyly detekovány fyzické disky)", False
     failed = []
     unknown = []
+    timed_out = []
     for drive in drives:
         try:
             # -n standby: do not spin a sleeping drive up just to ask how it feels.
@@ -1017,7 +1018,10 @@ def _probe_smart_status():
         except FileNotFoundError:
             return "N/A (smartctl chybí)", False
         except subprocess.TimeoutExpired:
-            return f"N/A (SMART neodpověděl pro /dev/{drive})", False
+            # One slow drive is no verdict on the others: a failing one after
+            # it was never asked when this returned here.
+            timed_out.append(drive)
+            continue
         except Exception:
             unknown.append(drive)
             continue
@@ -1033,8 +1037,12 @@ def _probe_smart_status():
             unknown.append(drive)
     # A failing disk wins even when another gave no verdict - an early return
     # on the first silent drive used to hide the failing one behind it.
+    # A drive that timed out is asked again next run, so nothing is kept.
+    final = not timed_out
     if failed:
-        return "WARNING (Disk /dev/" + ", /dev/".join(failed) + " selhal v SMART)", True
+        return "WARNING (Disk /dev/" + ", /dev/".join(failed) + " selhal v SMART)", final
+    if timed_out:
+        return "N/A (SMART neodpověděl pro /dev/" + ", /dev/".join(timed_out) + ")", False
     if unknown:
         return "N/A (SMART nedostupné pro /dev/" + ", /dev/".join(unknown) + ")", True
     return "OK", True

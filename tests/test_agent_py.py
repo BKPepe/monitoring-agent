@@ -153,6 +153,15 @@ class SmartProbe(AgentTestCase):
         # R45: "OK" about no disk at all was drawn green, and kept for a day.
         self.assertEqual(self.probe([], {}), ("N/A (Nebyly detekovány fyzické disky)", False))
 
+    def test_a_timeout_does_not_stop_the_other_disks(self):
+        # R194: the first drive that timed out ended the check as N/A, and a
+        # failing drive after it was never asked.
+        slow = self.agent.subprocess.TimeoutExpired('smartctl', 20)
+        result, final = self.probe(['sda', 'sdb'], {'sda': slow, 'sdb': ('SMART overall-health: FAILED!', 8)})
+        self.assertEqual((result, final), ("WARNING (Disk /dev/sdb selhal v SMART)", False))
+        result, final = self.probe(['sda', 'sdb'], {'sda': slow, 'sdb': ('SMART overall-health: PASSED', 0)})
+        self.assertEqual((result, final), ("N/A (SMART neodpověděl pro /dev/sda)", False))
+
     def test_a_healthy_set_is_final(self):
         self.assertEqual(self.probe(['sda'], {'sda': ('SMART overall-health: PASSED', 0)}), ("OK", True))
 
