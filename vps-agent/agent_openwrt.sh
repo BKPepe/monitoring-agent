@@ -6585,36 +6585,68 @@ if [ "$http_code" = "200" ]; then
                     send_action_result "$act_id" "failed" "Odmitnuto: $act_refused"
                 elif [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
                     log_message "Aktivovana bezpecna vzdalena akce: $act_type (ID: $act_id)"
+                    # Every command's exit status decides the answer (R43).
+                    # It was "executed" with a success text whatever happened:
+                    # restart_wireguard on a router without wg0 reported
+                    # "WireGuard (wg0) restartovan", reconnect_pppoe on a DHCP
+                    # line "PPPoE znovu pripojeno". Success says "vyzadan(o)":
+                    # netifd took the request, the link itself comes up later
+                    # and the next report shows it. ifup always follows an
+                    # ifdown, failed or not, so a link is never left down by
+                    # the action itself. ifup and ifdown print "Interface X
+                    # not found" and exit 0 for an interface netifd does not
+                    # know (OpenWrt 24.10 and the snapshot, measured), so
+                    # netifd is asked first, with the same `ubus -S list`.
                     case "$act_type" in
-                        restart_wan)
-                            /sbin/ifdown wan >/dev/null 2>&1 || true
-                            sleep 2
-                            /sbin/ifup wan >/dev/null 2>&1 || true
-                            send_action_result "$act_id" "executed" "WAN restartovano"
-                            ;;
-                        restart_wireguard)
-                            /sbin/ifdown wg0 >/dev/null 2>&1 || true
-                            sleep 1
-                            /sbin/ifup wg0 >/dev/null 2>&1 || true
-                            send_action_result "$act_id" "executed" "WireGuard (wg0) restartovan"
+                        restart_wan|restart_wireguard|reconnect_pppoe)
+                            _act_if=wan; _act_wait=2; _act_ok="Restart WAN vyzadan (ifdown + ifup wan)"
+                            case "$act_type" in
+                                restart_wireguard) _act_if=wg0; _act_wait=1; _act_ok="Restart WireGuard (wg0) vyzadan" ;;
+                                reconnect_pppoe) _act_wait=3; _act_ok="Nove PPPoE spojeni vyzadano" ;;
+                            esac
+                            if [ "$act_type" = reconnect_pppoe ] && [ "$wan_proto" != pppoe ]; then
+                                send_action_result "$act_id" "failed" "WAN nema proto pppoe (ma '${wan_proto:-zadne}'), nic se nedelo"
+                            elif ! ubus -S list "network.interface.$_act_if" >/dev/null 2>&1; then
+                                send_action_result "$act_id" "failed" "Rozhrani $_act_if netifd nezna, nic se nedelo"
+                            else
+                                _act_rc1=0; _act_rc2=0
+                                /sbin/ifdown "$_act_if" >/dev/null 2>&1 || _act_rc1=$?
+                                sleep "$_act_wait"
+                                /sbin/ifup "$_act_if" >/dev/null 2>&1 || _act_rc2=$?
+                                if [ "$_act_rc1" = 0 ] && [ "$_act_rc2" = 0 ]; then
+                                    send_action_result "$act_id" "executed" "$_act_ok"
+                                else
+                                    log_message "VAROVANI: $act_type selhal: ifdown $_act_if rc=$_act_rc1, ifup $_act_if rc=$_act_rc2"
+                                    send_action_result "$act_id" "failed" "Selhalo: ifdown $_act_if rc=$_act_rc1, ifup $_act_if rc=$_act_rc2"
+                                fi
+                            fi
                             ;;
                         renew_dhcp)
-                            ubus call network.interface.wan renew >/dev/null 2>&1 || true
-                            send_action_result "$act_id" "executed" "DHCP najem na WAN obnoven"
-                            ;;
-                        reconnect_pppoe)
-                            /sbin/ifdown wan >/dev/null 2>&1 || true
-                            sleep 3
-                            /sbin/ifup wan >/dev/null 2>&1 || true
-                            send_action_result "$act_id" "executed" "PPPoE znovu pripojeno"
+                            if [ "$wan_proto" != dhcp ]; then
+                                send_action_result "$act_id" "failed" "WAN nema proto dhcp (ma '${wan_proto:-zadne}'), nic se nedelo"
+                            else
+                                _act_rc1=0
+                                ubus call network.interface.wan renew >/dev/null 2>&1 || _act_rc1=$?
+                                if [ "$_act_rc1" = 0 ]; then
+                                    send_action_result "$act_id" "executed" "Obnoveni DHCP najmu na WAN vyzadano"
+                                else
+                                    send_action_result "$act_id" "failed" "Selhalo: ubus renew rc=$_act_rc1"
+                                fi
+                            fi
                             ;;
                         restart_service)
                             # svc_name was read and checked by bk_action_gate.
                             # -f as well as -x: a directory passes -x.
                             if [ -n "$svc_name" ] && [ -f "/etc/init.d/$svc_name" ] && [ -x "/etc/init.d/$svc_name" ]; then
-                                /etc/init.d/"$svc_name" restart >/dev/null 2>&1 || true
-                                log_message "Restartovana sluzba: $svc_name"
-                                send_action_result "$act_id" "executed" "Sluzba '$svc_name' restartovana"
+                                _act_rc1=0
+                                /etc/init.d/"$svc_name" restart >/dev/null 2>&1 || _act_rc1=$?
+                                if [ "$_act_rc1" = 0 ]; then
+                                    log_message "Restartovana sluzba: $svc_name"
+                                    send_action_result "$act_id" "executed" "Restart sluzby '$svc_name' vyzadan"
+                                else
+                                    log_message "VAROVANI: Restart sluzby $svc_name skoncil chybou (rc=$_act_rc1)."
+                                    send_action_result "$act_id" "failed" "Restart sluzby '$svc_name' skoncil chybou (rc=$_act_rc1)"
+                                fi
                             else
                                 log_message "VAROVANI: Sluzba '$svc_name' nenalezena nebo neni spustitelna."
                                 send_action_result "$act_id" "failed" "Sluzba '$svc_name' nenalezena nebo neni spustitelna"
@@ -6624,7 +6656,7 @@ if [ "$http_code" = "200" ]; then
                             log_message "PROVADIM REBOOT ROUTERU DLE PODEPSANEHO POKYNU..."
                             # Potvrzeni musi odejit PRED rebootem - jakmile /sbin/reboot
                             # ukonci proces, uz se nic dalsiho neprovede.
-                            send_action_result "$act_id" "executed" "Router se restartuje"
+                            send_action_result "$act_id" "executed" "Reboot routeru vyzadan"
                             /sbin/reboot >/dev/null 2>&1 || true
                             ;;
                         *)

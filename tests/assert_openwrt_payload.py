@@ -902,7 +902,7 @@ checks = {
     "gap: a version change drops the relocated identity cache - and the stamp then reads the running version": text("w23_stamp.txt") == w18["version"] != "0.0.0",
     "gap: a version change drops every cache a new parser would read back (Wi-Fi, disks, SMART, WAN path, rates, the modem's session, the old speedtest state) - and nothing else: probe counters and unsent results stay": (text("w23_stale.txt") or "").splitlines() == [f"/tmp/status-agent-openwrt-private/{f}" for f in ("pending.state", "probe-out/1.json", "probe.attempts", "probe.count", "skipped")],
     # WAN e2e #19
-    "gap: remote actions - positive control: signed and allowed, restart_wan runs": act_calls.get("w19_1") == ["/sbin/ifdown wan", "/sbin/ifup wan"] and act_results.get("w19_1") == ["1|executed|WAN restartovano"],
+    "gap: remote actions - positive control: signed and allowed, restart_wan runs": act_calls.get("w19_1") == ["/sbin/ifdown wan", "/sbin/ifup wan"] and act_results.get("w19_1") == ["1|executed|Restart WAN vyzadan (ifdown + ifup wan)"],
     "gap: remote actions - what the agent signs is action|ts|nonce of the answer": signed.get("w19_1") == [f"action=restart_wan|ts={resp1['timestamp']}|nonce={resp1['nonce']}"],
     "gap: remote actions are single-use - the same nonce within 60 s is refused, no second ifdown": refused("w19_2", "nonce"),
     "gap: remote actions are allow-listed - signed reboot_router off the list is refused, no reboot": refused("w19_3", "ALLOWED_ACTIONS"),
@@ -911,12 +911,25 @@ checks = {
     "gap: remote actions - positive control: restart_service restarts a plain name (list written with a space)": act_calls.get("w19_6") == ["/etc/init.d/dnsmasq restart"] and act_results.get("w19_6", [""])[0].startswith("6|executed|"),
     "gap: remote actions are path-safe - service_name ../x is refused, nothing under init.d is called": refused("w19_7", "sluzby"),
     "gap: remote actions are allow-listed - an empty ALLOWED_ACTIONS allows nothing": refused("w19_8", "ALLOWED_ACTIONS"),
-    "gap: remote actions are allow-listed - a cfg without the line keeps the default list": act_results.get("w19_11") == ["11|executed|DHCP najem na WAN obnoven"],
-    "gap: remote actions are single-use - a nonce used 100 s ago is free again": act_results.get("w19_9") == ["9|executed|DHCP najem na WAN obnoven"],
+    "gap: remote actions are allow-listed - a cfg without the line keeps the default list": act_results.get("w19_11") == ["11|executed|Obnoveni DHCP najmu na WAN vyzadano"],
+    "gap: remote actions are single-use - a nonce used 100 s ago is free again": act_results.get("w19_9") == ["9|executed|Obnoveni DHCP najmu na WAN vyzadano"],
+    "actions: an interface netifd does not know is a failed action, nothing is run - ifup itself would exit 0 (w19_19, R43)":
+        act_calls.get("w19_19") == [] and act_results.get("w19_19") == ["19|failed|Rozhrani wg0 netifd nezna, nic se nedelo"],
+    "actions: a failing ifup is a failed action with both exit codes, and ifup still follows ifdown (w19_23, R43)":
+        act_calls.get("w19_23") == ["/sbin/ifdown wg0", "/sbin/ifup wg0"]
+        and act_results.get("w19_23") == ["23|failed|Selhalo: ifdown wg0 rc=0, ifup wg0 rc=1"],
+    "actions: reconnect_pppoe on a DHCP line runs nothing and says why (w19_20, R43)":
+        act_calls.get("w19_20") == [] and act_results.get("w19_20") == ["20|failed|WAN nema proto pppoe (ma 'dhcp'), nic se nedelo"],
+    "actions: a service whose restart fails is a failed action (w19_21, R43)":
+        act_calls.get("w19_21") == ["/etc/init.d/dnsmasq restart"]
+        and act_results.get("w19_21") == ["21|failed|Restart sluzby 'dnsmasq' skoncil chybou (rc=1)"],
+    "actions: a renew netifd refuses is a failed action (w19_22, R43)":
+        act_calls.get("w19_22") == ["ubus call network.interface.wan renew"]
+        and act_results.get("w19_22") == ["22|failed|Selhalo: ubus renew rc=4"],
     "gap: remote actions - a timestamp that is not a number runs nothing, signs nothing and does not end the run": text("w19_10_exit.txt") == "0" and act_calls.get("w19_10") == [] and act_results.get("w19_10") == [] and signed.get("w19_10") == [] and "arithmetic" not in (text("w19_10.err") or ""),
     "gap: private directory planted as a symlink in both places - replaced by a real 0700 directory, nothing written behind the link": text("wpriv_dirmode.txt") == "drwx------" and text("wpriv_mode.txt") == "-rw-------" and text("wpriv_planted.txt") == "" and load("wpriv.json").get("version") == d["version"],
     "gap: the response seam is read on one line, and that line asks for --dry-run": (text("seam_guard.txt") or "").splitlines() == ['[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_RESPONSE" ] && BK_TEST_RESPONSE="$STATUS_TEST_RESPONSE"'],
-    "gap: a run on a canned answer still prints the whole payload": all(load(f"w19_{i}.json").get("version") == d["version"] for i in range(1, 12)),
+    "gap: a run on a canned answer still prints the whole payload": all(load(f"w19_{i}.json").get("version") == d["version"] for i in (*range(1, 12), 19, 20, 21, 22, 23)),
 }
 
 # --- W1-C3: the error lines behind log_errors_24h (wlog1..wlog8) ---

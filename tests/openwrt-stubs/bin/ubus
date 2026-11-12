@@ -70,6 +70,13 @@ case "$*" in
     fi ;;
   # The values themselves come from jshn.sh (root cursor); generic, no identifiers.
   "call system board") echo '{"hostname":"turris","model":"Turris Omnia"}' ;;
+  # Does netifd know the interface: wan, lan and lte, and BK_STUB_IFACES.
+  "-S list network.interface."*)
+    case " wan lan lte $BK_STUB_IFACES " in *" ${3#network.interface.} "*) exit 0 ;; *) exit 4 ;; esac ;;
+  # The renew_dhcp action. It fails when BK_STUB_ACTION_FAIL names "renew".
+  "call network.interface.wan renew")
+    echo "ubus $*" >> /work/out/action_calls.log
+    case " $BK_STUB_ACTION_FAIL " in *" renew "*) exit 4 ;; esac ;;
   # dnsmasq's counters in ubus's pretty print, the first keys of the real
   # answer (OpenWrt 24.10 and the snapshot, measured).
   "call dnsmasq metrics")

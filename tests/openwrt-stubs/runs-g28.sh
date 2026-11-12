@@ -183,6 +183,20 @@ lz_run() {
 }
 lz_run w19_17 17 089
 lz_run w19_18 018 "$(date +%s)"
+# What a command answers decides the result (R43): a target that fails is
+# "failed" with its exit status, and an action meant for another protocol
+# runs nothing. The WAN here is DHCP (BK_STUB_WAN is unset).
+write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 'ALLOWED_ACTIONS="restart_wireguard,reconnect_pppoe,restart_service,renew_dhcp"'
+action_run w19_19 restart_wireguard a1b2c3d4e5f60019 0 ""      # no wg0 at all
+export BK_STUB_IFACES=wg0 BK_STUB_ACTION_FAIL=ifup
+action_run w19_23 restart_wireguard a1b2c3d4e5f60023 0 ""      # wg0, but ifup fails
+unset BK_STUB_IFACES BK_STUB_ACTION_FAIL
+action_run w19_20 reconnect_pppoe a1b2c3d4e5f60020 0 ""        # a DHCP line
+export BK_STUB_ACTION_FAIL=dnsmasq
+action_run w19_21 restart_service a1b2c3d4e5f60021 0 ',"service_name":"dnsmasq"'
+export BK_STUB_ACTION_FAIL=renew
+action_run w19_22 renew_dhcp a1b2c3d4e5f60022 0 ""
+unset BK_STUB_ACTION_FAIL
 # --- the private directory is checked, not assumed ----------------------
 # Both of its places planted as symlinks into a directory somebody else can
 # read: /var/run is refused, the /tmp fallback is replaced by a real 0700
