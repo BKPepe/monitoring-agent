@@ -130,6 +130,7 @@ wfw1, wfw2, wfw3, wfw4 = (payload(f"wfw{n}") for n in (1, 2, 3, 4))
 wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
+wstk = [payload(f"wstk{n}") for n in range(1, 4)]
 with open(f"{out}/wrss1.rss") as _f:
     wrss_mb = int(_f.read().strip()) / 1024
 
@@ -790,6 +791,9 @@ checks = {
     "top: busybox prints VSZ, the memory is the VmRSS of /proc/PID/status - and unknown for a process gone since (R258)":
         rss_rows(wrss1["top_ram_processes"]) == [{"name": "AdGuardHome", "ram_mb": "rss", "cpu": 50.0}]
         and rss_rows(wrss1["top_cpu_processes"]) == [{"name": "AdGuardHome", "cpu": 50.0, "ram_mb": "rss"}, {"name": "gone", "cpu": 40.0, "ram_mb": None}],
+    "speed: a result the server never confirms holds speedtest_active for one run, not for good (R198)":
+        [p["speedtest_active"] for p in wstk] == [True, False, True]
+        and [x["timestamp"] for x in wstk[2]["speedtests"]] == ["2026-09-21T00:05:00+02:00"],
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":

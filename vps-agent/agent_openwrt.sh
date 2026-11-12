@@ -2432,14 +2432,20 @@ speedtests_json="[]"
 speedtests_newest=""
 speed_listed=""
 # An INTERVAL flag: the report covers the last ~60 s, so a test that ended
-# half a minute ago still owns this report's CPU numbers. The file-name
-# format of the result files is not confirmed on hardware (data_dir was empty
-# when the router was read), so "new in this listing" alone sets it, which
-# errs towards skipping one alert evaluation rather than raising a false one.
+# half a minute ago still owns this report's CPU numbers. It is set by a file
+# newer than the newest one the PREVIOUS run listed (field 10 of the last
+# uplink ring line, see below). It was "any file not yet confirmed", and a
+# file the server never confirms - a result without speeds is never sent -
+# kept it true for good, while the server skipped CPU alerts, anomalies and
+# slow-DNS checks for every report. Without a usable previous run (the first
+# run, a gap, a reboot) there is nothing to compare with, and an unconfirmed
+# file sets it for that one run: that errs towards skipping one alert
+# evaluation rather than raising a false one.
 speedtest_active="false"
 if [ -d "$LIBRESPEED_DIR" ]; then
     last_sent=""
     [ -f "$LIBRESPEED_STATE_FILE" ] && IFS= read -r last_sent < "$LIBRESPEED_STATE_FILE" 2>/dev/null
+    bk_uptime_cs; _sp_up="$_up_cs"
 
     # ONE awk decides which files are opened at all. 0.1.6 ran basename + tr
     # per file per run (two forks each, on the whole directory) only to throw
@@ -2449,7 +2455,19 @@ if [ -d "$LIBRESPEED_DIR" ]; then
     # At most 50 per report and OLDEST first: a router that was offline for a
     # week catches up report by report instead of sending a 500-item payload
     # that the 64-key / 8 KB pass-through would shed.
-    speed_sel=$(find "$LIBRESPEED_DIR" -type f -name '*.json' 2>/dev/null | sort | awk -v last_sent="$last_sent" '
+    speed_sel=$(find "$LIBRESPEED_DIR" -type f -name '*.json' 2>/dev/null | sort | awk -v last_sent="$last_sent" \
+        -v ring="$BK_PRIVATE_DIR/uplink.ring" -v up="$_sp_up" '
+        # The previous run is the last line of the uplink ring, and only one
+        # of this boot from the last 150 s says what it listed - the rule the
+        # uplink evaluation below applies to the same line.
+        BEGIN {
+            while ((getline l < ring) > 0) if (l ~ /^[0-9]+[|]/ && index(l, ";") == 0) last = l;
+            close(ring);
+            if (last != "" && up != "") {
+                split(last, pv, "|");
+                if (pv[1] + 0 < up + 0 && up - pv[1] <= 15000) { known = 1; prev_listed = pv[10] }
+            }
+        }
         {
             n = split($0, p, "/"); base = p[n]; sub(/\.json$/, "", base);
             if (base == "") next;
@@ -2464,7 +2482,7 @@ if [ -d "$LIBRESPEED_DIR" ]; then
         END {
             # The newest name in the whole directory, sent or not, for the
             # uplink ring: a later result newer than it is a fresh one.
-            print (c ? 1 : 0) "|" nb;
+            print ((known ? (nb != "" && nb > prev_listed) : c) ? 1 : 0) "|" nb;
             for (i = 1; i <= c && i <= 50; i++) print path[i];
         }')
     speed_files=""

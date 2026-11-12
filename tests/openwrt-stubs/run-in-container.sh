@@ -334,6 +334,31 @@ STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wa
 # A test running right now writes no file yet: only pidof can see it.
 pl wactive
 BK_STUB_TEST_RUNNING=1 sh agent_openwrt.sh --dry-run > $OUT/wactive.json 2> $OUT/wactive.err
+# A file the server never confirms - a run that failed has no speeds and is
+# never sent - must not hold speedtest_active up for good (R198). wstk1 has
+# no previous run to compare with: true once. wstk2, a minute later, lists
+# nothing new: false. wstk3 finds a new result: true.
+fresh
+speed_file /srv/speedstuck "2026-09-21T00:00:00+02:00" <<'M'
+{"timestamp":"2026-09-21T00:00:00.000000000+02:00","error":"connection reset by peer"}
+M
+cp /tmp/fakeroot/proc/uptime /tmp/wstk-uptime.save
+bump_uptime() {
+    read -r _su _si < /tmp/fakeroot/proc/uptime
+    awk -v u="$_su" -v i="$_si" 'BEGIN { printf "%.2f %.2f\n", u + 60, i }' > /tmp/fakeroot/proc/uptime
+}
+pl wstk1
+BK_STUB_SPEED_DIR=/srv/speedstuck sh agent_openwrt.sh --dry-run > $OUT/wstk1.json 2> $OUT/wstk1.err
+bump_uptime
+pl wstk2
+BK_STUB_SPEED_DIR=/srv/speedstuck sh agent_openwrt.sh --dry-run > $OUT/wstk2.json 2> $OUT/wstk2.err
+speed_file /srv/speedstuck "2026-09-21T00:05:00+02:00" <<'M'
+[{"timestamp":"2026-09-21T00:05:00.000000000+02:00","server":{"name":"Brno"},"bytes_sent":1000,"bytes_received":2000,"ping":4.0,"jitter":0.5,"upload":50.5,"download":100.25}]
+M
+bump_uptime
+pl wstk3
+BK_STUB_SPEED_DIR=/srv/speedstuck sh agent_openwrt.sh --dry-run > $OUT/wstk3.json 2> $OUT/wstk3.err
+cp /tmp/wstk-uptime.save /tmp/fakeroot/proc/uptime
 
 # --- wupl1..wupl7: which uplink carried a speedtest (0.1.11) ----------------
 # The Turris cron test is not bound to the WAN and follows the default route,
