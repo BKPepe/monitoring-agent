@@ -127,9 +127,23 @@ if SELFCHECK:
     # Not needed to build a payload, and this output is not a report.
     AGENT_KEY = ""
 
+# Between-run state and caches live next to the script (a root-owned
+# directory), not in the world-writable /tmp where any local user could
+# pre-create them. Two exceptions: the read-only Docker mount, and an agent
+# running as a user who cannot write beside the script - there every state
+# write would fail silently and CPU, network and fork rate would stay null
+# forever, which is worse than the /tmp exposure. The fallback says so in
+# the log rather than degrading quietly. It covers the log and every
+# counter file: it used to cover only STATE_DIR, and the network, disk I/O
+# and fork counters and the log still tried the script's directory.
+if SELFCHECK:
+    STATE_DIR = _data_dir
+else:
+    STATE_DIR = '/tmp' if (DOCKER_MODE or not os.access(_script_dir, os.W_OK)) else _script_dir
+STATE_DIR_FALLBACK = STATE_DIR == '/tmp' and not DOCKER_MODE
+_data_dir = STATE_DIR
+
 LOG_FILE = os.path.join(_data_dir, 'agent.log')
-# V Docker režimu je adresář se skriptem připojený read-only, proto se stavový
-# soubor pro výpočet síťové propustnosti ukládá vždy do /tmp.
 # --dry-run / --print: collect, print the JSON to stdout, send nothing. A dry
 # run keeps its own state series (".dryrun" suffix): run by hand between two
 # cron ticks it used to overwrite the counters, and the next cron report
@@ -138,19 +152,6 @@ LOG_FILE = os.path.join(_data_dir, 'agent.log')
 DRY_RUN = '--dry-run' in sys.argv or '--print' in sys.argv or SELFCHECK
 _STATE_SUFFIX = '.dryrun' if DRY_RUN else ''
 NET_STATE_FILE = ('/tmp/status-agent-net.state' if DOCKER_MODE else os.path.join(_data_dir, 'agent_net.state')) + _STATE_SUFFIX
-
-# Between-run state and caches live next to the script (a root-owned
-# directory), not in the world-writable /tmp where any local user could
-# pre-create them. Two exceptions: the read-only Docker mount, and an agent
-# running as a user who cannot write beside the script - there every state
-# write would fail silently and CPU, network and fork rate would stay null
-# forever, which is worse than the /tmp exposure. The fallback says so in
-# the log rather than degrading quietly.
-if SELFCHECK:
-    STATE_DIR = _data_dir
-else:
-    STATE_DIR = '/tmp' if (DOCKER_MODE or not os.access(_script_dir, os.W_OK)) else _script_dir
-STATE_DIR_FALLBACK = STATE_DIR == '/tmp' and not DOCKER_MODE
 
 # Self-update bookkeeping sits next to the script itself and is named after
 # it, so agent.sh and agent.py installed in one directory never share a file.

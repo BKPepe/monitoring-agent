@@ -109,6 +109,24 @@ class Rules(AgentTestCase):
         self.assertFalse(ok('["python","0.1.4"]\n', "0.1.4"))
 
 
+class StateDirFallback(unittest.TestCase):
+    # R191: without write access beside the script, only STATE_DIR moved to
+    # /tmp; the log and the network, disk I/O and fork counters stayed.
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root writes anywhere')
+    def test_everything_moves_to_tmp(self):
+        d = tempfile.mkdtemp(prefix="bk-agent-ro.")
+        self.addCleanup(shutil.rmtree, d, True)
+        shutil.copy(AGENT_SRC, os.path.join(d, "agent.py"))
+        os.chmod(d, 0o555)
+        self.addCleanup(os.chmod, d, 0o755)
+        spec = importlib.util.spec_from_file_location("bk_agent_ro_" + uuid.uuid4().hex, os.path.join(d, "agent.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for path in (mod.LOG_FILE, mod.NET_STATE_FILE, mod.DISKIO_STATE_FILE, mod.FORKRATE_STATE_FILE):
+            self.assertTrue(path.startswith('/tmp/'), path)
+        self.assertTrue(mod.STATE_DIR_FALLBACK)
+
+
 class CpuTimes(AgentTestCase):
     # R196: the total is the eight time fields, steal included; guest and
     # guest_nice are already inside user and nice and were counted twice.
