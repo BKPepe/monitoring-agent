@@ -70,5 +70,11 @@ case "$*" in
     fi ;;
   # The values themselves come from jshn.sh (root cursor); generic, no identifiers.
   "call system board") echo '{"hostname":"turris","model":"Turris Omnia"}' ;;
+  # dnsmasq's counters in ubus's pretty print, the first keys of the real
+  # answer (OpenWrt 24.10 and the snapshot, measured).
+  "call dnsmasq metrics")
+    printf '{\n\t"dns_cache_inserted": 140,\n\t"dns_cache_live_freed": 0,\n\t"dns_queries_forwarded": 120,\n'
+    printf '\t"dns_auth_answered": 0,\n\t"dns_local_answered": 300,\n\t"dns_stale_answered": 5,\n'
+    printf '\t"dns_unanswered": 3,\n\t"dhcp_ack": 7\n}\n' ;;
   *) exit 1 ;;
 esac

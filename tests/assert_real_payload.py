@@ -83,8 +83,6 @@ NULL_OK = [
     ("openwrt-*", "speedtests", "no speedtest result on disk"),
     ("openwrt-*", "btrfs_errors", "no btrfs tool"),
     ("openwrt-*", "inode_usage", "the image's busybox df has no -i"),
-    ("openwrt-*", "dns_queries", "dnsmasq never writes /tmp/dnsmasq.stats, the only source"),
-    ("openwrt-*", "dns_cache_*", "dnsmasq never writes /tmp/dnsmasq.stats, the only source"),
     ("openwrt-*", "fw_rejected", "fw4's default reject rules carry no counter"),
     ("openwrt-*", "model", "no /tmp/sysinfo (preinit never ran) and no device tree on x86"),
     ("openwrt-*", "board_name", "no /tmp/sysinfo (preinit never ran) and no device tree on x86"),

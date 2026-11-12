@@ -129,6 +129,7 @@ wupl = {n: payload(f"wupl{n}") for n in (1, 3, 4, 6, 7)}
 wfw1, wfw2, wfw3, wfw4 = (payload(f"wfw{n}") for n in (1, 2, 3, 4))
 wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
+wdnsm = payload("wdnsm")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
 wpath1b, wpath1c = payload("wpath1b"), payload("wpath1c")
 wstk = [payload(f"wstk{n}") for n in range(1, 4)]
@@ -795,6 +796,11 @@ checks = {
         (wts1["tailscale_up"], wts1["tailscale_peers"]) == (True, 2) and (d["tailscale_up"], d["tailscale_peers"]) == (None, None),
     "dns: a Turris running Unbound is Unbound, though /etc/config/resolver is there (R75)":
         wdnsu["dns_engine"] == "Unbound",
+    "dns: dnsmasq's counters come from ubus - hits answered locally or stale, misses forwarded (R130)":
+        wdnsm["dns_engine"] == "Dnsmasq"
+        and (wdnsm["dns_queries"], wdnsm["dns_cache_hits"], wdnsm["dns_cache_misses"]) == (428, 305, 120),
+    "dns: with another resolver dnsmasq's counters are not sent - it only hands out DHCP there (R130)":
+        (wdnsu["dns_queries"], wdnsu["dns_cache_hits"], wdnsu["dns_cache_misses"]) == (None, None, None),
     "top: busybox prints VSZ, the memory is the VmRSS of /proc/PID/status - and unknown for a process gone since (R258)":
         rss_rows(wrss1["top_ram_processes"]) == [{"name": "AdGuardHome", "ram_mb": "rss", "cpu": 50.0}]
         and rss_rows(wrss1["top_cpu_processes"]) == [{"name": "AdGuardHome", "cpu": 50.0, "ram_mb": "rss"}, {"name": "gone", "cpu": 40.0, "ram_mb": None}],

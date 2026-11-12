@@ -586,6 +586,14 @@ PATH="/tmp/notop:$PATH" BK_STUB_PIDOF_RUNNING=unbound BK_STUB_RESOLVER=unbound \
     sh agent_openwrt.sh --dry-run > $OUT/wdnsu.json 2> $OUT/wdnsu.err
 rm -rf /etc/config/resolver /tmp/notop
 fresh
+# dnsmasq as the resolver: its counters come from ubus (R130). Without top
+# the agent asks pidof, whose stub says dnsmasq runs.
+mkdir -p /tmp/notop
+printf '#!/bin/sh\nexit 1\n' > /tmp/notop/top && chmod +x /tmp/notop/top
+pl wdnsm
+PATH="/tmp/notop:$PATH" BK_STUB_PIDOF_RUNNING=dnsmasq sh agent_openwrt.sh --dry-run > $OUT/wdnsm.json 2> $OUT/wdnsm.err
+rm -rf /tmp/notop
+fresh
 # Process memory is the resident set, never VSZ (R258). busybox top up to
 # 1.36 prints only VSZ: a real process gets a VSZ of 999m in a shadow top,
 # and its ram_mb must be the VmRSS of /proc/PID/status. PID 999999 is gone

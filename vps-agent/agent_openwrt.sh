@@ -2215,21 +2215,11 @@ fi
 #  výsledky vždy přepsala vylepšená verze níže, jen stály CPU navíc.)
 
 # --- DNS (dnsmasq stats) ---
+# Read from `ubus call dnsmasq metrics` once the DNS engine is known (see
+# below the resolver detection); null on a router whose DNS is not dnsmasq.
 dns_queries="null"
 dns_cache_hits="null"
 dns_cache_misses="null"
-if [ -f /tmp/dnsmasq.stats ]; then
-    dns_queries=$(awk '/queries received/ {print $1}' /tmp/dnsmasq.stats 2>/dev/null)
-    dns_cache_hits=$(awk '/cache hits/ {print $1}' /tmp/dnsmasq.stats 2>/dev/null)
-    dns_cache_misses=$(awk '/cache misses/ {print $1}' /tmp/dnsmasq.stats 2>/dev/null)
-fi
-# (dnsmasq never writes /tmp/dnsmasq.stats; SIGUSR1 makes it log its statistics
-#  to syslog. The old branch sent that signal every minute, which only filled
-#  the log buffer - and on Turris wrote to eMMC - without ever yielding a
-#  number. Without the stats file these stay null.)
-[ -z "$dns_queries" ] && dns_queries="null"
-[ -z "$dns_cache_hits" ] && dns_cache_hits="null"
-[ -z "$dns_cache_misses" ] && dns_cache_misses="null"
 
 # --- Firewall packet counters (iptables/nftables) ---
 fw_accepted="null"
@@ -4513,7 +4503,7 @@ bk_flat_json() {
     _fj=${_fj# }
     case "$_fj" in
         \"*) _fj=${_fj#\"}; _fj=${_fj%%\"*} ;;
-        *) _fj=${_fj%%[,\} ]*} ;;
+        *) _fj=${_fj%%[,\} $BK_TAB$BK_NL]*} ;;
     esac
 }
 if command -v uqmi >/dev/null 2>&1; then
@@ -5489,6 +5479,38 @@ elif bk_running dnsmasq; then
     dns_encryption="Nešifrované DNS (UDP/53)"
 elif [ "$dns_active_853" = "1" ]; then
     dns_encryption="DoT - ověřeno (aktivní spojení na port 853)"
+fi
+
+# dnsmasq's counters, when dnsmasq is the resolver (R130). They were read
+# from /tmp/dnsmasq.stats, which dnsmasq never writes, so the three keys,
+# their charts and the cache tile were always empty. OpenWrt's dnsmasq
+# answers `ubus call dnsmasq metrics` (24.10 and the snapshot, measured):
+# counters since its start, which the server charts as increases. Answered
+# locally - from the cache or local data - is a hit, and so is a stale
+# answer; a forwarded query is a miss; the total adds the authoritative
+# and the unanswered ones. On a Turris whose DNS is Knot Resolver or
+# Unbound, dnsmasq only hands out DHCP and its zeros would read as no
+# traffic: then nothing is asked.
+if [ "$dns_engine" = "Dnsmasq" ] && command -v ubus >/dev/null 2>&1; then
+    _dm=$(ubus call dnsmasq metrics 2>/dev/null)
+    bk_flat_json dns_queries_forwarded "$_dm"; _dm_fw=$_fj
+    bk_flat_json dns_local_answered "$_dm"; _dm_lo=$_fj
+    bk_flat_json dns_stale_answered "$_dm"; _dm_st=$_fj
+    bk_flat_json dns_auth_answered "$_dm"; _dm_au=$_fj
+    bk_flat_json dns_unanswered "$_dm"; _dm_un=$_fj
+    # The forwarded and the locally answered queries must be there; a
+    # counter this dnsmasq does not have counts 0.
+    _dm_ok=1
+    case "$_dm_fw" in ''|*[!0-9]*) _dm_ok=0 ;; esac
+    case "$_dm_lo" in ''|*[!0-9]*) _dm_ok=0 ;; esac
+    case "$_dm_st" in ''|*[!0-9]*) _dm_st=0 ;; esac
+    case "$_dm_au" in ''|*[!0-9]*) _dm_au=0 ;; esac
+    case "$_dm_un" in ''|*[!0-9]*) _dm_un=0 ;; esac
+    if [ "$_dm_ok" = 1 ]; then
+        dns_cache_hits=$((_dm_lo + _dm_st))
+        dns_cache_misses=$_dm_fw
+        dns_queries=$((_dm_fw + _dm_lo + _dm_st + _dm_au + _dm_un))
+    fi
 fi
 
 if [ -f /tmp/resolv.conf.auto ]; then
