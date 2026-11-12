@@ -134,6 +134,8 @@ wpath1b, wpath1c = payload("wpath1b"), payload("wpath1c")
 wstk = [payload(f"wstk{n}") for n in range(1, 4)]
 wmw = {m: payload(f"wmw-{m}") for m in ("balance", "failover", "down")}
 wsvc1 = payload("wsvc1")
+wqmi, wmm = payload("wqmi"), payload("wmm")
+uqmi_calls = log_lines("uqmi_calls.log")
 wsvc = {s["name"]: s for s in wsvc1["discovered_services"]}
 wsvc2 = {s["name"]: s for s in payload("wsvc2")["discovered_services"]}
 with open(f"{out}/wrss1.rss") as _f:
@@ -825,6 +827,11 @@ checks = {
     "discovery: no process is claimed for WireGuard and no port for Docker, so an imported check asks what really exists (R106)":
         (wsvc.get("WireGuard VPN", {}).get("process"), wsvc.get("WireGuard VPN", {}).get("port")) == ("", 51820)
         and (wsvc.get("Docker Engine", {}).get("process"), wsvc.get("Docker Engine", {}).get("port")) == ("dockerd", 0),
+    "lte: uqmi is asked on the qmi interface's device and its answer is read - signal, snr and operator (R107)":
+        (wqmi["lte_rsrp"], wqmi["lte_rsrq"], wqmi["lte_sinr"], wqmi["lte_carrier"]) == (-88, -9, 8.2, "Example Mobile")
+        and len(uqmi_calls) == 2 and all("-d /dev/cdc-wdm0" in c for c in uqmi_calls),
+    "lte: mmcli's signal-to-noise ratio is its s/n line (R107)":
+        (wmm["lte_rsrp"], wmm["lte_sinr"]) == (-88, 8),
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":

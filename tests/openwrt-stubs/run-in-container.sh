@@ -623,6 +623,18 @@ PATH="/tmp/rsstop:$PATH" sh agent_openwrt.sh --dry-run > $OUT/wrss2.json 2> $OUT
 kill "$_rss_pid" 2>/dev/null; wait "$_rss_pid" 2>/dev/null || true
 rm -rf /tmp/rsstop
 fresh
+# A QMI modem without ModemManager, and ModemManager (R107). uqmi answers
+# only with -d and the device the qmi interface names; mmcli prints the
+# signal-to-noise ratio as "s/n". Both override the HiLink values the stubs
+# answer in every run.
+mknod /dev/cdc-wdm0 c 180 176
+pl wqmi
+PATH="/work/stubs/modem-qmi:$PATH" sh agent_openwrt.sh --dry-run > $OUT/wqmi.json 2> $OUT/wqmi.err
+rm -f /dev/cdc-wdm0
+fresh
+pl wmm
+PATH="/work/stubs/modem-mm:$PATH" sh agent_openwrt.sh --dry-run > $OUT/wmm.json 2> $OUT/wmm.err
+fresh
 # mwan3's gateway is the one member of the policy the catch-all IPv4 rule
 # uses, and every interface keeps the state mwan3 names (R73).
 for _m in balance failover down; do

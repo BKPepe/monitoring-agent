@@ -55,9 +55,13 @@ case "$*" in
       "mwan3.default_rule_v4=rule" "mwan3.default_rule_v4.dest_ip='0.0.0.0/0'" \
       "mwan3.default_rule_v4.family='ipv4'" "mwan3.default_rule_v4.use_policy='$_pol'" ;;
   "show network")
-    # Service discovery: a WireGuard interface with its listen_port fixed,
-    # unless BK_STUB_WG_PORT=none (a client, whose port is random).
-    printf '%s\n' "network.wg0=interface" "network.wg0.proto='wireguard'"
+    # The QMI run (it alone has uqmi): the modem's interface, its device
+    # named before its proto, as uci may print them. Service discovery: a
+    # WireGuard interface with its listen_port fixed, unless
+    # BK_STUB_WG_PORT=none (a client, whose port is random).
+    printf '%s\n' "network.lte=interface" "network.lte.device='/dev/cdc-wdm0'" \
+      "network.lte.proto='qmi'" "network.lte.apn='internet'" \
+      "network.wg0=interface" "network.wg0.proto='wireguard'"
     [ "$BK_STUB_WG_PORT" = none ] || echo "network.wg0.listen_port='51820'" ;;
   "show dhcp") printf 'dhcp.@host[0]=host\ndhcp.@host[0].name=a\ndhcp.@host[1]=host\ndhcp.@host[2]=host\n' ;;
   *) exit 1 ;;

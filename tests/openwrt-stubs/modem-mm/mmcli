@@ -1,0 +1,18 @@
+#!/bin/sh
+# mmcli stub, on PATH only for the ModemManager run. The signal block is
+# mmcli's: the LTE signal-to-noise ratio is "s/n", not "sinr".
+case "$*" in
+  "-m any --signal-get"|"-m 0 --signal-get")
+    cat <<'M'
+  --------------------------
+  Signal |    refresh rate: 5 seconds
+  --------------------------
+  LTE    |            rssi: -60.00 dBm
+         |            rsrq: -9.00 dB
+         |            rsrp: -88.00 dBm
+         |             s/n: 8.00 dB
+M
+    ;;
+  -L) echo '    /org/freedesktop/ModemManager1/Modem/0 [Example] LTE Modem' ;;
+  *) exit 0 ;;
+esac

@@ -1,0 +1,23 @@
+#!/bin/sh
+# uqmi stub, on PATH only for the QMI run (PATH=/work/stubs/modem-qmi:...),
+# so no other run takes the uqmi branch. Like the real uqmi it answers only
+# with its control device named (-d), and an option it does not know is an
+# error.
+echo "$*" >> /work/out/uqmi_calls.log 2>/dev/null
+_dev=""; _cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d) _dev="$2"; shift ;;
+    -t) shift ;;
+    -s) ;;
+    --get-signal-info|--get-serving-system) _cmd="$1" ;;
+    *) echo "uqmi: unrecognized option '$1'" >&2; exit 1 ;;
+  esac
+  shift
+done
+[ "$_dev" = /dev/cdc-wdm0 ] || exit 1
+case "$_cmd" in
+  --get-signal-info) echo '{"type":"lte","rssi":-60,"rsrq":-9,"rsrp":-88,"snr":8.200000}' ;;
+  --get-serving-system) echo '{"registration":"registered","plmn_mcc":230,"plmn_mnc":1,"plmn_description":"Example Mobile","roaming":false}' ;;
+  *) exit 1 ;;
+esac

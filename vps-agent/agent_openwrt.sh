@@ -4447,23 +4447,55 @@ fi
 # Zadna inicializace na null: ta je nahore pred HiLink blokem. Tady se
 # hodnota prepise jen tehdy, kdyz uqmi/mmcli opravdu neco vrati - jinak by
 # router s HiLink modemem a bez techto nastroju o signal prisel.
+#
+# uqmi talks to ONE control device and needs it named (-d); every call
+# without it failed, and --get-network-registration is no uqmi command, so a
+# QMI modem without ModemManager never had a signal or an operator (R107).
+# The device is the one a 'qmi' interface of /etc/config/network names, so
+# an MBIM or AT modem on another cdc-wdm is never asked in a protocol it
+# does not speak. -t bounds each request: uqmi waits for the modem's answer
+# without a limit of its own. The band is not in --get-signal-info.
+#
+# -s prints one flat object, {"type":"lte","rsrp":-88,"snr":8.200000},
+# read here by key like the rest of the agent reads JSON - not with
+# jsonfilter, which no test image carries (X5). bk_flat_json KEY TEXT ->
+# $_fj, the value without quotes, "" when the key is not there.
+bk_flat_json() {
+    _fj=""
+    case "$2" in *"\"$1\":"*) ;; *) return 0 ;; esac
+    _fj=${2#*\"$1\":}
+    _fj=${_fj# }
+    case "$_fj" in
+        \"*) _fj=${_fj#\"}; _fj=${_fj%%\"*} ;;
+        *) _fj=${_fj%%[,\} ]*} ;;
+    esac
+}
 if command -v uqmi >/dev/null 2>&1; then
-    lte_signal=$(uqmi --get-signal-info 2>/dev/null)
-    if [ -n "$lte_signal" ]; then
-        _q=$(echo "$lte_signal" | jsonfilter -e '@.rsrp' 2>/dev/null); [ -n "$_q" ] && lte_rsrp="$_q"
-        _q=$(echo "$lte_signal" | jsonfilter -e '@.rsrq' 2>/dev/null); [ -n "$_q" ] && lte_rsrq="$_q"
+    _qmi_dev=$(uci -q show network 2>/dev/null | awk -F= '
+        $1 ~ /[.]proto$/ && $2 == "'"'qmi'"'" { q[substr($1, 1, length($1) - 6)] = 1 }
+        $1 ~ /[.]device$/ { v = $2; gsub(/'"'"'/, "", v); d[substr($1, 1, length($1) - 7)] = v }
+        END { for (s in q) if (s in d) { print d[s]; exit } }')
+    case "$_qmi_dev" in
+        /dev/*) case "$_qmi_dev" in *[!A-Za-z0-9/_.-]*) _qmi_dev="" ;; esac ;;
+        *) _qmi_dev="" ;;
+    esac
+    if [ -n "$_qmi_dev" ] && [ -c "$_qmi_dev" ]; then
+        lte_signal=$(uqmi -s -t 3000 -d "$_qmi_dev" --get-signal-info 2>/dev/null)
         # uqmi calls it "snr"; the old "sinr" key never existed in its output.
-        _q=$(echo "$lte_signal" | jsonfilter -e '@.snr' 2>/dev/null); [ -n "$_q" ] && lte_sinr="$_q"
-        _q=$(echo "$lte_signal" | jsonfilter -e '@.band' 2>/dev/null); [ -n "$_q" ] && lte_band="$_q"
+        for _q in rsrp:lte_rsrp rsrq:lte_rsrq snr:lte_sinr; do
+            bk_flat_json "${_q%%:*}" "$lte_signal"
+            case "$_fj" in ''|*[!0-9.-]*) ;; *) eval "${_q#*:}=\$_fj" ;; esac
+        done
+        bk_flat_json plmn_description "$(uqmi -s -t 3000 -d "$_qmi_dev" --get-serving-system 2>/dev/null)"
+        [ -n "$_fj" ] && lte_carrier="$_fj"
     fi
-    _q=$(uqmi --get-network-registration 2>/dev/null | jsonfilter -e '@.description' 2>/dev/null)
-    [ -n "$_q" ] && lte_carrier="$_q"
 elif command -v mmcli >/dev/null 2>&1; then
+    # mmcli prints the LTE signal-to-noise ratio as "s/n:", never "sinr".
     mm_out=$(mmcli -m any --signal-get 2>/dev/null)
     if [ -n "$mm_out" ]; then
         _q=$(echo "$mm_out" | grep -i "rsrp" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}'); [ -n "$_q" ] && lte_rsrp="$_q"
         _q=$(echo "$mm_out" | grep -i "rsrq" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}'); [ -n "$_q" ] && lte_rsrq="$_q"
-        _q=$(echo "$mm_out" | grep -i "sinr" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}'); [ -n "$_q" ] && lte_sinr="$_q"
+        _q=$(echo "$mm_out" | grep -i "s/n:" | awk -F: '{gsub(/[^0-9.-]/, "", $2); print $2}'); [ -n "$_q" ] && lte_sinr="$_q"
     fi
 fi
 # Fallback: Turris/OpenWrt s ModemManager pres ubus, kdyz uqmi/mmcli chybi
@@ -4476,7 +4508,7 @@ if [ "$lte_rsrp" = "null" ] || [ -z "$lte_rsrp" ]; then
             [ -n "$mm_sig" ] && {
                 lte_rsrp=$(echo "$mm_sig" | sed -n 's/.*rsrp:[[:space:]]*\(-\?[0-9.]*\).*/\1/p' | head -1)
                 lte_rsrq=$(echo "$mm_sig" | sed -n 's/.*rsrq:[[:space:]]*\(-\?[0-9.]*\).*/\1/p' | head -1)
-                lte_sinr=$(echo "$mm_sig" | sed -n 's/.*snr:[[:space:]]*\(-\?[0-9.]*\).*/\1/p' | head -1)
+                lte_sinr=$(echo "$mm_sig" | sed -n 's|.*s/n:[[:space:]]*\(-\?[0-9.]*\).*|\1|p' | head -1)
             }
             mm_info=$(mmcli -m "$mm_id" 2>/dev/null)
             [ -n "$mm_info" ] && {
