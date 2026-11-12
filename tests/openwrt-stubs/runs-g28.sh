@@ -97,29 +97,41 @@ for _t in /sbin/ifdown /sbin/ifup /sbin/reboot /etc/init.d/dnsmasq /etc/x; do
     cp /work/stubs/action-target.sh "$_t"; chmod +x "$_t"
 done
 SIG=5f1d0c2e9a7b4d3c8e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d
+# The harness signs with the agent's own bk_hmac_sha256, cut out by name:
+# that is only an oracle because its vectors are checked against Python's
+# hmac (hmac_vectors.txt -> hmac_vectors.out, assert_openwrt_payload.py).
+sed -n '/^bk_hmac_sha256() {/,/^}/p' agent_openwrt.sh > /tmp/hmac_fn.sh
+. /tmp/hmac_fn.sh
+while IFS='	' read -r _vk _vm; do
+    bk_hmac_sha256 "$_vk" "$_vm" || _hm=FAILED
+    printf '%s\n' "$_hm"
+done < /work/stubs/hmac_vectors.txt > $OUT/hmac_vectors.out
 # action_run TAG ACTION NONCE TS_OFFSET EXTRA_JSON: writes the answer at run
-# time (the agent's 30 s window is real), runs the agent on it and files the
-# calls and results under TAG. BK_STUB_HMAC is what the openssl stub "computes".
+# time (the agent's 30 s window is real), signed with SIGN_KEY (the key in
+# agent_openwrt.cfg unless a run says otherwise), runs the agent on it and
+# files the calls and results under TAG.
+SIGN_KEY=SECRETKEY123
 action_run() {
     _tag="$1"; _resp="$OUT/$1.resp"
     _ts=$(( $(date +%s) + $4 ))
+    bk_hmac_sha256 "$SIGN_KEY" "action=$2|ts=$_ts|nonce=$3"
     printf '200\n{"success":true,"pending_action":{"action_id":%s,"action":"%s","timestamp":%s,"nonce":"%s","signature":"%s"%s}}\n' \
-        "${_tag#w19_}" "$2" "$_ts" "$3" "$SIG" "$5" > "$_resp"
+        "${_tag#w19_}" "$2" "$_ts" "$3" "$_hm" "$5" > "$_resp"
     echo "# $_tag" >> $OUT/action_calls.log
     echo "# $_tag" >> $OUT/action_results.log
-    echo "# $_tag ts=$_ts" >> $OUT/openssl_calls.log
+    echo "# $_tag ts=$_ts" >> $OUT/sha256sum_calls.log
     pl "$_tag"
     STATUS_TEST_RESPONSE="$_resp" sh agent_openwrt.sh --dry-run > "$OUT/$_tag.json" 2>"$OUT/$_tag.err"
+    echo "# end" >> $OUT/sha256sum_calls.log
     cat "$_resp.results" >> $OUT/action_results.log 2>/dev/null || true
 }
-export BK_STUB_HMAC="$SIG"
 write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 ALLOWED_ACTIONS=restart_wan
 action_run w19_1 restart_wan a1b2c3d4e5f60001 0 ""            # positive control
 action_run w19_2 restart_wan a1b2c3d4e5f60001 0 ""            # the same nonce again
 action_run w19_3 reboot_router a1b2c3d4e5f60003 0 ""          # signed, not on the list
-export BK_STUB_HMAC=0000
-action_run w19_4 restart_wan a1b2c3d4e5f60004 0 ""            # wrong signature
-export BK_STUB_HMAC="$SIG"
+SIGN_KEY=SECRETKEY124
+action_run w19_4 restart_wan a1b2c3d4e5f60004 0 ""            # signed with another key
+SIGN_KEY=SECRETKEY123
 action_run w19_5 restart_wan a1b2c3d4e5f60005 -100 ""         # signed, 100 s old
 write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 'ALLOWED_ACTIONS="restart_wan, restart_service"'
 action_run w19_6 restart_service a1b2c3d4e5f60006 0 ',"service_name":"dnsmasq"'   # positive control
@@ -140,10 +152,11 @@ action_run w19_11 renew_dhcp a1b2c3d4e5f60011 0 ""
 # neither act on it nor die of it - the exit code is kept for the assertion.
 write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 ALLOWED_ACTIONS=restart_wan
 printf '200\n{"success":true,"pending_action":{"action_id":10,"action":"restart_wan","timestamp":12abc,"nonce":"a1b2c3d4e5f60010","signature":"%s"}}\n' "$SIG" > $OUT/w19_10.resp
-for _log in action_calls action_results openssl_calls; do echo "# w19_10" >> $OUT/$_log.log; done
+for _log in action_calls action_results sha256sum_calls; do echo "# w19_10" >> $OUT/$_log.log; done
 _rc=0
 pl w19_10
 STATUS_TEST_RESPONSE="$OUT/w19_10.resp" sh agent_openwrt.sh --dry-run > $OUT/w19_10.json 2>$OUT/w19_10.err || _rc=$?
+echo "# end" >> $OUT/sha256sum_calls.log
 echo "$_rc" > $OUT/w19_10_exit.txt
 cat $OUT/w19_10.resp.results >> $OUT/action_results.log 2>/dev/null || true
 # W1-C: the service-name rule all four agents share,
@@ -161,10 +174,11 @@ action_run w19_15 restart_service a1b2c3d4e5f60015 0 ',"service_name":"a b"'
 # before any use, like the letters of w19_10.
 write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 ALLOWED_ACTIONS=restart_wan
 printf '200\n{"success":true,"pending_action":{"action_id":16,"action":"restart_wan","timestamp":1234567890123456789,"nonce":"a1b2c3d4e5f60016","signature":"%s"}}\n' "$SIG" > $OUT/w19_16.resp
-for _log in action_calls action_results openssl_calls; do echo "# w19_16" >> $OUT/$_log.log; done
+for _log in action_calls action_results sha256sum_calls; do echo "# w19_16" >> $OUT/$_log.log; done
 _rc=0
 pl w19_16
 STATUS_TEST_RESPONSE="$OUT/w19_16.resp" sh agent_openwrt.sh --dry-run > $OUT/w19_16.json 2>$OUT/w19_16.err || _rc=$?
+echo "# end" >> $OUT/sha256sum_calls.log
 echo "$_rc" > $OUT/w19_16_exit.txt
 cat $OUT/w19_16.resp.results >> $OUT/action_results.log 2>/dev/null || true
 # Digits only, but a leading zero: ash reads 089 as a bad octal constant, and
@@ -174,15 +188,31 @@ cat $OUT/w19_16.resp.results >> $OUT/action_results.log 2>/dev/null || true
 # lz_run TAG ACTION_ID TIMESTAMP: one such answer, by hand like w19_10.
 lz_run() {
     printf '200\n{"success":true,"pending_action":{"action_id":%s,"action":"restart_wan","timestamp":%s,"nonce":"a1b2c3d4e5f600%s","signature":"%s"}}\n' "$2" "$3" "${1#w19_}" "$SIG" > "$OUT/$1.resp"
-    for _log in action_calls action_results openssl_calls; do echo "# $1" >> "$OUT/$_log.log"; done
+    for _log in action_calls action_results sha256sum_calls; do echo "# $1" >> "$OUT/$_log.log"; done
     _rc=0
     pl "$1"
     STATUS_TEST_RESPONSE="$OUT/$1.resp" sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2>"$OUT/$1.err" || _rc=$?
+    echo "# end" >> "$OUT/sha256sum_calls.log"
     echo "$_rc" > "$OUT/$1_exit.txt"
     cat "$OUT/$1.resp.results" >> $OUT/action_results.log 2>/dev/null || true
 }
 lz_run w19_17 17 089
 lz_run w19_18 018 "$(date +%s)"
+# A sha256sum that answers no digest: the agent computes no signature, so it
+# refuses the action with that reason instead of calling it a bad one, runs
+# nothing and burns no nonce (R259). The harness signs with the real one.
+write_cfg SECRETKEY123 REMOTE_ACTIONS_ENABLED=1 ALLOWED_ACTIONS=restart_wan
+mkdir -p /tmp/badsum && printf '#!/bin/sh\necho garbage\n' > /tmp/badsum/sha256sum && chmod +x /tmp/badsum/sha256sum
+_ts=$(date +%s)
+bk_hmac_sha256 SECRETKEY123 "action=restart_wan|ts=$_ts|nonce=a1b2c3d4e5f60024"
+printf '200\n{"success":true,"pending_action":{"action_id":24,"action":"restart_wan","timestamp":%s,"nonce":"a1b2c3d4e5f60024","signature":"%s"}}\n' "$_ts" "$_hm" > $OUT/w19_24.resp
+for _log in action_calls action_results sha256sum_calls; do echo "# w19_24" >> $OUT/$_log.log; done
+pl w19_24
+PATH="/tmp/badsum:$PATH" STATUS_TEST_RESPONSE="$OUT/w19_24.resp" sh agent_openwrt.sh --dry-run > $OUT/w19_24.json 2>$OUT/w19_24.err
+echo "# end" >> $OUT/sha256sum_calls.log
+cat $OUT/w19_24.resp.results >> $OUT/action_results.log 2>/dev/null || true
+grep -c a1b2c3d4e5f60024 "$PRIV/action-nonces" > $OUT/w19_24_nonce.txt 2>/dev/null || echo 0 > $OUT/w19_24_nonce.txt
+rm -rf /tmp/badsum
 # What a command answers decides the result (R43): a target that fails is
 # "failed" with its exit status, and an action meant for another protocol
 # runs nothing. The WAN here is DHCP (BK_STUB_WAN is unset).

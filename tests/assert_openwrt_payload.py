@@ -83,7 +83,20 @@ def load_kept(name):
 w18_kept, w18b_kept = load_kept("w18_last_payload.json"), load_kept("w18b_last_payload.json")
 act_calls = by_run("action_calls.log")
 act_results = by_run("action_results.log")
-signed = by_run("openssl_calls.log")
+# The agent's sha256sum calls per remote-action run: an HMAC it computed is
+# two of them (inner and outer pass), an answer refused before any
+# signature none.
+signed = by_run("sha256sum_calls.log")
+# The agent's HMAC, cut out of it by name and run on busybox in the
+# container (hmac_vectors.out), against Python's hmac: the harness signs
+# with that function, so these vectors are what make it an oracle. Keys
+# with a "6" or a "\" (a NUL byte in a pad), of 1, 64, 65 and 112 bytes,
+# two that differ only in the last byte, a quote, UTF-8.
+import hmac as _hmac
+import hashlib as _hashlib
+_vec = [l.rstrip("\n").split("\t", 1) for l in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "openwrt-stubs", "hmac_vectors.txt"), encoding="utf-8")]
+hmac_expected = [_hmac.new(k.encode(), m.encode(), _hashlib.sha256).hexdigest() for k, m in _vec]
+hmac_got = (text("hmac_vectors.out") or "").split()
 resp1 = json.loads(open(f"{out}/w19_1.resp").read().split("\n", 1)[1])["pending_action"]
 
 def refused(tag, reason):
@@ -903,10 +916,10 @@ checks = {
     "gap: a version change drops every cache a new parser would read back (Wi-Fi, disks, SMART, WAN path, rates, the modem's session, the old speedtest state) - and nothing else: probe counters and unsent results stay": (text("w23_stale.txt") or "").splitlines() == [f"/tmp/status-agent-openwrt-private/{f}" for f in ("pending.state", "probe-out/1.json", "probe.attempts", "probe.count", "skipped")],
     # WAN e2e #19
     "gap: remote actions - positive control: signed and allowed, restart_wan runs": act_calls.get("w19_1") == ["/sbin/ifdown wan", "/sbin/ifup wan"] and act_results.get("w19_1") == ["1|executed|Restart WAN vyzadan (ifdown + ifup wan)"],
-    "gap: remote actions - what the agent signs is action|ts|nonce of the answer": signed.get("w19_1") == [f"action=restart_wan|ts={resp1['timestamp']}|nonce={resp1['nonce']}"],
+    "gap: remote actions - the agent signs action|ts|nonce of the answer: signed so by the harness it runs (w19_1), with one HMAC of two passes": signed.get("w19_1") == ["call ", "call "] and act_results.get("w19_1", [""])[0].startswith("1|executed|"),
     "gap: remote actions are single-use - the same nonce within 60 s is refused, no second ifdown": refused("w19_2", "nonce"),
     "gap: remote actions are allow-listed - signed reboot_router off the list is refused, no reboot": refused("w19_3", "ALLOWED_ACTIONS"),
-    "gap: remote actions - a wrong signature runs nothing": refused("w19_4", "HMAC"),
+    "gap: remote actions - a signature made with another key runs nothing": refused("w19_4", "HMAC") and signed.get("w19_4") == ["call ", "call "],
     "gap: remote actions - a signature 100 s old runs nothing and is not even checked": refused("w19_5", "30s") and signed.get("w19_5") == [],
     "gap: remote actions - positive control: restart_service restarts a plain name (list written with a space)": act_calls.get("w19_6") == ["/etc/init.d/dnsmasq restart"] and act_results.get("w19_6", [""])[0].startswith("6|executed|"),
     "gap: remote actions are path-safe - service_name ../x is refused, nothing under init.d is called": refused("w19_7", "sluzby"),
@@ -926,10 +939,15 @@ checks = {
     "actions: a renew netifd refuses is a failed action (w19_22, R43)":
         act_calls.get("w19_22") == ["ubus call network.interface.wan renew"]
         and act_results.get("w19_22") == ["22|failed|Selhalo: ubus renew rc=4"],
+    "actions: the agent's HMAC-SHA256 is RFC 2104 - ten vectors on busybox equal Python's hmac, and different keys give different MACs (R259)":
+        len(hmac_got) == len(hmac_expected) == 10 and hmac_got == hmac_expected and len(set(hmac_got)) == 10,
+    "actions: a sha256sum that gives no digest is no verdict on the signature - refused with that reason, nothing run, no nonce burnt (w19_24, R259)":
+        act_calls.get("w19_24") == [] and text("w19_24_nonce.txt") == "0"
+        and act_results.get("w19_24") == ["24|failed|Podpis nelze overit: sha256sum nebo hexdump na routeru chybi nebo nefunguje"],
     "gap: remote actions - a timestamp that is not a number runs nothing, signs nothing and does not end the run": text("w19_10_exit.txt") == "0" and act_calls.get("w19_10") == [] and act_results.get("w19_10") == [] and signed.get("w19_10") == [] and "arithmetic" not in (text("w19_10.err") or ""),
     "gap: private directory planted as a symlink in both places - replaced by a real 0700 directory, nothing written behind the link": text("wpriv_dirmode.txt") == "drwx------" and text("wpriv_mode.txt") == "-rw-------" and text("wpriv_planted.txt") == "" and load("wpriv.json").get("version") == d["version"],
     "gap: the response seam is read on one line, and that line asks for --dry-run": (text("seam_guard.txt") or "").splitlines() == ['[ "$DRY_RUN" = "1" ] && [ -n "$STATUS_TEST_RESPONSE" ] && BK_TEST_RESPONSE="$STATUS_TEST_RESPONSE"'],
-    "gap: a run on a canned answer still prints the whole payload": all(load(f"w19_{i}.json").get("version") == d["version"] for i in (*range(1, 12), 19, 20, 21, 22, 23)),
+    "gap: a run on a canned answer still prints the whole payload": all(load(f"w19_{i}.json").get("version") == d["version"] for i in (*range(1, 12), 19, 20, 21, 22, 23, 24)),
 }
 
 # --- W1-C3: the error lines behind log_errors_24h (wlog1..wlog8) ---

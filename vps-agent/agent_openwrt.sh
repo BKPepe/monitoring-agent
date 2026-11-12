@@ -6356,6 +6356,46 @@ else
     exit 1
 fi
 
+# bk_hmac_sha256 KEY MESSAGE -> $_hm: HMAC-SHA256 (RFC 2104) as 64 hex
+# digits, "" when it cannot be computed. Only busybox applets every OpenWrt
+# has - sha256sum and hexdump - because a stock OpenWrt has no openssl CLI
+# (24.10 and the snapshot, measured), and the openssl call refused every
+# remote action as "Neplatny HMAC podpis" there (R259). The key is in no
+# argv: it reaches hexdump on stdin, and both pads are printf FORMATs, three-
+# digit octal escapes (printf is a builtin; a NUL byte comes out as one). A
+# key longer than the 64-byte block is its own digest first. The test
+# vectors in tests/openwrt-stubs/hmac_vectors.txt are checked against
+# Python's hmac on busybox 1.36 by the e2e.
+bk_hmac_sha256() {
+    _hm=""
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    command -v hexdump >/dev/null 2>&1 || return 1
+    _hk=$(printf '%s' "$1" | hexdump -v -e '1/1 "%02x"')
+    if [ ${#_hk} -gt 128 ]; then
+        _hk=$(printf '%s' "$1" | sha256sum); _hk=${_hk%% *}
+    fi
+    case "$_hk" in *[!0-9a-f]*) return 1 ;; esac
+    _hi=""; _ho=""; _hn=0
+    while [ "$_hn" -lt 64 ]; do
+        _hb=0
+        if [ -n "$_hk" ]; then _hb=$((0x${_hk%"${_hk#??}"})); _hk=${_hk#??}; fi
+        _hx=$((_hb ^ 54)); _hi="$_hi\\$((_hx >> 6))$(((_hx >> 3) & 7))$((_hx & 7))"
+        _hx=$((_hb ^ 92)); _ho="$_ho\\$((_hx >> 6))$(((_hx >> 3) & 7))$((_hx & 7))"
+        _hn=$((_hn + 1))
+    done
+    _hd=$({ printf "$_hi"; printf '%s' "$2"; } | sha256sum); _hd=${_hd%% *}
+    case "$_hd" in *[!0-9a-f]*) return 1 ;; esac
+    [ ${#_hd} -eq 64 ] || return 1
+    _he=""
+    while [ -n "$_hd" ]; do
+        _hx=$((0x${_hd%"${_hd#??}"})); _hd=${_hd#??}
+        _he="$_he\\$((_hx >> 6))$(((_hx >> 3) & 7))$((_hx & 7))"
+    done
+    _hm=$({ printf "$_ho"; printf "$_he"; } | sha256sum); _hm=${_hm%% *}
+    case "$_hm" in *[!0-9a-f]*) _hm=""; return 1 ;; esac
+    [ ${#_hm} -eq 64 ] || { _hm=""; return 1; }
+}
+
 if [ "$http_code" = "200" ]; then
     log_debug "OK: Statistiky uspesne odeslany."
     # W1-B: a normal run pays three `[ ]` tests here, nothing else.
@@ -6570,20 +6610,23 @@ if [ "$http_code" = "200" ]; then
             if [ $time_diff -le 30 ]; then
                 calc_str="action=${act_type}|ts=${act_ts}|nonce=${act_nonce}"
                 calc_sig=""
-                if command -v openssl >/dev/null 2>&1; then
-                    calc_sig=$(printf '%s' "$calc_str" | openssl dgst -sha256 -hmac "$AGENT_KEY" 2>/dev/null | awk '{print $NF}')
-                fi
-                
+                bk_hmac_sha256 "$AGENT_KEY" "$calc_str" && calc_sig=$_hm
+
                 act_refused=""
                 # The gate only ever sees a verified signature: an unsigned
                 # answer learns nothing about the list and burns no nonce.
                 if [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
                     bk_action_gate
                 fi
-                if [ -n "$act_refused" ]; then
+                if [ -z "$calc_sig" ]; then
+                    # Fail closed, and say so: no signature computed is no
+                    # verdict on the server's one, and no nonce is burnt.
+                    log_message "VAROVANI: Vzdalenou akci $act_type (ID: $act_id) nelze overit - sha256sum nebo hexdump chybi nebo nefunguje."
+                    send_action_result "$act_id" "failed" "Podpis nelze overit: sha256sum nebo hexdump na routeru chybi nebo nefunguje"
+                elif [ -n "$act_refused" ]; then
                     log_message "VAROVANI: Odmitnuta vzdalena akce $act_type (ID: $act_id): $act_refused"
                     send_action_result "$act_id" "failed" "Odmitnuto: $act_refused"
-                elif [ -n "$calc_sig" ] && [ "$calc_sig" = "$act_sig" ]; then
+                elif [ "$calc_sig" = "$act_sig" ]; then
                     log_message "Aktivovana bezpecna vzdalena akce: $act_type (ID: $act_id)"
                     # Every command's exit status decides the answer (R43).
                     # It was "executed" with a success text whatever happened:

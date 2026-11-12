@@ -1,0 +1,7 @@
+#!/bin/sh
+# sha256sum as busybox computes it, with each call logged (arguments only;
+# stdin is a pad of the key during an HMAC): the remote-action runs count
+# the agent's HMAC passes this way - two for a signature it checked, none
+# when it refused the answer before any signature.
+echo "call $*" >> /work/out/sha256sum_calls.log
+exec /bin/busybox sha256sum "$@"
