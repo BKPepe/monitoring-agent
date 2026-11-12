@@ -948,6 +948,10 @@ except Exception:
     sys.exit(1)
 sock.settimeout(5)
 buf = ""
+# Every command ends with its own "error id=" line: "use port=N" answers
+# its ok before serverinfo says anything, so reading stops only after the
+# last command answered (or the server closed after quit).
+want = len([l for l in os.environ["BK_TS3_CMD"].split("\n") if l.strip()])
 try:
     sock.sendall((os.environ["BK_TS3_CMD"] + "\nquit\n").encode())
     while True:
@@ -955,7 +959,7 @@ try:
         if not chunk:
             break
         buf += chunk.decode("utf-8", "replace")
-        if "error id=" in buf:
+        if buf.count("error id=") >= want:
             break
 except Exception:
     pass

@@ -36,8 +36,10 @@ PATH="/agent/nopython:$PATH" bash agent.sh --dry-run > /work/out/sh3.json 2>/wor
 
 kill "$ts3_pid" 2>/dev/null || true
 
-# A stopped virtual server carries no client counts (R81).
-for mode in offline; do
+# A stopped virtual server carries no client counts (R81), and without the
+# permission for serverlist the agents ask each port with "use port=N" and
+# "serverinfo", which answers only after the "use" line's own ok (R246).
+for mode in offline denied; do
     BK_FAKE_TS3_MODE=$mode python3 /agent/fake_ts3.py & ts3_pid=$!
     sleep 1
     bash agent.sh --dry-run > "/work/out/sh_ts3_$mode.json" 2>"/work/out/sh_ts3_$mode.err"

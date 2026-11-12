@@ -35,11 +35,13 @@ for kind, label in (("sh2", "bash agent via python3"), ("sh3", "bash agent via n
     )
     check(f"teamspeak: {label} decodes the escaped name", first.get("name") == "Blood Kings")
 
-# A stopped virtual server is left out, not stored as 0/0 (R81).
+# A stopped virtual server is left out, not stored as 0/0 (R81); without the
+# serverlist permission the per-port fallback still reads the server (R246).
 for kind, label in (("sh", "bash agent via python3"), ("shnc", "bash agent via nc"), ("py", "python agent")):
-    for mode in ("offline",):
+    for mode in ("offline", "denied"):
         servers = json.load(open(f"{out}/{kind}_ts3_{mode}.json")).get("teamspeak_servers") or []
-        want = [(9987, 7, 32)]
+        # agent.py asks serverlist only: without the permission it has none.
+        want = [] if (kind, mode) == ("py", "denied") else [(9987, 7, 32)]
         check(f"teamspeak {mode}: {label} lists {'nothing' if not want else 'only the running server, 7/32'}",
               [(s.get("port"), s.get("clients_online"), s.get("clients_max")) for s in servers] == want)
 
