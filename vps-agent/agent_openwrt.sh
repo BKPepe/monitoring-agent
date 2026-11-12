@@ -1249,10 +1249,19 @@ bk_upd_probation() {
 if { [ -f "$BK_UPD_PROBATION" ] || [ -f "$BK_UPD_MARK" ]; } && { [ "$DRY_RUN" != "1" ] || [ -n "$BK_TEST_RESPONSE" ]; }; then
     bk_upd_probation
 fi
-# A 4xx is the server refusing this version's report (a 5xx or no answer at
-# all can be the server's own trouble). Called from the POST's else branch.
+# An answer that says the REPORT is wrong is the server refusing this
+# version (a 5xx or no answer at all can be the server's own trouble):
+# 400 (JSON it cannot read), 413 (a body too large), 422. Every 4xx used to
+# count (R187): 401 is a key the server no longer knows - a monitor
+# archived, a key rotated - and 403, 404 and 429 are no verdict on the
+# version either, yet three of them rolled a good version back and barred
+# its file for good. They count nothing here; the run itself still counts
+# towards the 30-run limit, like a run that got no answer at all: a 403
+# can come from a filter in front of the server reacting to the new
+# payload, and a version that never gets a report through must still go.
+# Called from the POST's else branch.
 bk_upd_refused() { # HTTP_CODE
-    case "$1" in 4[0-9][0-9]) ;; *) return 0 ;; esac
+    case "$1" in 400|413|422) ;; *) return 0 ;; esac
     bk_upd_probation_read || return 0
     printf '%s %s %s %s\n' "$_pb_v" "$_pb_sha" "$_pb_runs" "$((_pb_ref + 1))" > "$BK_UPD_PROBATION" 2>/dev/null
     return 0

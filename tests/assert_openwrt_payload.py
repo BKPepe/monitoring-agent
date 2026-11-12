@@ -131,6 +131,7 @@ wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wdnsm = payload("wdnsm")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
+w401 = [(text(f"w401b{i}_target.txt"), (text(f"w401b{i}_state.txt") or "").split("\n")[0]) for i in range(1, 5)]
 wpath1b, wpath1c = payload("wpath1b"), payload("wpath1c")
 wstk = [payload(f"wstk{n}") for n in range(1, 4)]
 wmw = {m: payload(f"wmw-{m}") for m in ("balance", "failover", "down")}
@@ -838,6 +839,13 @@ checks = {
         and len(uqmi_calls) == 2 and all("-d /dev/cdc-wdm0" in c for c in uqmi_calls),
     "lte: mmcli's signal-to-noise ratio is its s/n line (R107)":
         (wmm["lte_rsrp"], wmm["lte_sinr"]) == (-88, 8),
+    "update: a 401 is the key, not the version - four of them count no refusal and the new version stays (R187)":
+        text("w401a_target.txt") == "new"
+        and [t for t, _ in w401] == ["new"] * 4
+        and [s.split(" ")[3:] for _, s in w401] == [["0"]] * 4
+        and [int(s.split(" ")[2]) for _, s in w401] == sorted(int(s.split(" ")[2]) for _, s in w401),
+    "update: a 401 is still a run without a report - at the 30-run limit the version goes back, as with no answer (R187)":
+        text("w401c1_target.txt") == "new" and text("w401c2_target.txt") == "old",
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":

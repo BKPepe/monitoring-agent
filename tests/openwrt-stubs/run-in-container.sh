@@ -1314,6 +1314,19 @@ urun wreb1
 fresh
 for _i in 2 3 4; do urun "wreb$_i"; done
 urun wreb5 -
+# A key the server no longer knows is no verdict on the version (R187):
+# four reports answered 401 after an update count no refusal, and the new
+# version stays. They are still runs without a report: at the 30-run limit
+# a 401 rolls back like no answer at all (w401c1, w401c2).
+fresh
+reset_upd
+offer good "$(usha good)" 9.9.9
+urun w401a
+printf '401\n{"success":false,"message":"Neplatny klic agenta nebo monitor neexistuje."}\n' > /tmp/upd-resp.json
+for _i in 1 2 3 4; do urun "w401b$_i"; done
+printf '9.9.9 %s 29 0\n' "$(usha good)" > "$PRIV/update.probation"
+urun w401c1
+urun w401c2 -
 rm -rf "$UPD" /srv/upd /tmp/curlbin /tmp/upd-resp.json
 fresh
 
