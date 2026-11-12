@@ -984,8 +984,10 @@ for q_port in 10011 8219; do
             BEGIN { RS="|" }
             /virtualserver_port=/ {
                 port = 9987;
-                online = 0;
-                max = 0;
+                # No default counts: a stopped virtual server carries none,
+                # and 0/0 stored for it read as an empty running server.
+                online = "";
+                max = "";
                 name = "";
                 
                 n = split($0, attrs, " ");
@@ -1009,7 +1011,7 @@ for q_port in 10011 8219; do
                         gsub(/\\p/, "|", name);
                     }
                 }
-                print port "," online "," max "," name;
+                if (online != "" && max != "") print port "," online "," max "," name;
             }')
             
             while read -r s_line; do

@@ -1,25 +1,46 @@
-"""A stand-in TeamSpeak 3 ServerQuery on 10011: greeting, then one virtual
-server in the serverlist answer, then the error line that ends an exchange."""
-import socket, threading
+"""A stand-in TeamSpeak 3 ServerQuery on 10011: greeting, then an answer per
+command line, each ended by the error line that closes an exchange.
+
+BK_FAKE_TS3_MODE picks what serverlist says:
+  (unset)   one virtual server, online
+  offline   that one plus a stopped one, which carries no client counts
+"""
+import os, socket, threading
+MODE = os.environ.get("BK_FAKE_TS3_MODE", "")
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", 10011))
 srv.listen(5)
 
+RUNNING = (b"virtualserver_id=1 virtualserver_port=9987 virtualserver_clientsonline=7 "
+           b"virtualserver_maxclients=32 virtualserver_name=Blood\\sKings")
+STOPPED = b"virtualserver_id=2 virtualserver_port=9988 virtualserver_status=offline virtualserver_name=Stopped"
+OK = b"error id=0 msg=ok\n\r"
+
+def answer(line, state):
+    if line == "serverlist":
+        body = RUNNING + (b"|" + STOPPED if MODE == "offline" else b"")
+        return body + b"\n\r" + OK
+    return b"error id=256 msg=command\\snot\\sfound\n\r"
+
 def serve(c):
     c.sendall(b"TS3\n\rWelcome to the TeamSpeak 3 ServerQuery interface\n\r")
     data = b""
+    state = {}
     try:
-        while b"quit" not in data:
+        while True:
             chunk = c.recv(4096)
             if not chunk:
                 break
             data += chunk
-            if b"serverlist" in data:
-                c.sendall(b"virtualserver_id=1 virtualserver_port=9987 virtualserver_clientsonline=7 "
-                          b"virtualserver_maxclients=32 virtualserver_name=Blood\\sKings\n\r"
-                          b"error id=0 msg=ok\n\r")
-                break
+            while b"\n" in data:
+                raw, data = data.split(b"\n", 1)
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                if line == "quit":
+                    return
+                c.sendall(answer(line, state))
     finally:
         c.close()
 

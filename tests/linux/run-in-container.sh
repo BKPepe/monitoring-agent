@@ -35,6 +35,18 @@ chmod +x /agent/nopython/python3
 PATH="/agent/nopython:$PATH" bash agent.sh --dry-run > /work/out/sh3.json 2>/work/out/sh3.err
 
 kill "$ts3_pid" 2>/dev/null || true
+
+# A stopped virtual server carries no client counts (R81).
+for mode in offline; do
+    BK_FAKE_TS3_MODE=$mode python3 /agent/fake_ts3.py & ts3_pid=$!
+    sleep 1
+    bash agent.sh --dry-run > "/work/out/sh_ts3_$mode.json" 2>"/work/out/sh_ts3_$mode.err"
+    PATH="/agent/nopython:$PATH" bash agent.sh --dry-run > "/work/out/shnc_ts3_$mode.json" 2>"/work/out/shnc_ts3_$mode.err"
+    python3 agent.py --dry-run > "/work/out/py_ts3_$mode.json" 2>"/work/out/py_ts3_$mode.err"
+    kill "$ts3_pid" 2>/dev/null || true
+    wait "$ts3_pid" 2>/dev/null || true
+done
+
 if grep -qi traceback /work/out/py1.err /work/out/py2.err; then cat /work/out/py2.err >&2; exit 1; fi
 
 # cron's environment: PATH=/usr/bin:/bin and nothing else. A tool in an sbin

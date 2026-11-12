@@ -35,6 +35,14 @@ for kind, label in (("sh2", "bash agent via python3"), ("sh3", "bash agent via n
     )
     check(f"teamspeak: {label} decodes the escaped name", first.get("name") == "Blood Kings")
 
+# A stopped virtual server is left out, not stored as 0/0 (R81).
+for kind, label in (("sh", "bash agent via python3"), ("shnc", "bash agent via nc"), ("py", "python agent")):
+    for mode in ("offline",):
+        servers = json.load(open(f"{out}/{kind}_ts3_{mode}.json")).get("teamspeak_servers") or []
+        want = [(9987, 7, 32)]
+        check(f"teamspeak {mode}: {label} lists {'nothing' if not want else 'only the running server, 7/32'}",
+              [(s.get("port"), s.get("clients_online"), s.get("clients_max")) for s in servers] == want)
+
 # cron's bare environment (env -i PATH=/usr/bin:/bin) against an ordinary
 # run: the agents add the sbin directories themselves, so what one measures
 # the other measures too. zerotier-cli is a stub in /usr/sbin.
