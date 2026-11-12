@@ -2145,7 +2145,19 @@ else
     elif command -v apk >/dev/null 2>&1; then
         # `apk list` pise hlavicku i prazdne radky, proto se pocitaji jen
         # radky zacinajici nazvem balicku.
-        upgradable_packages=$(apk list --upgradable 2>/dev/null | grep -c '^[a-zA-Z0-9]' | xargs)
+        #
+        # Without a repository index apk knows of no newer package: it warns
+        # "opening from cache ...packages.adb: No such file", exits 0 and
+        # lists nothing, and that was sent as 0 updates (R40). `apk update`
+        # keeps the index as /var/cache/apk/APKINDEX.*.tar.gz, and /var is
+        # tmpfs: after every reboot it is gone until someone updates. No
+        # index is unknown, like opkg without its lists, and apk is not
+        # asked at all (measured on the OpenWrt snapshot image).
+        _apk_idx=0
+        for _f in /var/cache/apk/APKINDEX.*; do [ -e "$_f" ] && _apk_idx=1; break; done
+        if [ "$_apk_idx" = 1 ]; then
+            upgradable_packages=$(apk list --upgradable 2>/dev/null | grep -c '^[a-zA-Z0-9]' | xargs)
+        fi
         installed_packages=$(apk list --installed 2>/dev/null | grep -c '^[a-zA-Z0-9]' | xargs)
         # Kazdy pocet se overuje zvlast - kdyz selze jen jeden prikaz, nema
         # to zneplatnit i ten druhy.
