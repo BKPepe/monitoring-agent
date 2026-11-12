@@ -9,6 +9,7 @@
 # Radios: wlan0 (2.4 GHz; an ESSID with a quote, a backslash and a #), wlan1
 # (disabled), phy0-ap0 and phy3-ap0 (the owner's Omnia, see omnia/README.md),
 # wlan6 (6 GHz, the driver gives no station list), wlan7 (5 GHz, nobody on it).
+# BK_STUB_WIFI_STA=1 adds wlan8, a client-mode uplink joined to one AP.
 D=/work/stubs/omnia
 echo "$*" >> /work/out/iwinfo_calls.log
 if [ $# -gt 2 ]; then echo "No such wireless backend: $1" >&2; exit 1; fi
@@ -73,6 +74,19 @@ wlan7     ESSID: "Garaz"
           Supports VAPs: yes  PHY name: phy4
 M
     ;;
+    wlan8) cat <<'M'
+wlan8     ESSID: "Upstream"
+          Access Point: 02:00:00:00:00:81
+          Mode: Client  Channel: 11 (2.462 GHz)  HT Mode: HT20
+          Center Channel 1: 11 2: unknown
+          Tx-Power: 20 dBm  Link Quality: 50/70
+          Signal: -60 dBm  Noise: -95 dBm
+          Bit Rate: 65.0 MBit/s
+          Encryption: WPA2 PSK (CCMP)
+          Type: nl80211  HW Mode(s): 802.11b/g/n
+          Supports VAPs: yes  PHY name: phy6
+M
+    ;;
     *) return 1 ;;
     esac
 }
@@ -101,6 +115,14 @@ assoclist() {
 M
     ;;
     wlan1|wlan7) echo "No station connected" ;;
+    wlan8) cat <<'M'
+02:00:00:00:00:81  -60 dBm / -95 dBm (SNR 35)  10 ms ago
+	RX: 65.0 MBit/s, MCS 7, 20MHz                     900 Pkts.
+	TX: 65.0 MBit/s, MCS 7, 20MHz                     800 Pkts.
+	expected throughput: unknown
+
+M
+    ;;
     wlan6) echo "No information available" ;;
     phy0-ap0) cat $D/iwinfo_assoclist.txt ;;
     phy3-ap0) cat $D/iwinfo_phy3_assoclist.txt ;;
@@ -115,7 +137,7 @@ htmodelist() {
     phy0-ap0) sed -n '1p' $D/caps.txt ;;
     wlan6) echo "HE20 HE40 HE80 HE160 " ;;
     wlan7) echo "HT20 HT40 VHT20 VHT40 VHT80 " ;;
-    wlan0|wlan1|phy3-ap0) echo "HT20 HT40 " ;;
+    wlan0|wlan1|phy3-ap0|wlan8) echo "HT20 HT40 " ;;
     *) return 1 ;;
     esac
 }
@@ -127,13 +149,14 @@ freqlist() {
     wlan0) printf '  2.412 GHz (Band: 2.4 GHz, Channel 1) \n* 2.437 GHz (Band: 2.4 GHz, Channel 6) \n' ;;
     phy3-ap0) printf '  2.412 GHz (Band: 2.4 GHz, Channel 1) \n* 2.432 GHz (Band: 2.4 GHz, Channel 5) \n' ;;
     wlan1) printf '  2.412 GHz (Band: 2.4 GHz, Channel 1) \n  2.437 GHz (Band: 2.4 GHz, Channel 6) \n' ;;
+    wlan8) printf '  2.412 GHz (Band: 2.4 GHz, Channel 1) \n* 2.462 GHz (Band: 2.4 GHz, Channel 11) \n' ;;
     *) return 1 ;;
     esac
 }
 
 if [ $# -eq 0 ]; then
     # Bare `iwinfo`: the info block of every device, a blank line between them.
-    for _r in wlan0 wlan1 phy0-ap0 wlan6 wlan7 phy3-ap0; do info "$_r"; echo; done
+    for _r in wlan0 wlan1 phy0-ap0 wlan6 wlan7 phy3-ap0 ${BK_STUB_WIFI_STA:+wlan8}; do info "$_r"; echo; done
     exit 0
 fi
 case "$2" in

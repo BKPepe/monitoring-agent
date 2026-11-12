@@ -144,6 +144,7 @@ wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wdnsm = payload("wdnsm")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
+wsta1 = payload("wsta1")
 ping_runs = by_run("ping_calls.log")
 # R338: the real runs' client calls, and the bodies they were handed.
 post_runs = by_run("post_argv.log")
@@ -595,7 +596,8 @@ checks = {
     "speed: 1850.23 Mbit/s arrives as 1850.23 - the result is Mbit/s, there is no bytes-per-second heuristic":
         d1["speedtests"][0]["download_mbps"] == 1850.23 and d1["speedtests"][0]["upload_mbps"] == 902.4,
     "speed: the client block never leaves the router - no client, no address, no share, no backend url in any payload":
-        not re.search(r'"client"|198\.51\.100|"share"|speed\.example', payload_text),
+        # The KEY "client": a radio in client mode says "mode":"client".
+        not re.search(r'"client"\s*:|198\.51\.100|"share"\s*:|speed\.example', payload_text),
     "speed: a result carries its server name, its bytes and who started it; a missing upload is null, not 0":
         [(i["server"], i["bytes_received"], i["bytes_sent"], i["started_by"], i["iface"], i["link_mbit"], i["diagnostics"])
          for i in d1["speedtests"]] ==
@@ -902,6 +904,9 @@ checks = {
         and [c for c in ping_runs.get("wpath1", []) if "-c 2" in c] == ["-I eth2 -c 2 -W 1 -w 3 203.0.113.1"],
     "wan: no WAN device, no WAN latency (R44)":
         wpath[5]["wan_latency_ms"] is None,
+    "wifi: a client-mode uplink's AP is no client of this router - the sum is the access points' stations only (R74)":
+        wsta1["wifi_clients_count"] == d["wifi_clients_count"] == 14
+        and [(r["mode"], r["clients"]) for r in wsta1["wifi_radios"] if r["radio"] == "wlan8"] == [("client", 1)],
     "post: a body that cannot be written goes the old way with a warning - the report still arrives (R338)":
         text("wpost-full_rc.txt") == "0"
         # The body spans lines in the shim's log: the payload is pretty-printed.

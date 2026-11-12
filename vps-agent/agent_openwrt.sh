@@ -5228,7 +5228,10 @@ function flush_radio(   i, j, k, t, n, band, g, known, c6, oc_known, c5, akm_kno
         ",\"clients_wpa3\":" (sta_src == "hostapd_cli" ? wpa3 : "null") ",\"clients_8021x\":" (sta_src == "hostapd_cli" ? eap : "null") \
         ",\"busy_pct\":" jn(busy) ",\"busy_other_pct\":" jn(other) ",\"busy_state\":" jq(bstate) "}"
     json = json (json == "" ? "" : ",") out
-    if (clients != "") { total += clients; have_total = 1 }
+    # Only the stations of an access point are clients (R74): a radio in
+    # client mode lists the upstream AP it is joined to, a mesh point its
+    # peers. Their own entries still say how many they see.
+    if (clients != "") { have_total = 1; if (mode == "ap") total += clients }
 }
 BEGIN {
     while ((getline l < prev) > 0) { split(l, q, "|"); p_f[q[1]] = q[2]; p_a[q[1]] = q[3]; p_b[q[1]] = q[4]; p_t[q[1]] = q[5]; p_bss[q[1]] = q[6]; p_ts[q[1]] = q[7] }

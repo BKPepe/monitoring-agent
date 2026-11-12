@@ -645,6 +645,11 @@ fresh
 pl wmm
 PATH="/work/stubs/modem-mm:$PATH" sh agent_openwrt.sh --dry-run > $OUT/wmm.json 2> $OUT/wmm.err
 fresh
+# A client-mode uplink next to the access points (R74): its one "station"
+# is the AP it joined, which is no client of this router.
+pl wsta1
+BK_STUB_WIFI_STA=1 sh agent_openwrt.sh --dry-run > $OUT/wsta1.json 2> $OUT/wsta1.err
+fresh
 # mwan3's gateway is the one member of the policy the catch-all IPv4 rule
 # uses, and every interface keeps the state mwan3 names (R73).
 for _m in balance failover down; do
