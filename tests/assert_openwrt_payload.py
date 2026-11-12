@@ -133,6 +133,9 @@ wrss1, wrss2 = payload("wrss1"), payload("wrss2")
 wpath1b, wpath1c = payload("wpath1b"), payload("wpath1c")
 wstk = [payload(f"wstk{n}") for n in range(1, 4)]
 wmw = {m: payload(f"wmw-{m}") for m in ("balance", "failover", "down")}
+wsvc1 = payload("wsvc1")
+wsvc = {s["name"]: s for s in wsvc1["discovered_services"]}
+wsvc2 = {s["name"]: s for s in payload("wsvc2")["discovered_services"]}
 with open(f"{out}/wrss1.rss") as _f:
     wrss_mb = int(_f.read().strip()) / 1024
 
@@ -809,6 +812,19 @@ checks = {
         [(p["interface"], p["status"]) for p in wmw["failover"]["mwan3_policies"]]
         == [("wan", "online"), ("wwan", "online"), ("lte", "connecting"), ("wifi", "disabled")]
         and [(p["interface"], p["status"]) for p in wmw["down"]["mwan3_policies"]] == [("wan", "offline"), ("wwan", "offline")],
+    "discovery: Docker, WireGuard, Sentinel and OpenVPN are found by the signals they really give (R106)":
+        [(n, wsvc.get(n, {}).get("confidence"), wsvc.get(n, {}).get("evidence")) for n in
+         ("Docker Engine", "WireGuard VPN", "Turris Sentinel / Pakon", "OpenVPN")]
+        == [("Docker Engine", 74, ["process", "config", "active_verify"]),
+            ("WireGuard VPN", 99, ["process", "port", "config", "active_verify"]),
+            ("Turris Sentinel / Pakon", 74, ["process", "config", "active_verify"]),
+            ("OpenVPN", 99, ["process", "port", "config", "active_verify"])],
+    "discovery: a WireGuard client claims no port - its listen port is random - and still counts its interface, handler and handshake (R106)":
+        (wsvc2.get("WireGuard VPN", {}).get("port"), wsvc2.get("WireGuard VPN", {}).get("confidence"),
+         wsvc2.get("WireGuard VPN", {}).get("evidence")) == (0, 74, ["process", "config", "active_verify"]),
+    "discovery: no process is claimed for WireGuard and no port for Docker, so an imported check asks what really exists (R106)":
+        (wsvc.get("WireGuard VPN", {}).get("process"), wsvc.get("WireGuard VPN", {}).get("port")) == ("", 51820)
+        and (wsvc.get("Docker Engine", {}).get("process"), wsvc.get("Docker Engine", {}).get("port")) == ("dockerd", 0),
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":

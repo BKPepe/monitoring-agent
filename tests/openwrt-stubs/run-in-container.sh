@@ -1007,6 +1007,32 @@ rm -f /tmp/fakeroot/proc/net/tcp /tmp/fakeroot/proc/net/tcp6 /tmp/fakeroot/proc/
     /etc/config/dropbear /etc/mosquitto/mosquitto.conf "$SVC_CACHE"
 if [ -f "$SVC_CACHE.keep" ]; then mv "$SVC_CACHE.keep" "$SVC_CACHE"; fi
 fresh
+# Docker, WireGuard, Sentinel and OpenVPN running as they run on a router
+# (R106): dockerd with its socket and /etc/config/dockerd, a WireGuard
+# interface with a peer that handshook and the netifd handler on UDP 51820,
+# sentinel-proxy with /etc/config/sentinel, openvpn on UDP 1194. The socket
+# is syslogd's /dev/log, the one unix socket busybox can make here.
+if [ -f "$SVC_CACHE" ]; then mv "$SVC_CACHE" "$SVC_CACHE.keep"; fi
+mkdir -p /lib/netifd/proto /var/run
+: > /etc/config/dockerd; : > /etc/config/sentinel; : > /etc/config/openvpn; : > /lib/netifd/proto/wireguard.sh
+syslogd -O /dev/null
+ln -s /dev/log /var/run/docker.sock
+{ echo "$UNH"
+  echo '  10: 00000000:04AA 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1011 2 0000000000000000 0'
+  echo '  11: 00000000:CA6C 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 0 2 0000000000000000 0'
+} > /tmp/fakeroot/proc/net/udp
+pl wsvc1
+BK_STUB_PIDOF_RUNNING="dockerd sentinel-proxy openvpn" sh agent_openwrt.sh --dry-run > $OUT/wsvc1.json 2> $OUT/wsvc1.err
+# The same router as a WireGuard client: no listen_port in uci, so no port
+# is claimed, though something listens on 51820.
+rm -f "$SVC_CACHE"
+pl wsvc2
+BK_STUB_WG_PORT=none BK_STUB_PIDOF_RUNNING="dockerd sentinel-proxy openvpn" sh agent_openwrt.sh --dry-run > $OUT/wsvc2.json 2> $OUT/wsvc2.err
+killall syslogd 2>/dev/null || true
+rm -f /etc/config/dockerd /etc/config/sentinel /etc/config/openvpn /lib/netifd/proto/wireguard.sh \
+    /var/run/docker.sock /tmp/fakeroot/proc/net/udp "$SVC_CACHE"
+if [ -f "$SVC_CACHE.keep" ]; then mv "$SVC_CACHE.keep" "$SVC_CACHE"; fi
+fresh
 
 # --- wupd1, wupd2: the self-update swap (IO-07) ------------------------------
 # The update itself runs only after a real 200 and never under the response

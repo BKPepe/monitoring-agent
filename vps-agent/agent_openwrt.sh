@@ -5485,7 +5485,16 @@ else
         _name="$1"; _type="$2"; _proc="$3"; _porthex="$4"; _config="$5"; _portdec="$6"; _desc="$7"
         _conf=0; _evidence=""; _missing=""; _no_hardware=0
         # 1. Process detection
-        if pidof "$_proc" >/dev/null 2>&1; then
+        #
+        # WireGuard runs in the kernel and has no process: its counterpart is
+        # an interface that exists. It was looked for as a process called
+        # "wireguard", which never runs, so it could never be found.
+        _have_proc=1
+        case "$_type" in
+            wireguard) [ -n "$(wg show interfaces 2>/dev/null)" ] || _have_proc=0 ;;
+            *) pidof "$_proc" >/dev/null 2>&1 || _have_proc=0 ;;
+        esac
+        if [ "$_have_proc" = 1 ]; then
             _conf=$((_conf + 30)); _evidence="${_evidence}\"process\","
         else
             _missing="${_missing}\"process\","
@@ -5529,7 +5538,9 @@ else
                 if [ -S /var/run/docker.sock ]; then _active_ok=1; fi
                 ;;
             wireguard)
-                if command -v wg >/dev/null 2>&1 && [ -n "$(wg show all dump 2>/dev/null)" ]; then _active_ok=1; fi
+                # A peer that has completed a handshake: the tunnel is in
+                # use, not only configured.
+                if wg show all latest-handshakes 2>/dev/null | awk '$3 ~ /^[1-9][0-9]*$/ { f = 1 } END { exit !f }'; then _active_ok=1; fi
                 ;;
             wifi)
                 # Rozhoduje hardware, ne bezici proces.
@@ -5584,13 +5595,30 @@ else
     detect_svc "uHTTPd Web UI" "web" "uhttpd" "0050" "/etc/config/uhttpd" 80 "Webový server pro administraci LuCI / Rebuilt"
     detect_svc "Lighttpd Web" "web" "lighttpd" "0050" "/etc/lighttpd/lighttpd.conf" 80 "Lehký webový server pro administraci TurrisOS"
     detect_svc "Mosquitto MQTT" "mqtt" "mosquitto" "075B" "/etc/mosquitto/mosquitto.conf" 1883 "MQTT Message Broker pro IoT zařízení a chytrou domácnost (Home Assistant, senzory)"
-    detect_svc "WireGuard VPN" "vpn" "wireguard" "" "/etc/config/wireguard" 51820 "Šifrovaný VPN tunel pro bezpečné připojení odkudkoliv"
-    detect_svc "OpenVPN" "vpn" "openvpn" "0476" "/etc/config/openvpn" 1194 "SSL/TLS VPN server"
+    # Four detectors could never reach 50 (R106). WireGuard looked for a
+    # process that does not exist and for /etc/config/wireguard, which no
+    # OpenWrt has (the tunnel lives in /etc/config/network); its handshake
+    # check sat under a type nothing called. Its evidence is now the
+    # interface, the proto handler netifd needs for it (wireguard-tools),
+    # its port and a peer's handshake. It names no process, so an imported
+    # agent-side check looks at the port, never at pidof. The port is the
+    # listen_port fixed in /etc/config/network: a WireGuard client listens on
+    # a random port that changes with every start, so none is claimed (0),
+    # and a check of a port that is not bound would be down from the start.
+    _wg_port=$(uci -q show network 2>/dev/null | awk -F"'" '/^network\.[^.=]+\.listen_port=/ { print $2; exit }')
+    case "$_wg_port" in ''|*[!0-9]*) _wg_port="" ;; esac
+    detect_svc "WireGuard VPN" "wireguard" "" "${_wg_port:+port}" "/lib/netifd/proto/wireguard.sh" "$_wg_port" "Šifrovaný VPN tunel pro bezpečné připojení odkudkoliv"
+    detect_svc "OpenVPN" "vpn" "openvpn" "04AA" "/etc/config/openvpn" 1194 "SSL/TLS VPN server"
     detect_svc "AdGuard Home" "dns" "AdGuardHome" "0BB8" "/usr/bin/AdGuardHome" 3000 "Blokování reklam a sledování na úrovni celé sítě"
-    detect_svc "Turris Sentinel / Pakon" "security" "sentinel" "" "/etc/config/sentinel" 0 "Systém detekce kybernetických hrozeb a sběru dat CZ.NIC"
+    # Sentinel runs as sentinel-proxy; no process is called "sentinel".
+    detect_svc "Turris Sentinel / Pakon" "security" "sentinel-proxy" "" "/etc/config/sentinel" 0 "Systém detekce kybernetických hrozeb a sběru dat CZ.NIC"
     detect_svc "Samba SMB File Share" "storage" "smbd" "01BD" "/etc/samba/smb.conf" 445 "Sdílení souborů v lokální síti (NAS / Windows Share)"
     detect_svc "Nginx Web Server" "web" "nginx" "0050" "/etc/nginx/nginx.conf" 80 "Vysoce výkonný webový server a reverzní proxy"
-    detect_svc "Docker Engine" "container" "dockerd" "" "/var/run/docker.sock" 2375 "Kontejnerová platforma pro spouštění aplikací"
+    # Docker's type was "container", so its socket check never ran, and the
+    # socket was tested as the config FILE (-f), which a socket is not. The
+    # config is OpenWrt's /etc/config/dockerd. 2375 is the unencrypted API
+    # that is off by default and was never checked: no port is claimed.
+    detect_svc "Docker Engine" "docker" "dockerd" "" "/etc/config/dockerd" "" "Kontejnerová platforma pro spouštění aplikací"
     detect_svc "PostgreSQL DB" "database" "postgres" "1538" "/etc/postgresql/postgresql.conf" 5432 "Relační databázový systém"
     detect_svc "TeamSpeak 3 Server" "teamspeak" "ts3server" "271B" "/etc/ts3server.ini" 10011 "TeamSpeak 3 hlasový komunikační server"
     detect_svc "Minecraft Server" "minecraft" "java" "63DD" "" 25565 "Minecraft herní server"
