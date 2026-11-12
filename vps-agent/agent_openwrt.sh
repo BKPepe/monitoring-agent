@@ -2910,7 +2910,8 @@ if command -v top >/dev/null 2>&1; then
                 h = toupper($i);
                 if (h == "%CPU" || h == "CPU%") cpu_i = i;
                 else if (h == "%VSZ" || h == "%MEM" || h == "MEM%") mem_i = i;
-                else if (h == "VSZ" || h == "RSS" || h == "RES") vsz_i = i;
+                else if (h == "RSS" || h == "RES") rss_i = i;
+                else if (h == "VSZ") vsz_i = i;
                 else if (h == "COMMAND" || h == "CMD" || h == "PROCESS") cmd_i = i;
                 else if (h == "PID") pid_i = i;
             }
@@ -2920,12 +2921,28 @@ if command -v top >/dev/null 2>&1; then
             cpu = (cpu_i ? $cpu_i : "");
             gsub(/%/, "", cpu);
             if (cpu !~ /^[0-9]+(\.[0-9]+)?$/) cpu = "";
-            # Pamet: VSZ/RSS je v kB (busybox pouziva pripony m/g)
-            raw = (vsz_i ? $vsz_i : "");
+            # Memory is the resident set. procps top prints it (RES, in kB
+            # or with an m/g suffix). busybox top up to 1.36 (OpenWrt 24.10,
+            # Turris) prints only VSZ, the mapped address space: a Go binary
+            # such as AdGuardHome maps about 1 GB on a 512 MB router. So with
+            # only VSZ in the header the RSS comes from /proc/PID/status, the
+            # /proc top itself read. No VmRSS line is a kernel thread (0);
+            # an unreadable file is a process gone since the snapshot, and
+            # its memory stays unknown.
             mb = "";
-            if (raw ~ /^[0-9]+(\.[0-9]+)?[mM]$/) { sub(/[mM]$/, "", raw); mb = raw + 0; }
-            else if (raw ~ /^[0-9]+(\.[0-9]+)?[gG]$/) { sub(/[gG]$/, "", raw); mb = (raw + 0) * 1024; }
-            else if (raw ~ /^[0-9]+(\.[0-9]+)?[kK]?$/) { sub(/[kK]$/, "", raw); mb = (raw + 0) / 1024; }
+            if (rss_i) {
+                raw = $rss_i;
+                if (raw ~ /^[0-9]+(\.[0-9]+)?[mM]$/) { sub(/[mM]$/, "", raw); mb = raw + 0; }
+                else if (raw ~ /^[0-9]+(\.[0-9]+)?[gG]$/) { sub(/[gG]$/, "", raw); mb = (raw + 0) * 1024; }
+                else if (raw ~ /^[0-9]+(\.[0-9]+)?[kK]?$/) { sub(/[kK]$/, "", raw); mb = (raw + 0) / 1024; }
+            } else if (vsz_i) {
+                sf = "/proc/" $pid_i "/status";
+                if ((getline sl < sf) > 0) {
+                    mb = 0;
+                    do { if (sl ~ /^VmRSS:/) { split(sl, sv, " "); mb = sv[2] / 1024; break } } while ((getline sl < sf) > 0);
+                }
+                close(sf);
+            }
             # busybox top kresli strom procesu: COMMAND zacina glyfem
             # (`- , |- , +-) a skutecny prikaz je az za nim. Driv se proto
             # jako jmeno ulozilo doslova "`-".

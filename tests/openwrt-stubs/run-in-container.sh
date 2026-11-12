@@ -552,6 +552,43 @@ PATH="/tmp/notop:$PATH" BK_STUB_PIDOF_RUNNING=unbound BK_STUB_RESOLVER=unbound \
     sh agent_openwrt.sh --dry-run > $OUT/wdnsu.json 2> $OUT/wdnsu.err
 rm -rf /etc/config/resolver /tmp/notop
 fresh
+# Process memory is the resident set, never VSZ (R258). busybox top up to
+# 1.36 prints only VSZ: a real process gets a VSZ of 999m in a shadow top,
+# and its ram_mb must be the VmRSS of /proc/PID/status. PID 999999 is gone
+# by the time the agent looks: unknown memory, so CPU list only. procps top
+# prints RES, which is used as it is.
+sleep 600 &
+_rss_pid=$!
+awk '/^VmRSS:/ { print $2 }' "/proc/$_rss_pid/status" > $OUT/wrss1.rss
+mkdir -p /tmp/rsstop
+cat > /tmp/rsstop/top <<EOT
+#!/bin/sh
+cat <<'EOP'
+Mem: 100000K used, 400000K free, 0K shrd, 0K buff, 50000K cached
+CPU:   5% usr   2% sys   0% nic  93% idle   0% io   0% irq   0% sirq
+Load average: 0.10 0.20 0.30 1/80 1234
+  PID  PPID USER     STAT   VSZ %VSZ CPU %CPU COMMAND
+$_rss_pid     1 root     S     999m 200%   0  50% /usr/bin/AdGuardHome -c /etc/adguardhome.yaml
+999999     1 root     S    1024m 205%   0  40% /usr/bin/gone
+EOP
+EOT
+chmod +x /tmp/rsstop/top
+pl wrss1
+PATH="/tmp/rsstop:$PATH" sh agent_openwrt.sh --dry-run > $OUT/wrss1.json 2> $OUT/wrss1.err
+cat > /tmp/rsstop/top <<EOT
+#!/bin/sh
+cat <<'EOP'
+top - 10:00:00 up 1 day,  1:00,  0 users,  load average: 0.10, 0.20, 0.30
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+$_rss_pid root      20   0 1048576  20480   1000 S  30.0   4.0   0:01.00 AdGuardHome
+EOP
+EOT
+pl wrss2
+PATH="/tmp/rsstop:$PATH" sh agent_openwrt.sh --dry-run > $OUT/wrss2.json 2> $OUT/wrss2.err
+# wait reports the kill (143), which set -e must not take for a failure.
+kill "$_rss_pid" 2>/dev/null; wait "$_rss_pid" 2>/dev/null || true
+rm -rf /tmp/rsstop
+fresh
 # Neither nft nor iptables: unknown, not "off". The image has no iptables
 # applet at all, which is what a router without the compat layer looks like.
 stub_off nft

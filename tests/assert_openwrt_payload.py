@@ -129,6 +129,16 @@ wupl = {n: payload(f"wupl{n}") for n in (1, 3, 4, 6, 7)}
 wfw1, wfw2, wfw3, wfw4 = (payload(f"wfw{n}") for n in (1, 2, 3, 4))
 wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
+wrss1, wrss2 = payload("wrss1"), payload("wrss2")
+with open(f"{out}/wrss1.rss") as _f:
+    wrss_mb = int(_f.read().strip()) / 1024
+
+
+def rss_rows(rows):
+    """The rows with ram_mb checked against the harness's own VmRSS read
+    (the agent prints one decimal) and then set to "rss", so the rest is an
+    exact comparison."""
+    return [dict(r, ram_mb="rss") if isinstance(r.get("ram_mb"), float) and abs(r["ram_mb"] - wrss_mb) <= 0.051 else r for r in rows]
 wdns1, wdns3 = payload("wdns1"), payload("wdns3")
 wrun2, wrun3, wrun4 = (payload(f"wrun{n}") for n in (2, 3, 4))
 wrun5, wrun6, wrun7 = (payload(f"wrun{n}") for n in (5, 6, 7))
@@ -777,6 +787,11 @@ checks = {
         (wts1["tailscale_up"], wts1["tailscale_peers"]) == (True, 2) and (d["tailscale_up"], d["tailscale_peers"]) == (None, None),
     "dns: a Turris running Unbound is Unbound, though /etc/config/resolver is there (R75)":
         wdnsu["dns_engine"] == "Unbound",
+    "top: busybox prints VSZ, the memory is the VmRSS of /proc/PID/status - and unknown for a process gone since (R258)":
+        rss_rows(wrss1["top_ram_processes"]) == [{"name": "AdGuardHome", "ram_mb": "rss", "cpu": 50.0}]
+        and rss_rows(wrss1["top_cpu_processes"]) == [{"name": "AdGuardHome", "cpu": 50.0, "ram_mb": "rss"}, {"name": "gone", "cpu": 40.0, "ram_mb": None}],
+    "top: procps prints RES, the resident set in kB, taken as it is (R258)":
+        wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":
         wfw4["firewall_enabled"] is None and wfw4["fw_accepted"] is None,
     # G24: the five claim-defaults (sqm_enabled is the wpath5 check above)
