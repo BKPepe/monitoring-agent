@@ -1,5 +1,70 @@
 #!/bin/sh
-cat <<'M'
+# mwan3 stub: `mwan3 status` as mwan3 prints it - the interfaces, then every
+# policy with the members it routes over now. The uci stub answers the rules
+# (`uci show mwan3`) for the same BK_STUB_MWAN3 mode.
+#
+#   (unset)     wan online, wwan offline; balanced and wan_only over wan
+#   balance     both online, balanced shares them 50/50: no single gateway
+#   failover    the catch-all rule uses wan_wwan, which routes over wwan
+#               (lower metric) while balanced shares wan and wwan; lte is
+#               connecting and wifi disabled
+#   down        nothing online: the policy is unreachable
+case "$BK_STUB_MWAN3" in
+  balance)
+    cat <<'M'
+Interface status:
+ interface wan is online 00h:41m:21s, uptime 01h:02m:03s and tracking is active
+ interface wwan is online 00h:12m:00s, uptime 00h:15m:00s and tracking is active
+
+Current ipv4 policies:
+balanced:
+ wan (50%)
+ wwan (50%)
+
+Current ipv6 policies:
+balanced:
+ wan (100%)
+
+M
+    ;;
+  failover)
+    cat <<'M'
+Interface status:
+ interface wan is online 00h:41m:21s, uptime 01h:02m:03s and tracking is active
+ interface wwan is online 00h:12m:00s, uptime 00h:15m:00s and tracking is active
+ interface lte is connecting and tracking is active
+ interface wifi is disabled and tracking is down
+
+Current ipv4 policies:
+balanced:
+ wan (50%)
+ wwan (50%)
+wan_wwan:
+ wwan (100%)
+
+Current ipv6 policies:
+wan_wwan:
+ wan (100%)
+
+Directly connected ipv4 networks:
+192.0.2.0/24
+
+M
+    ;;
+  down)
+    cat <<'M'
+Interface status:
+ interface wan is offline and tracking is active
+ interface wwan is offline and tracking is active
+
+Current ipv4 policies:
+balanced:
+ unreachable
+
+M
+    ;;
+  *)
+    cat <<'M'
 Interface status:
  interface wan is online and tracking is active
  interface wwan is offline and tracking is active
@@ -7,5 +72,9 @@ Interface status:
 Current ipv4 policies:
 balanced:
  wan (100%)
+wan_only:
+ wan (100%)
 
 M
+    ;;
+esac

@@ -12,6 +12,8 @@
 #   BK_STUB_SQM=off            the queue on the WAN port is enabled='0' too,
 #                              so every section of the file is disabled
 #   BK_STUB_RESOLVER=<name>    resolver.common.prefered_resolver (Turris)
+#   BK_STUB_MWAN3=failover     the catch-all IPv4 rule uses wan_wwan instead
+#                              of balanced (see the mwan3 stub)
 echo "$*" >> /work/out/uci_calls.log 2>/dev/null
 # `uci -q get x` and `uci get x` are the same question here.
 set -- $(echo "$*" | sed 's/^-q //')
@@ -40,6 +42,18 @@ case "$*" in
   "get resolver.common.prefered_resolver")
     [ -n "$BK_STUB_RESOLVER" ] || exit 1
     echo "$BK_STUB_RESOLVER" ;;
+  "show mwan3")
+    # The rules of mwan3's default file, in its order: the https rule comes
+    # first and is not the catch-all (a port and a protocol), the IPv6 one
+    # is not IPv4.
+    _pol=balanced; [ "$BK_STUB_MWAN3" = failover ] && _pol=wan_wwan
+    printf '%s\n' "mwan3.wan=interface" "mwan3.wan.enabled='1'" \
+      "mwan3.https=rule" "mwan3.https.sticky='1'" "mwan3.https.dest_port='443'" \
+      "mwan3.https.proto='tcp'" "mwan3.https.use_policy='wan_only'" \
+      "mwan3.default_rule_v6=rule" "mwan3.default_rule_v6.dest_ip='::/0'" \
+      "mwan3.default_rule_v6.family='ipv6'" "mwan3.default_rule_v6.use_policy='wan_only'" \
+      "mwan3.default_rule_v4=rule" "mwan3.default_rule_v4.dest_ip='0.0.0.0/0'" \
+      "mwan3.default_rule_v4.family='ipv4'" "mwan3.default_rule_v4.use_policy='$_pol'" ;;
   "show dhcp") printf 'dhcp.@host[0]=host\ndhcp.@host[0].name=a\ndhcp.@host[1]=host\ndhcp.@host[2]=host\n' ;;
   *) exit 1 ;;
 esac

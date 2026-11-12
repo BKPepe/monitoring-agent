@@ -3022,25 +3022,61 @@ mwan3_policies_json="[]"
 mwan3_active_gw=""
 if [ -f /etc/config/mwan3 ]; then
     # `mwan3 status` prints " interface wan is online and tracking is
-    # active". The old grep for "active" returned the word "active" as the
-    # gateway, and the policy scan never saw a policy line before the
-    # interface section, so every entry carried an empty policy name.
+    # active" per interface, then "Current ipv4 policies:" with every policy
+    # ("balanced:") and the members it routes over now (" wan (50%)"), or
+    # one word without a share (" unreachable", " default", " blackhole").
     #
-    # One awk straight on the output (it was held in the shell and read twice,
-    # by printf | sed | head and by printf | awk: 8 forks, now 3). Line 1 is
-    # "G" + the gateway: the name in the FIRST "interface NAME is online" line,
-    # what the sed + head -1 printed (empty when that name is empty). Line 2
-    # is the policy list. Nothing is printed when mwan3 printed nothing, and
-    # the defaults stay, as they did when the status was empty.
-    _mw_out=$(mwan3 status 2>/dev/null | awk '
-    length($0) > 0 { any = 1 }
-    !gwdone && /^ *interface [^ ]* is online/ { s = $0; sub(/^ *interface /, "", s); gw = substr(s, 1, index(s, " ") - 1); gwdone = 1 }
-    /^ *interface [^ ]+ is (online|offline|disabled)/ {
-        st = ($4 == "online") ? "online" : "offline";
-        if (count > 0) js = js ", ";
-        js = js sprintf("{\"policy\":null,\"interface\":\"%s\",\"status\":\"%s\"}", $2, st); count++
+    # The gateway is the one member of the policy the catch-all IPv4 rule
+    # uses - the rule with no source, port, protocol or ipset match and a
+    # destination of 0.0.0.0/0 or none, the first such in uci order, as
+    # mwan3 matches them. It was the first online interface in config order,
+    # which is not what routes: a failover policy whose lower metric is the
+    # second interface, or a balanced one over both, showed the first. A
+    # policy over two or more members is balancing and has no single
+    # gateway, and an unknown policy has none either: null. Every interface
+    # keeps the state mwan3 names (connecting and disabled were "offline",
+    # and any other state was dropped).
+    #
+    # The uci rules and the status go through ONE awk, split by a marker
+    # line uci never prints. Nothing is printed when mwan3 printed nothing,
+    # and the defaults stay.
+    _mw_out=$({ uci -q show mwan3 2>/dev/null; echo '@@bk-mwan3-status@@'; mwan3 status 2>/dev/null; } | awk '
+    $0 == "@@bk-mwan3-status@@" { st_part = 1; next }
+    !st_part {
+        eq = index($0, "="); if (!eq) next;
+        key = substr($0, 1, eq - 1); val = substr($0, eq + 1);
+        gsub(/^'"'"'|'"'"'$/, "", val);
+        n = split(key, k, ".");
+        if (n == 2 && val == "rule") { nr++; rs[nr] = k[2]; ri[k[2]] = nr; next }
+        if (n == 3 && (k[2] in ri)) ro[k[2], k[3]] = val;
+        next
     }
-    END { if (any) printf "G%s\n[%s]", gw, js }')
+    length($0) > 0 { any = 1 }
+    /^ *interface [^ ]+ is [^ ]+/ {
+        st = $4; if (st !~ /^[a-z]+$/) st = "unknown";
+        if (count > 0) js = js ", ";
+        js = js sprintf("{\"policy\":null,\"interface\":\"%s\",\"status\":\"%s\"}", $2, st); count++;
+        next
+    }
+    # A section header holds a space; a policy name cannot.
+    /^[^ ].*:$/ && index($0, " ") { sec = ($0 == "Current ipv4 policies:"); pol = ""; next }
+    sec && /^[A-Za-z0-9_]+:$/ { pol = substr($0, 1, length($0) - 1); nm[pol] = 0; next }
+    sec && pol != "" && /^ +[^ ]/ { nm[pol]++; mb[pol] = ($2 ~ /^[(][0-9]+%[)]$/) ? $1 : "" }
+    END {
+        if (!any) exit;
+        dpol = "";
+        for (i = 1; i <= nr && dpol == ""; i++) {
+            r = rs[i];
+            if (ro[r, "src_ip"] != "" || ro[r, "src_port"] != "" || ro[r, "dest_port"] != "" || ro[r, "ipset"] != "") continue;
+            if (ro[r, "proto"] != "" && ro[r, "proto"] != "all") continue;
+            if (ro[r, "family"] == "ipv6") continue;
+            if (ro[r, "dest_ip"] != "" && ro[r, "dest_ip"] != "0.0.0.0/0") continue;
+            dpol = ro[r, "use_policy"];
+        }
+        gw = (dpol != "" && nm[dpol] == 1) ? mb[dpol] : "";
+        if (gw !~ /^[A-Za-z0-9_.-]+$/) gw = "";
+        printf "G%s\n[%s]", gw, js
+    }')
     case "$_mw_out" in
         G*"$BK_NL"*)
             mwan3_active_gw=${_mw_out%%"$BK_NL"*}; mwan3_active_gw=${mwan3_active_gw#G}

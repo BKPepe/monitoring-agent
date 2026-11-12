@@ -623,6 +623,13 @@ PATH="/tmp/rsstop:$PATH" sh agent_openwrt.sh --dry-run > $OUT/wrss2.json 2> $OUT
 kill "$_rss_pid" 2>/dev/null; wait "$_rss_pid" 2>/dev/null || true
 rm -rf /tmp/rsstop
 fresh
+# mwan3's gateway is the one member of the policy the catch-all IPv4 rule
+# uses, and every interface keeps the state mwan3 names (R73).
+for _m in balance failover down; do
+    pl "wmw-$_m"
+    BK_STUB_MWAN3=$_m sh agent_openwrt.sh --dry-run > "$OUT/wmw-$_m.json" 2> "$OUT/wmw-$_m.err"
+    fresh
+done
 # Neither nft nor iptables: unknown, not "off". The image has no iptables
 # applet at all, which is what a router without the compat layer looks like.
 stub_off nft

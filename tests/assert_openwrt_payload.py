@@ -132,6 +132,7 @@ wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
 wpath1b, wpath1c = payload("wpath1b"), payload("wpath1c")
 wstk = [payload(f"wstk{n}") for n in range(1, 4)]
+wmw = {m: payload(f"wmw-{m}") for m in ("balance", "failover", "down")}
 with open(f"{out}/wrss1.rss") as _f:
     wrss_mb = int(_f.read().strip()) / 1024
 
@@ -800,6 +801,14 @@ checks = {
     "speed: a result the server never confirms holds speedtest_active for one run, not for good (R198)":
         [p["speedtest_active"] for p in wstk] == [True, False, True]
         and [x["timestamp"] for x in wstk[2]["speedtests"]] == ["2026-09-21T00:05:00+02:00"],
+    "mwan3: the gateway is the single member of the catch-all rule's policy - the https rule is not it (R73)":
+        d["mwan3_active_gw"] == "wan" and wmw["failover"]["mwan3_active_gw"] == "wwan",
+    "mwan3: a policy balancing over two members, or unreachable, has no single gateway (R73)":
+        wmw["balance"]["mwan3_active_gw"] is None and wmw["down"]["mwan3_active_gw"] is None,
+    "mwan3: every interface keeps the state mwan3 names (R73)":
+        [(p["interface"], p["status"]) for p in wmw["failover"]["mwan3_policies"]]
+        == [("wan", "online"), ("wwan", "online"), ("lte", "connecting"), ("wifi", "disabled")]
+        and [(p["interface"], p["status"]) for p in wmw["down"]["mwan3_policies"]] == [("wan", "offline"), ("wwan", "offline")],
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":
