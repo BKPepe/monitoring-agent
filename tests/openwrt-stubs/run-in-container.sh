@@ -32,8 +32,9 @@
 # wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session, what is
 # cached of its answers), wnum1 with wjnum (a value that is no JSON number is
 # null), wst1..3 (the modem's answer changing, in syslog), wreg1 (the file
-# --register sends its token from) - and the hardening runs (runs-g28.sh,
-# remote actions w19_1..18).
+# --register sends its token from), wbnd1..7 with wbndl (a tool that hangs:
+# killed, skipped once, abandoned while the kernel holds it) - and the
+# hardening runs (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -998,6 +999,145 @@ BK_STUB_UPTIME_ADD=40 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.
 pl wdl2
 BK_STUB_UPTIME_ADD=50 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wdl2.json 2> $OUT/wdl2.err
 fresh
+
+# --- wbnd1..wbnd7: bounded calls (C1, 0.1.15) ---------------------------------
+# A tool that waits in the kernel no longer holds the run. df stands in for
+# every bounded tool; each run's wall time is taken on the container's clock.
+#   wbnd1  df_root hangs: killed after 5 s, hdd null, the run goes on (the
+#          filesystem list is df_fs, its own tag), timeout:df_root
+#   wbnd2  the next run skips df_root once: skipped:df_root
+#   wbnd3  and the one after asks again: no token
+#   wbnd4  a df_fs process the kernel still holds (planted: a live PID and
+#          its start time in bnd.skip) is skipped while it lives: stuck:df_fs
+#   wbnd5  it is gone: asked again, and syslog says so
+#   wbnd6  df_root hangs and leaves a process outside its tree on the FIFO:
+#          stuck:df_root, abandoned without waiting, the later calls of the
+#          run get 1 s, and the FIFO is not left behind
+#   wbnd7  the next run skips df_root once
+bnd() { # TAG [VAR=VALUE...]: one dry run, its wall time and bnd.skip filed under TAG
+    _bt=$1; shift
+    _b0=$(realcs)
+    pl "$_bt"
+    env "$@" sh agent_openwrt.sh --dry-run > "$OUT/$_bt.json" 2> "$OUT/$_bt.err" || true
+    echo $(( $(realcs) - _b0 )) > "$OUT/${_bt}_cs.txt"
+    cat "$PRIV/bnd.skip" > "$OUT/${_bt}_skip.txt" 2>/dev/null || : > "$OUT/${_bt}_skip.txt"
+    if [ -e "$PRIV/bnd.fifo" ]; then echo fifo; else echo none; fi > "$OUT/${_bt}_fifo.txt"
+}
+fresh
+touch /tmp/df.hold
+bnd wbnd1 BK_STUB_DF_HOLD=/tmp/df.hold BK_STUB_DF_HOLD_S=30
+bnd wbnd2
+bnd wbnd3
+sleep 300 &
+_bs=$!
+read -r _bl < "/proc/$_bs/stat"; set -- ${_bl##*") "}
+printf 'df_fs %s %s\n' "$_bs" "${20}" > "$PRIV/bnd.skip"
+echo "# wbnd4" >> $OUT/logger.log
+bnd wbnd4
+kill -9 "$_bs" 2>/dev/null; wait "$_bs" 2>/dev/null || true
+echo "# wbnd5" >> $OUT/logger.log
+bnd wbnd5
+echo "# end" >> $OUT/logger.log
+fresh
+touch /tmp/df.escape
+echo "# wbnd6" >> $OUT/logger.log
+bnd wbnd6 BK_STUB_DF_ESCAPE=/tmp/df.escape
+echo "# end" >> $OUT/logger.log
+bnd wbnd7
+for _p in /proc/[0-9]*; do
+    read -r _pc 2>/dev/null < "$_p/cmdline" || continue
+    case "$_pc" in sleep60) kill -9 "${_p#/proc/}" 2>/dev/null ;; esac
+done
+rm -f /tmp/df.hold /tmp/df.escape
+fresh
+
+# --- wbndl: bk_bounded itself, lifted from the agent (C1) ----------------------
+# What a full run cannot make happen on cue: a child of the shell that exits
+# at the wrong moment, and a bound the run cuts short.
+#   race     60 calls, each right after a child that exits at once: the open
+#            of the FIFO is interrupted (EINTR) in a quarter to a third of
+#            them on busybox 1.36, and every call must still be bounded and
+#            answered (a skipped block used to leave a wait with no bound)
+#   stretch  a child gone 3 s into a 5 s bound restarts busybox's read -t:
+#            the call still ends within the bound and one slice
+#   capped, late  the bound cut to 1 s by an earlier stuck call, then by the
+#            run's deadline: "budget", and no skip line for the next run
+#   rwq, rwh  the read-write fallback (the fourth open), forced: a quick
+#            tool answers within a slice, a hung one is a timeout, not stuck
+# A watchdog ends the shell if a call is not bounded after all.
+sed -n -e '/^bk_proc_start() {/,/^}/p' -e '/^bk_lock_tree() {/,/^}/p' -e '/^bk_alive() {/,/^}/p' \
+    -e '/^bk_bnd_note() {/,/^}/p' -e '/^bk_bnd_load() {/,/^}/p' -e '/^bk_bnd_cs() {/,/^}/p' \
+    -e '/^bk_bnd_wait() {/,/^}/p' -e '/^bk_bounded() {/,/^}/p' agent_openwrt.sh > /tmp/bndl.sh
+sed 's/_bb_try=0$/_bb_try=3/' /tmp/bndl.sh > /tmp/bndl-rw.sh
+bndl() { # LIFTED-FILE: the agent's bounded calls in a shell of their own
+    BK_PRIVATE_DIR=/tmp/bndl.d; rm -rf "$BK_PRIVATE_DIR"; mkdir -p "$BK_PRIVATE_DIR"
+    BK_BND_FIFO=$BK_PRIVATE_DIR/bnd.fifo; BK_BND_SKIP=$BK_PRIVATE_DIR/bnd.skip
+    BK_BND_RESERVE_S=10; BK_NL='
+'
+    bk_bnd_fifo=""; bk_bnd_skip=""; bk_bnd_stuck=""; bk_bnd_errs=""
+    bk_syslog() { echo "syslog: $1"; }
+    bk_proc_where() { _pw=wchan; }
+    bk_time_left() { _left=""; }
+    . "$1"
+}
+watched() { # OUTFILE CMD...: CMD in the background, killed after 90 s
+    _wo=$1; shift
+    "$@" > "$_wo" 2>&1 &
+    _wl=$!
+    # Looks once a second, so it leaves no sleep behind once CMD is reaped.
+    ( _wn=0
+      while [ "$_wn" -lt 90 ] && kill -0 "$_wl" 2>/dev/null; do sleep 1; _wn=$((_wn + 1)); done
+      kill -9 "$_wl" 2>/dev/null ) &
+    _wk=$!
+    wait "$_wl" 2>/dev/null || true
+    wait "$_wk" 2>/dev/null || true
+}
+bndl_main() {
+    # The agent runs without set -e: a read -t that times out is no error.
+    set +e
+    bndl /tmp/bndl.sh
+    _ok=0; _i=0
+    while [ "$_i" -lt 60 ]; do
+        _i=$((_i + 1))
+        true &
+        bk_bounded 5 race "$BK_PRIVATE_DIR/out" echo "answer $_i"
+        _a=""; read -r _a < "$BK_PRIVATE_DIR/out"
+        [ "$_bb_rc" = 0 ] && [ "$_a" = "answer $_i" ] && _ok=$((_ok + 1))
+    done
+    echo "race $_ok/$_i"
+    sleep 3 &
+    _t0=$(realcs)
+    bk_bounded 5 stretch "$BK_PRIVATE_DIR/out" sleep 30
+    echo "stretch $_bb_rc $(( $(realcs) - _t0 ))"
+    bk_bnd_stuck=1
+    bk_bounded 5 capped "$BK_PRIVATE_DIR/out" sleep 30
+    echo "capped $_bb_rc"
+    bk_bnd_stuck=""
+    bk_time_left() { _left=11; }
+    bk_bounded 5 late "$BK_PRIVATE_DIR/out" sleep 30
+    echo "late $_bb_rc"
+    echo "errs$bk_bnd_errs"
+    echo "skip $(tr '\n' ' ' < "$BK_BND_SKIP")"
+}
+bndl_rw() {
+    # The agent runs without set -e: a read -t that times out is no error.
+    set +e
+    bndl /tmp/bndl-rw.sh
+    _t0=$(realcs)
+    bk_bounded 5 rwq "$BK_PRIVATE_DIR/out" echo quick
+    _a=""; read -r _a < "$BK_PRIVATE_DIR/out"
+    echo "rwq $_bb_rc $_a $(( $(realcs) - _t0 ))"
+    bk_bounded 2 rwh "$BK_PRIVATE_DIR/out" sleep 30
+    echo "rwh $_bb_rc"
+    echo "errs$bk_bnd_errs"
+}
+watched $OUT/wbndl.txt bndl_main
+watched $OUT/wbndl_rw.txt bndl_rw
+for _p in /proc/[0-9]*; do
+    read -r _pc 2>/dev/null < "$_p/cmdline" || continue
+    case "$_pc" in sleep30) kill -9 "${_p#/proc/}" 2>/dev/null ;; esac
+done
+rm -rf /tmp/bndl.d /tmp/bndl.sh /tmp/bndl-rw.sh
 
 # --- wsc1: what "the port listens" is read from (R6) --------------------------
 # A service check asks for the port when its process is not found, and Service

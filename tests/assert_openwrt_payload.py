@@ -144,6 +144,19 @@ wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wdnsm = payload("wdnsm")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
+# C1: the bounded calls (run-in-container.sh wbnd1..wbnd7).
+wbnd = {t: payload(t) for t in ("wbnd1", "wbnd2", "wbnd3", "wbnd4", "wbnd5", "wbnd6", "wbnd7")}
+def bnd_cs(t):
+    v = text(f"{t}_cs.txt") or ""
+    return int(v) if v.isdigit() else 10 ** 9
+bnd_log = by_run("logger.log")
+# wbndl: bk_bounded lifted from the agent, "NAME FIELD..." per line.
+def bndl(name):
+    return {l.split()[0]: l.split()[1:] for l in (text(name) or "").splitlines() if l.strip()}
+wbndl, wbndl_rw = bndl("wbndl.txt"), bndl("wbndl_rw.txt")
+def bndl_cs(d, key, i):
+    v = (d.get(key) or [])[i:i + 1]
+    return int(v[0]) if v and v[0].isdigit() else 10 ** 9
 wsta1 = payload("wsta1")
 ping_runs = by_run("ping_calls.log")
 # R338: the real runs' client calls, and the bodies they were handed.
@@ -918,6 +931,35 @@ checks = {
         and "curl " in "\n".join(post_runs.get("wpost-full", [])) and " -d {" in "\n".join(post_runs.get("wpost-full", []))
         and "POSTKEY789" in "\n".join(post_runs.get("wpost-full", []))
         and "Telo POSTu nejde zapsat" in (text("wpost-full_log.txt") or ""),
+    "bounded: a run where every tool answers names nothing - collect_errors is [] (C1)":
+        d1["collect_errors"] == [] and d["collect_errors"] == [],
+    "bounded: a df that hangs is killed after 5 s and the run goes on - hdd null, the filesystem list still there, timeout:df_root (C1)":
+        wbnd["wbnd1"]["collect_errors"] == ["timeout:df_root"] and wbnd["wbnd1"]["hdd"] is None
+        and len(wbnd["wbnd1"]["filesystems"]) > 0 and bnd_cs("wbnd1") < 1500
+        and text("wbnd1_skip.txt") == "df_root" and text("wbnd1_fifo.txt") == "none",
+    "bounded: the next run skips that tag once, and the one after asks again (C1)":
+        wbnd["wbnd2"]["collect_errors"] == ["skipped:df_root"] and wbnd["wbnd2"]["hdd"] is None and text("wbnd2_skip.txt") == ""
+        and wbnd["wbnd3"]["collect_errors"] == [] and isinstance(wbnd["wbnd3"]["hdd"], int),
+    "bounded: a process the kernel still holds keeps its tag skipped while it lives, then it is asked again and syslog says so (C1)":
+        wbnd["wbnd4"]["collect_errors"] == ["stuck:df_fs"] and wbnd["wbnd4"]["filesystems"] == []
+        and (text("wbnd4_skip.txt") or "").startswith("df_fs ")
+        and wbnd["wbnd5"]["collect_errors"] == [] and len(wbnd["wbnd5"]["filesystems"]) > 0 and text("wbnd5_skip.txt") == ""
+        and any("df_fs" in l and "uz skoncil" in l for l in bnd_log.get("wbnd5", [])),
+    "bounded: a hang that leaves a process outside its tree on the FIFO is abandoned at once - stuck:df_root, the run still in time, no FIFO left (C1)":
+        "stuck:df_root" in wbnd["wbnd6"]["collect_errors"] and bnd_cs("wbnd6") < 2000
+        and text("wbnd6_skip.txt") == "df_root" and text("wbnd6_fifo.txt") == "none"
+        and any("mimo jeho strom" in l for l in bnd_log.get("wbnd6", []))
+        and wbnd["wbnd7"]["collect_errors"] == ["skipped:df_root"],
+    "bounded: a child gone just before each of 60 calls interrupts the FIFO's open, and every call is still bounded and answered, ash's \"can't open\" never shown (C1)":
+        wbndl.get("race") == ["60/60"] and "can't open" not in (text("wbndl.txt") or ""),
+    "bounded: a child gone 3 s into a 5 s bound restarts busybox's read -t, the call still ends within the bound and a slice (C1)":
+        (wbndl.get("stretch") or [""])[0] == "124" and 450 <= bndl_cs(wbndl, "stretch", 1) < 700,
+    "bounded: a bound cut short by a stuck call or by the run's deadline is budget, and the next run skips nothing for it (C1)":
+        wbndl.get("capped") == ["124"] and wbndl.get("late") == ["124"]
+        and wbndl.get("errs") == ["timeout:stretch", "budget:capped", "budget:late"] and wbndl.get("skip") == ["stretch"],
+    "bounded: the read-write fallback (the fourth open) answers within a slice and calls a hung tool a timeout, not stuck (C1)":
+        (wbndl_rw.get("rwq") or [""])[:2] == ["0", "quick"] and bndl_cs(wbndl_rw, "rwq", 2) < 200
+        and wbndl_rw.get("rwh") == ["124"] and wbndl_rw.get("errs") == ["timeout:rwh"],
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":
@@ -1248,7 +1290,7 @@ checks.update({
 # reason there. 0.1.11: 28 - uplink.ring (the counter snapshots the speedtest
 # uplink is judged on) and uplink.cache (the verdict of a result not yet
 # acknowledged), one page each.
-FORK_BUDGET = 200
+FORK_BUDGET = 194
 FORK_SLACK = 9
 MAX_RSS_KB = 6144
 SHELL_ANON_KB = 768

@@ -13,6 +13,14 @@ if [ -n "$BK_STUB_DF_HOLD" ] && [ -f "$BK_STUB_DF_HOLD" ]; then
     rm -f "$BK_STUB_DF_HOLD"
     sleep "${BK_STUB_DF_HOLD_S:-1000}"
 fi
+# BK_STUB_DF_ESCAPE=<file>: while that file exists, the first df removes it,
+# leaves a process outside its own tree holding its fd 3 (the agent's FIFO,
+# C1) and hangs - what a tool that hands its work to a daemon looks like.
+if [ -n "$BK_STUB_DF_ESCAPE" ] && [ -f "$BK_STUB_DF_ESCAPE" ]; then
+    rm -f "$BK_STUB_DF_ESCAPE"
+    ( sleep 60 & )
+    sleep 60
+fi
 if [ -n "$BK_STUB_DF_AVAIL" ] && [ "$1" = "-Pk" ]; then
     printf 'Filesystem           1024-blocks    Used Available Capacity Mounted on\n'
     printf 'overlayfs:/overlay          7000    6900 %9s  99%% /\n' "$BK_STUB_DF_AVAIL"

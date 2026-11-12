@@ -374,6 +374,35 @@ bk_uptime_cs() {
 bk_uptime_cs
 BK_RUN_START_CS="$_up_cs"
 
+# WW-04: the run has a deadline. cron starts the next run 60 s after this one
+# started, and a run still holding the lock then costs that minute its report
+# ("l"). The POST used to wait up to 20 s whatever the clock said, so a slow
+# run plus a stalled server went over. Its limit now comes from the time left
+# until 58 s after the start (the uptime clock of agent_run_ms), minus 5 s
+# for the name lookup, which uclient-fetch's -T does not bound (5.0-5.5 s
+# measured). Never more than the 20 s it always had, never less than 5 s: a
+# run that is already late still gets a real chance to deliver. The
+# follow-ups after the report (action results, service checks, the update)
+# use what is left, and those that can wait for the next minute are skipped
+# below 12 s. No clock (no uptime to read): the fixed limits, as before.
+BK_RUN_DEADLINE_S=58
+bk_time_left() { # -> _left: whole seconds until the deadline, or empty
+    _left=""
+    bk_uptime_cs
+    if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
+        _left=$(( BK_RUN_DEADLINE_S - (_up_cs - BK_RUN_START_CS) / 100 ))
+    fi
+    return 0
+}
+bk_limit() { # LOW HIGH RESERVE -> _lim: _left minus RESERVE, clamped; HIGH without a clock
+    _lim=$2
+    [ -n "$_left" ] || return 0
+    _lim=$((_left - $3))
+    [ "$_lim" -gt "$2" ] && _lim=$2
+    [ "$_lim" -lt "$1" ] && _lim=$1
+    return 0
+}
+
 # Automatické vyčištění starých logů z flash paměti (/root) pro prevenci opotřebení disku
 for old_log in "$ScriptPath/agent_openwrt.log" "$ScriptPath/agent.log" /root/agent_openwrt.log /root/agent.log /root/status-agent-openwrt.log; do
     if [ -f "$old_log" ] && [ "$old_log" != "$LOG_FILE" ]; then
@@ -1108,6 +1137,224 @@ echo "$$" > "$BK_LOCK_DIR/pid" 2>/dev/null
 bk_proc_start "$$"
 [ -n "$BK_RUN_START_CS" ] && [ -n "$_ps_start" ] && printf '%s %s\n' "$BK_RUN_START_CS" "$_ps_start" > "$BK_LOCK_DIR/info" 2>/dev/null
 
+# --- Bounded calls (C1, 0.1.15) ---------------------------------------------
+#
+# A tool that waits in the kernel - df on a dead USB disk, nft on the nfnl
+# mutex, iw on a wedged radio - used to hold the run, then the lock, and
+# after 300 s the takeover; one the kernel would not let go of even after
+# SIGKILL kept every later run at the lock and the router went silent.
+# bk_bounded runs such a tool with its output in a file and waits at most
+# SECS for it. busybox has no usable timed wait: its `timeout` only sends a
+# signal and cannot end a wait on a process in D state, and OpenWrt's ash
+# has neither fractional sleep nor read -t on a pipe of a $(...). What it
+# has is `read -t` on a FIFO: the tool gets the FIFO's write end as fd 3,
+# so the read ends with EOF the moment the tool and everything it started
+# are gone - no added latency, no added fork - or after SECS. The uptime
+# clock, not read's status (1 in 1.36, 142 in 1.38), says which.
+# A child of the agent that exits meanwhile (a logger killed a moment
+# before, a tool abandoned earlier that the kernel let go) trips ash twice:
+# read -t starts its time over on every SIGCHLD - 4 s became 6 s with a
+# child gone after 2 - so the wait goes in 1 s slices against the clock;
+# and the open of the FIFO, which waits for the tool's own open, fails with
+# EINTR and ash skips the block it guards - with a child gone just before,
+# in a quarter to a third of the calls on busybox 1.36 - so it is tried
+# again.
+#
+# Out of time: the tool's tree is killed (SIGKILL) and given 2 s. Gone then,
+# it was a timeout: the output is dropped whole, the next run skips the tag
+# once ("skipped"), and the run goes on. A bound the run had cut short
+# (after a stuck call, or late before its POST, see bk_bounded) says
+# nothing about the tool: that is "budget", and nothing is skipped. Still
+# there, the kernel holds it: it is abandoned, never waited for, and its
+# tag is skipped for as long as that process lives ("stuck"), named in
+# syslog with its wchan. The FIFO it still holds is replaced. Every outcome
+# is a collect_errors token kind:tag[:name] in the report, which the server
+# shows as a collection issue. Without a FIFO (no mkfifo) the call runs as
+# before, unbounded. The FIFO is made by the first bounded call and removed
+# by the EXIT trap.
+BK_BND_FIFO="$BK_PRIVATE_DIR/bnd.fifo"
+# One line per tag: "tag" = skip once; "tag pid start" = skip while it lives.
+BK_BND_SKIP="$BK_PRIVATE_DIR/bnd.skip"
+# Scratch for the small answers (df); truncated after every read.
+BK_BND_OUT="$BK_PRIVATE_DIR/bnd.out"
+# df -PT's body, read by the filesystem list and the disk collector.
+BK_DF_OUT="$BK_PRIVATE_DIR/df.out"
+# Seconds no bounded call may eat into before the run's deadline: the POST.
+BK_BND_RESERVE_S=10
+bk_bnd_fifo=""; bk_bnd_skip=""; bk_bnd_stuck=""; bk_bnd_errs=""
+bk_alive() { # PID [START] -> 0 while that process lives (a zombie does not)
+    bk_proc_start "$1"
+    case "$_ps_state" in ''|Z) return 1 ;; esac
+    [ -z "$2" ] || [ "$2" = "$_ps_start" ]
+}
+bk_bnd_note() { # KIND TAG -> one collect_errors token, once
+    case " $bk_bnd_errs " in *" $1:$2 "*) return 0 ;; esac
+    bk_bnd_errs="$bk_bnd_errs $1:$2"
+}
+# The skip list, read once per run: a skip-once tag is consumed here, a
+# stuck one stays while its process lives (pid AND start time, so a reused
+# PID does not count) and is named every run.
+bk_bnd_load() {
+    bk_bnd_skip=" "
+    [ -f "$BK_BND_SKIP" ] || return 0
+    _bs_keep=""
+    while read -r _bs_tag _bs_pid _bs_start _bs_x; do
+        case "$_bs_tag" in ''|*[!A-Za-z0-9:._-]*) continue ;; esac
+        case "$_bs_pid$_bs_start" in *[!0-9]*) continue ;; esac
+        if [ -n "$_bs_pid" ]; then
+            if bk_alive "$_bs_pid" "$_bs_start"; then
+                _bs_keep="$_bs_keep$_bs_tag $_bs_pid $_bs_start$BK_NL"
+                bk_bnd_skip="$bk_bnd_skip$_bs_tag=stuck "
+                bk_bnd_note stuck "$_bs_tag"
+            else
+                bk_syslog "Prikaz $_bs_tag (PID $_bs_pid) uz skoncil, behy ho zase spousti."
+            fi
+        else
+            bk_bnd_skip="$bk_bnd_skip$_bs_tag=skipped "
+            bk_bnd_note skipped "$_bs_tag"
+        fi
+    done < "$BK_BND_SKIP" 2>/dev/null
+    printf '%s' "$_bs_keep" > "$BK_BND_SKIP" 2>/dev/null
+}
+# The real uptime in centiseconds, for the waits below. Not through $BK_PROC:
+# under the dry-run seam that is a planted file whose clock stands still.
+bk_bnd_cs() {
+    _bc=""
+    read -r _bc_raw _ < /proc/uptime 2>/dev/null || return 0
+    case "$_bc_raw" in *.[0-9][0-9]) _bc=${_bc_raw%.*}${_bc_raw#*.} ;; esac
+    case "$_bc" in *[!0-9]*) _bc="" ;; esac
+}
+# The wait, inside the FIFO's read end; bk_bounded's variables throughout.
+bk_bnd_wait() {
+    if [ -n "$_bb_t0" ]; then
+        # 1 s slices: a SIGCHLD restarts only the slice it hits. One that
+        # ends early ended on EOF or on a line the tool wrote to fd 3.
+        while :; do
+            _bb_ts=$_bc
+            # read -t is busybox ash's, not POSIX sh's; this script runs only
+            # under ash, and the timed read on the FIFO is the bound itself.
+            # shellcheck disable=SC3045
+            read -t 1 _bb_x
+            bk_bnd_cs
+            [ -n "$_bc" ] || break
+            [ $((_bc - _bb_t0)) -lt $((_bb_s * 100)) ] || break
+            [ $((_bc - _bb_ts)) -ge 90 ] || break
+            bk_alive "$_bb_pid" || break
+        done
+    else
+        # No clock to slice by: one read, the whole bound.
+        # shellcheck disable=SC3045
+        read -t "$_bb_s" _bb_x
+    fi
+    # The pipe end closes in do_exit() a moment before the process
+    # becomes a zombie: look again a few times before sleeping on it.
+    _bb_i=0
+    while [ "$_bb_i" -lt 20 ] && bk_alive "$_bb_pid"; do _bb_i=$((_bb_i + 1)); done
+    if bk_alive "$_bb_pid"; then
+        bk_bnd_cs
+        while [ -n "$_bc" ] && [ -n "$_bb_t0" ] && [ $(( (_bc - _bb_t0) / 100 )) -lt "$_bb_s" ] && bk_alive "$_bb_pid"; do
+            sleep 1; bk_bnd_cs
+        done
+    fi
+    bk_alive "$_bb_pid" || return 0
+    _bb_rc=124
+    bk_lock_tree "$_bb_pid"
+    for _bb_p in $_kt_list; do kill -9 "$_bb_p" 2>/dev/null; done
+    bk_bnd_cs; _bb_t1=$_bc
+    # A read-write open (the fourth try) holds a write end itself: no EOF
+    # to wait for, and nothing to learn from its absence.
+    # shellcheck disable=SC3045
+    [ "$_bb_try" -le 3 ] && read -t 2 _bb_x
+    bk_bnd_cs
+    # The same race as above, after the kill: the FIFO's EOF comes a
+    # moment before the killed process turns into a zombie. A process
+    # still there after 20 looks and one more second is a survivor.
+    for _bb_p in $_kt_list; do
+        _bb_i=0
+        while [ "$_bb_i" -lt 20 ] && bk_alive "$_bb_p"; do _bb_i=$((_bb_i + 1)); done
+        bk_alive "$_bb_p" && { sleep 1; bk_alive "$_bb_p"; } && { _bb_sv=$_bb_p; _bb_svs=$_ps_start; break; }
+    done
+    [ "$_bb_try" -le 3 ] && [ -n "$_bc" ] && [ -n "$_bb_t1" ] && [ $((_bc - _bb_t1)) -ge 150 ] && _bb_late=1
+    return 0
+}
+bk_bounded() { # SECS TAG OUT CMD [ARG...] -> _bb_rc (124 out of time, 125 not run), _bb_pid
+    _bb_s=$1; _bb_tag=$2; _bb_out=$3; shift 3
+    _bb_rc=125; _bb_pid=""; : > "$_bb_out"
+    [ -n "$bk_bnd_skip" ] || bk_bnd_load
+    case "$bk_bnd_skip" in *" $_bb_tag="*) return 0 ;; esac
+    _bb_full=$_bb_s
+    # After one abandoned call the kernel is in trouble: everything after it
+    # gets a second, so the run still reaches its POST.
+    [ -n "$bk_bnd_stuck" ] && _bb_s=1
+    # A late run still makes every call - they take milliseconds when the
+    # kernel answers - but none may wait past the run's deadline minus the
+    # POST's reserve; one second is the floor (read -t takes whole seconds).
+    bk_time_left
+    if [ -n "$_left" ] && [ $((_left - BK_BND_RESERVE_S)) -lt "$_bb_s" ]; then
+        _bb_s=$((_left - BK_BND_RESERVE_S))
+        [ "$_bb_s" -ge 1 ] || _bb_s=1
+    fi
+    if [ -z "$bk_bnd_fifo" ]; then
+        bk_bnd_fifo=0
+        if [ ! -p "$BK_BND_FIFO" ]; then
+            [ -e "$BK_BND_FIFO" ] && rm -f "$BK_BND_FIFO"
+            mkfifo "$BK_BND_FIFO" 2>/dev/null || mknod "$BK_BND_FIFO" p 2>/dev/null
+        fi
+        [ -p "$BK_BND_FIFO" ] && bk_bnd_fifo=1
+    fi
+    if [ "$bk_bnd_fifo" != 1 ]; then
+        "$@" > "$_bb_out" 2>/dev/null < /dev/null; _bb_rc=$?
+        return 0
+    fi
+    bk_bnd_cs; _bb_t0=$_bc
+    "$@" 3> "$BK_BND_FIFO" > "$_bb_out" 2>/dev/null < /dev/null &
+    _bb_pid=$!
+    _bb_sv=""; _bb_late=""; _bb_in=""; _bb_try=0
+    # This open waits for the tool's own open of the FIFO. A child that
+    # exits meanwhile makes it fail with EINTR, ash skips the block, and the
+    # wait below would have no bound - so try again, the tool is waiting
+    # for it. 2>/dev/null BEFORE the `<` keeps ash's "can't open" quiet.
+    # The fourth try opens read-write, which never waits: no EOF then, and
+    # each slice looks at the tool instead.
+    while [ -z "$_bb_in" ]; do
+        _bb_try=$((_bb_try + 1))
+        if [ "$_bb_try" -le 3 ]; then
+            { _bb_in=1; bk_bnd_wait; } 2>/dev/null < "$BK_BND_FIFO"
+        else
+            { _bb_in=1; bk_bnd_wait; } 2>/dev/null <> "$BK_BND_FIFO"
+        fi
+    done
+    if [ "$_bb_rc" != 124 ]; then
+        wait "$_bb_pid" 2>/dev/null; _bb_rc=$?
+        return 0
+    fi
+    if [ -z "$_bb_sv" ] && [ -z "$_bb_late" ]; then
+        wait "$_bb_pid" 2>/dev/null; _bb_rc=124
+        : > "$_bb_out"                       # never half an answer
+        if [ "$_bb_s" -lt "$_bb_full" ]; then
+            bk_bnd_note budget "$_bb_tag"
+            bk_syslog "Prikaz $_bb_tag neskoncil do zkraceneho limitu $_bb_s s, ukoncen."
+        else
+            bk_bnd_note timeout "$_bb_tag"
+            printf '%s\n' "$_bb_tag" >> "$BK_BND_SKIP" 2>/dev/null
+            bk_syslog "Prikaz $_bb_tag neskoncil do $_bb_s s, ukoncen; pristi beh ho vynecha."
+        fi
+        return 0
+    fi
+    bk_bnd_stuck=1
+    bk_bnd_note stuck "$_bb_tag"
+    rm -f "$BK_BND_FIFO" "$_bb_out"; : > "$_bb_out"; bk_bnd_fifo=""
+    if [ -n "$_bb_sv" ]; then
+        printf '%s %s %s\n' "$_bb_tag" "$_bb_sv" "$_bb_svs" >> "$BK_BND_SKIP" 2>/dev/null
+        bk_proc_where "$_bb_sv"
+        bk_syslog "Prikaz $_bb_tag (PID $_bb_sv, $_pw) neskoncil ani po SIGKILL - drzi ho jadro; dalsi behy ho vynechaji, dokud neskonci."
+    else
+        printf '%s\n' "$_bb_tag" >> "$BK_BND_SKIP" 2>/dev/null
+        bk_syslog "Prikaz $_bb_tag neskoncil do $_bb_s s a jeho vystup drzi proces mimo jeho strom; pristi beh ho vynecha."
+    fi
+    return 0
+}
+
 # G42: the WHOLE previous run, its POST included. The payload is assembled
 # before the POST, so a run can never report its own total - and the POST is
 # what usually pushes a minute run past its minute, which is the thing worth
@@ -1176,6 +1423,10 @@ bk_run_end() {
     _re_pid=""
     read -r _re_pid 2>/dev/null < "$BK_LOCK_DIR/pid"
     [ "$_re_pid" = "$$" ] || return 0
+    # The bounded calls' FIFO lives only while a run does: left in the
+    # private directory, it would block any reader that opens it, a
+    # `grep -r` over /var/run included.
+    [ -p "$BK_BND_FIFO" ] && rm -f "$BK_BND_FIFO" 2>/dev/null
     # A body a POST left behind (the run was cut short inside it) holds the
     # key. A test, not a fork, on the runs that left nothing.
     [ -e "$BK_POST_BODY" ] && rm -f "$BK_POST_BODY" 2>/dev/null
@@ -1537,9 +1788,16 @@ fi
 # se rovnou /. ---
 df_target="/overlay"
 [ -d "$df_target" ] || df_target="/"
-hdd=$(df -P "$df_target" 2>/dev/null | tail -n 1 | awk '{gsub("%","",$5); print $5}')
+# Bounded (C1): statfs on a dead overlay waits in the kernel. The last
+# line's 5th column, parsed with builtins (it was tail | awk, 4 forks); a
+# value that is not plain digits - df's own header word on a failure - is
+# null, never a bare word in the JSON.
+hdd=""
+bk_bounded 5 df_root "$BK_BND_OUT" df -P "$df_target"
+while read -r _ _ _ _ _df5 _; do hdd=${_df5%\%}; done < "$BK_BND_OUT" 2>/dev/null
+: > "$BK_BND_OUT"
 # df selhal (chybejici mountpoint, prava) - nevime, ne "prazdny disk".
-[ -z "$hdd" ] && hdd="null"
+case "$hdd" in ''|*[!0-9]*) hdd="null" ;; esac
 
 # --- 2b. Btrfs stav - jen zarizeni s btrfs (napr. Turris) ho maji, klasicky
 # OpenWrt squashfs+jffs2/overlay btrfs vubec nezna a prikaz jen tise selze
@@ -2616,17 +2874,23 @@ fi
 filesystems_json="[]"
 if command -v df >/dev/null 2>&1; then
     # -T (typ FS) umi coreutils i novejsi busybox; kdyz ne, jede se bez typu.
-    df_out=$(df -PT 2>/dev/null) || df_out=""
+    # Bounded (C1) under its own tag, so a hung data disk does not take hdd
+    # (df_root) with it. The output stays in df.out for the disk collector
+    # below. One failing mount makes df exit non-zero but still lists the
+    # others: kept, where it used to fall back to df -P and lose every type.
+    # An old busybox without -T prints nothing: asked once more, never after
+    # a timeout.
+    bk_bounded 5 df_fs "$BK_DF_OUT" df -PT
     df_has_type=1
-    if [ -z "$df_out" ]; then
-        df_out=$(df -P 2>/dev/null)
+    if [ ! -s "$BK_DF_OUT" ] && [ "$_bb_rc" -lt 124 ]; then
+        bk_bounded 5 df_fs "$BK_DF_OUT" df -P
         df_has_type=0
     fi
-    if [ -n "$df_out" ]; then
+    if [ -s "$BK_DF_OUT" ]; then
         # The mount point is everything after the percentage, spaces and all
         # (it was its first word), escaped for JSON like every name the agent
         # sends: a quote in "/mnt/usb #1 "disk"" would have broken the payload.
-        filesystems_json=$(echo "$df_out" | awk -v has_type="$df_has_type" '
+        filesystems_json=$(awk -v has_type="$df_has_type" '
             function esc(s,   o, c, i, n) { gsub(/[\001-\037]/, "", s); if (!index(s, "\\") && !index(s, "\"")) return s; o = ""; n = length(s); for (i = 1; i <= n; i++) { c = substr(s, i, 1); o = o ((c == "\\" || c == "\"") ? "\\" c : c) } return o }
             NR == 1 { next }
             {
@@ -2643,7 +2907,7 @@ if command -v df >/dev/null 2>&1; then
                 printf "%s{\"mount\":\"%s\",\"device\":\"%s\",\"fstype\":\"%s\",\"total_kb\":%s,\"used_kb\":%s,\"avail_kb\":%s,\"used_pct\":%s}",
                        (n++ ? "," : "["), esc(mnt), esc(dev), esc(type), total+0, used+0, avail+0, pct+0;
             }
-            END { printf "%s", (n ? "]" : "[]") }')
+            END { printf "%s", (n ? "]" : "[]") }' "$BK_DF_OUT")
     fi
 fi
 [ -z "$filesystems_json" ] && filesystems_json="[]"
@@ -2890,10 +3154,13 @@ smart_due=""
 : >> "$STORAGE_STATIC"; : >> "$SMART_CACHE"
 # Without `df -T` the type column is missing and every other column shifts, so
 # the join would read a size as a mount point. Better no mount than a wrong one.
-_df_body=""
-[ "$df_has_type" = 1 ] && _df_body="$df_out"
-_storage_out=$(printf '%s\n' "$_df_body" | awk -v smartctl="$have_smartctl" -v active="$diskdev_active" -v now="$now_ts" \
-    -v stuck="$smart_stuck" -v interval="$SMART_INTERVAL_SEC" "$BK_STORAGE_AWK" "$STORAGE_STATIC" "$SMART_CACHE" -)
+# The df -PT body comes from df.out (bounded above); without the type column
+# the collector reads nothing in its place. The file is emptied afterwards.
+_df_body_file="$BK_DF_OUT"
+[ "$df_has_type" = 1 ] || _df_body_file=/dev/null
+_storage_out=$(awk -v smartctl="$have_smartctl" -v active="$diskdev_active" -v now="$now_ts" \
+    -v stuck="$smart_stuck" -v interval="$SMART_INTERVAL_SEC" "$BK_STORAGE_AWK" "$STORAGE_STATIC" "$SMART_CACHE" - < "$_df_body_file")
+: > "$BK_DF_OUT"
 # Last '#': a mount path may contain one, a device name cannot.
 storage_disks_json=${_storage_out%#*}
 smart_due=${_storage_out##*#}
@@ -5897,7 +6164,11 @@ elif [ -f /proc/net/nf_conntrack ]; then
 fi
 
 inode_usage_json="null"
-inode_usage=$(df -i / 2>/dev/null | tail -n 1 | awk '{print $5}' | tr -d '%')
+# Bounded (C1) like df_root, with builtin parsing (it was 5 forks).
+inode_usage=""
+bk_bounded 5 df_inode "$BK_BND_OUT" df -i /
+while read -r _ _ _ _ _di5 _; do inode_usage=${_di5%\%}; done < "$BK_BND_OUT" 2>/dev/null
+: > "$BK_BND_OUT"
 if [ -n "$inode_usage" ] && [ "$inode_usage" -eq "$inode_usage" ] 2>/dev/null; then
     inode_usage_json="$inode_usage"
 fi
@@ -6008,6 +6279,12 @@ bk_js "$ow_kernel"; _js_ow_kernel=$_jr
 bk_js "$ow_model"; _js_ow_model=$_jr
 bk_js "$ow_board_name"; _js_ow_board_name=$_jr
 _bk_auto_update01=0; [ "$AUTO_UPDATE" = "1" ] && _bk_auto_update01=1
+# What the bounded calls gave up on this run (C1): kind:tag[:name] tokens,
+# [] when nothing. The server shows them as a collection issue.
+collect_errors_json="["; _ce_sep=""
+for _ce in $bk_bnd_errs; do collect_errors_json="$collect_errors_json$_ce_sep\"$_ce\""; _ce_sep=","; done
+collect_errors_json="$collect_errors_json]"
+
 payload=$(cat <<EOF
 {
   "agent_key": "$_js_AGENT_KEY",
@@ -6039,6 +6316,7 @@ payload=$(cat <<EOF
   "wifi_radios": $wifi_radios_json,
   "storage_disks": $storage_disks_json,
   "agent_tools": $agent_tools_json,
+  "collect_errors": $collect_errors_json,
   "interfaces": $interfaces_json,
   "discovered_services": $discovered_services_json,
   "lan_subnet": $_jv_lan_subnet,
@@ -6229,35 +6507,6 @@ if [ "$DRY_RUN" = "1" ]; then
     # place of the POST and everything below runs as on a router.
     [ -z "$BK_TEST_RESPONSE" ] && exit 0
 fi
-
-# WW-04: the run has a deadline. cron starts the next run 60 s after this one
-# started, and a run still holding the lock then costs that minute its report
-# ("l"). The POST used to wait up to 20 s whatever the clock said, so a slow
-# run plus a stalled server went over. Its limit now comes from the time left
-# until 58 s after the start (the uptime clock of agent_run_ms), minus 5 s
-# for the name lookup, which uclient-fetch's -T does not bound (5.0-5.5 s
-# measured). Never more than the 20 s it always had, never less than 5 s: a
-# run that is already late still gets a real chance to deliver. The
-# follow-ups after the report (action results, service checks, the update)
-# use what is left, and those that can wait for the next minute are skipped
-# below 12 s. No clock (no uptime to read): the fixed limits, as before.
-BK_RUN_DEADLINE_S=58
-bk_time_left() { # -> _left: whole seconds until the deadline, or empty
-    _left=""
-    bk_uptime_cs
-    if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
-        _left=$(( BK_RUN_DEADLINE_S - (_up_cs - BK_RUN_START_CS) / 100 ))
-    fi
-    return 0
-}
-bk_limit() { # LOW HIGH RESERVE -> _lim: _left minus RESERVE, clamped; HIGH without a clock
-    _lim=$2
-    [ -n "$_left" ] || return 0
-    _lim=$((_left - $3))
-    [ "$_lim" -gt "$2" ] && _lim=$2
-    [ "$_lim" -lt "$1" ] && _lim=$1
-    return 0
-}
 
 # W1-B: 0 when version A is newer than version B. Both must be dotted
 # numbers (what AGENT_VERSION always is); anything else in A is no version

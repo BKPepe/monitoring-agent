@@ -1,7 +1,7 @@
 {
   "agent_key": "",
   "agent_type": "openwrt",
-  "version": "0.1.12.1",
+  "version": "0.1.14",
   "heavy_op_interval_hours": 24,
   "os": "TurrisOS 7.2.3",
   "cpu": 52.4,
@@ -557,6 +557,9 @@
     "ethtool": false,
     "tc": true
   },
+  "collect_errors": [
+    "timeout:df_root"
+  ],
   "interfaces": [
     {
       "iface": "tunl0",
@@ -669,9 +672,9 @@
   "lan_subnet": "192.168.1.1/24",
   "dhcp_leases_count": 0,
   "dhcp_reservations_count": 3,
-  "dns_queries": null,
-  "dns_cache_hits": null,
-  "dns_cache_misses": null,
+  "dns_queries": 428,
+  "dns_cache_hits": 305,
+  "dns_cache_misses": 120,
   "dns_engine": "Dnsmasq",
   "dns_encryption": "Nešifrované DNS (UDP/53)",
   "dns_servers": "192.0.2.1",
@@ -949,8 +952,8 @@
     }
   ],
   "log_lines_state": "on",
-  "tailscale_up": null,
-  "tailscale_peers": null,
+  "tailscale_up": true,
+  "tailscale_peers": 2,
   "zerotier_networks": null,
   "ups_status": null,
   "ups_battery_pct": null,

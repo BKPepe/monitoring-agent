@@ -115,6 +115,7 @@ VARIES = [
     ("openwrt-*", "dns_latency_ms", "the runner's resolver"),
     ("openwrt-*", "wan_latency_ms", "ICMP from the runner"),
     ("openwrt-*", "log_errors_recent", "what the services log in the window"),
+    ("openwrt-*", "collect_errors", "[] when every bounded call answered (checked as such in r2), tokens only when one did not (r3)"),
     ("openwrt-*", "log_warnings_24h", "what the services log in the window"),
     ("openwrt-*", "top_io_processes", "which processes wrote between the runs"),
     ("*/*", "temperature", "the runner's thermal zones"),
@@ -141,6 +142,26 @@ NF_STAT_KEYS = ("conntrack_insert_failed", "conntrack_drop", "conntrack_early_dr
 # print it.
 NF_STAT_GAP_VERSIONS = ("0.1.12",)
 NF_STAT_GAP = re.compile(r"^(\./)?agent_openwrt\.sh: line \d+: can't open /proc/net/stat/nf_conntrack: no such file$")
+
+
+def check_t0(c, tag, base):
+    """T0 (C1): the image's busybox bounds a df that hangs. Three bounded df
+    calls (df_root, df_fs, df_inode) of 5 s each, the rest of the run as
+    usual: well under 30 s, their values unknown, their tokens named."""
+    try:
+        p = json.load(open(base + ".json"))
+    except (OSError, ValueError) as exc:
+        c.check("%s: the run with a hanging df printed a payload (%s)" % (tag, exc), False)
+        return
+    try:
+        cs = int(open(base + "_cs.txt").read().strip())
+    except (OSError, ValueError):
+        cs = 10 ** 9
+    c.check("%s: a df that hangs costs the run its three bounded calls, nothing more (%s cs, under 3000)" % (tag, cs), cs < 3000)
+    c.check("%s: what df would have measured is unknown, not invented" % tag,
+            p.get("hdd") is None and p.get("filesystems") == [] and p.get("inode_usage") is None)
+    c.check("%s: collect_errors names the three df calls (got %r)" % (tag, p.get("collect_errors")),
+            p.get("collect_errors") == ["timeout:df_root", "timeout:df_fs", "timeout:df_inode"])
 
 
 def is_num(v):
@@ -563,6 +584,9 @@ def main(argv):
                                    NF_STAT_KEYS if nf_stat.startswith("absent") else ())
         if profile != "hw":
             boot_up(c, out, prefix[:-1])
+            check_t0(c, prefix + "r3", os.path.join(out, prefix + "r3"))
+            if payloads.get("r2") is not None:
+                c.check("%sr2: collect_errors is [] - every bounded call answered" % prefix, payloads["r2"].get("collect_errors") == [])
     elif profile in ("ubuntu", "alpine", "rocky"):
         for kind, agent_type in (("sh", "bash"), ("py", "python")):
             version = agent_version(AGENTS[agent_type])

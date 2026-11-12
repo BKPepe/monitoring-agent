@@ -37,6 +37,18 @@ for r in 1 2; do
     echo "$?" > "$OUT/${ver}_r$r.rc"
     echo "  r$r exit $(cat "$OUT/${ver}_r$r.rc")"
 done
+# T0 (C1): a third run with a df that hangs (statfs on a dead disk). The
+# image's own busybox and ash must bound it: each of the three df calls is
+# killed after 5 s, and the run reports what it gave up on.
+mkdir -p /tmp/hangdf
+printf '#!/bin/sh\nsleep 30\n' > /tmp/hangdf/df
+chmod +x /tmp/hangdf/df
+read -r _t0 _ < /proc/uptime
+PATH="/tmp/hangdf:$PATH" sh agent_openwrt.sh --dry-run > "$OUT/${ver}_r3.json" 2> "$OUT/${ver}_r3.err"
+echo "$?" > "$OUT/${ver}_r3.rc"
+read -r _t1 _ < /proc/uptime
+echo $(( ${_t1%.*}${_t1#*.} - ${_t0%.*}${_t0#*.} )) > "$OUT/${ver}_r3_cs.txt"
+echo "  r3 (df hangs) exit $(cat "$OUT/${ver}_r3.rc") after $(cat "$OUT/${ver}_r3_cs.txt") cs"
 # The run facts after the fact: what the agent itself left in the log.
 logread > "$OUT/${ver}_logread.txt" 2>&1
 exit 0

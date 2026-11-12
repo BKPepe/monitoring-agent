@@ -227,6 +227,23 @@ with nobody on it.
   two filesystems while a poller watches the target, and with a full flash
   (`BK_STUB_DF_AVAIL` on the `df` stub) and a `.new` left by an interrupted
   swap.
+- **Bounded calls (`wbnd*`, `wbndl`, C1).** A tool that waits in the kernel
+  must not hold the run. `df` stands in for every bounded tool: `wbnd1`
+  hangs the first `df` (`BK_STUB_DF_HOLD`), which is killed after 5 s while
+  the run goes on (`timeout:df_root`); `wbnd2` skips that tag once and
+  `wbnd3` asks again. `wbnd4/5` plant a live PID and its start time in
+  `bnd.skip`: the tag is skipped while that process lives (`stuck:df_fs`)
+  and asked again once it is gone. `wbnd6/7` leave a process outside the
+  tool's tree on the FIFO (`BK_STUB_DF_ESCAPE`): abandoned at once, and the
+  later calls of the run get 1 s. `wbndl` runs `bk_bounded` itself, lifted
+  from the agent, through what a full run cannot make happen on cue: a child
+  that exits just before each of 60 calls (busybox fails the FIFO's open
+  with EINTR in a quarter to a third of them, and each call must still be
+  bounded and answered), a child that exits 3 s into a 5 s bound (busybox
+  restarts `read -t`, and the call still ends within a slice), a bound cut
+  short by a stuck call or by the run's deadline (`budget:`, no skip), and
+  the read-write fallback, forced. A watchdog ends it if a call is not
+  bounded after all.
 - **Cost and budget (`wbud0..6`, W1-7).** `wbud1` and `wbud2` are warm runs
   under busybox `time`: their forks are the PID namespace's last-PID delta,
   their CPU and largest process come from `wait4()`. `wbud2` must report
