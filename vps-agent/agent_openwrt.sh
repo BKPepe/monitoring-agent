@@ -1125,6 +1125,9 @@ bk_run_end() {
     _re_pid=""
     read -r _re_pid 2>/dev/null < "$BK_LOCK_DIR/pid"
     [ "$_re_pid" = "$$" ] || return 0
+    # A body a POST left behind (the run was cut short inside it) holds the
+    # key. A test, not a fork, on the runs that left nothing.
+    [ -e "$BK_POST_BODY" ] && rm -f "$BK_POST_BODY" 2>/dev/null
     [ -n "$BK_RUN_COST_KEEP" ] && { rm -rf "$BK_LOCK_DIR"; return 0; }
     bk_uptime_cs
     if [ -n "$_up_cs" ] && [ -n "$BK_RUN_START_CS" ] && [ "$_up_cs" -ge "$BK_RUN_START_CS" ] 2>/dev/null; then
@@ -1140,6 +1143,30 @@ bk_run_end() {
     rm -rf "$BK_LOCK_DIR"
 }
 trap bk_run_end EXIT
+
+# Every POST body goes to the client from a file: the report, an action's
+# result and the service checks all carry the agent key, and as an argument
+# (curl -d, --post-data) the body sat in the client's argv, which every
+# local user reads in /proc/PID/cmdline, once a minute (R338). The file is
+# 0600 in the private directory, written by the printf builtin, read by
+# curl --data-binary @FILE (-d @FILE would strip newlines) or by
+# uclient-fetch and wget --post-file, and removed when the client is done
+# (or by the EXIT trap). A dry run never POSTs, so its cost is unchanged.
+#
+# bk_post_body BODY sets the data arguments: _cd_opt _cd_val for curl and
+# _pf_arg for uclient-fetch and wget. A body that cannot be written (a full
+# tmpfs) goes the old way, in argv, with a warning: a missing or cut file
+# would send an empty report, a 400 - and during a probation a refusal.
+BK_POST_BODY="$BK_PRIVATE_DIR/post.body"
+bk_post_body() { # BODY
+    if ( umask 077; printf '%s' "$1" > "$BK_POST_BODY" ) 2>/dev/null; then
+        _cd_opt=--data-binary; _cd_val="@$BK_POST_BODY"; _pf_arg="--post-file=$BK_POST_BODY"
+    else
+        rm -f "$BK_POST_BODY" 2>/dev/null
+        log_message "VAROVANI: Telo POSTu nejde zapsat do $BK_POST_BODY - posila se v argumentu klienta jako drive."
+        _cd_opt=-d; _cd_val="$1"; _pf_arg="--post-data=$1"
+    fi
+}
 
 # W1-B (MISS-owrt-bak): a self-update is on probation until the server has
 # accepted one report of the new version. The self-check before the swap
@@ -6318,7 +6345,9 @@ if [ -n "$BK_TEST_RESPONSE" ]; then
     [ -z "$http_code" ] && http_code="000"
     body=$(sed -n '2,$p' "$BK_TEST_RESPONSE" 2>/dev/null)
 elif command -v curl >/dev/null 2>&1; then
-    response=$(curl -s -m "$bk_post_t" --connect-timeout 5 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d "$payload" "$API_URL")
+    bk_post_body "$payload"
+    response=$(curl -s -m "$bk_post_t" --connect-timeout 5 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" "$_cd_opt" "$_cd_val" "$API_URL")
+    rm -f "$BK_POST_BODY"
     # Split in the shell: the code is the last line (-w "\n%{http_code}"),
     # the body everything before it - `echo | tail -n 1` and `echo | head -n
     # -1` were four forks on every report.
@@ -6338,7 +6367,11 @@ elif command -v uclient-fetch >/dev/null 2>&1; then
     # error: ..." only when it is not quiet, and those are exactly what the
     # failure branch below parses. Its stderr goes to the file either way, so
     # nothing reaches the console.
-    if body=$(uclient-fetch -T "$bk_post_t" -O - --post-data="$payload" --header="Content-Type: application/json" "$API_URL" 2>"$uf_err"); then
+    bk_post_body "$payload"
+    _uf_ok=0
+    body=$(uclient-fetch -T "$bk_post_t" -O - "$_pf_arg" --header="Content-Type: application/json" "$API_URL" 2>"$uf_err") && _uf_ok=1
+    rm -f "$BK_POST_BODY"
+    if [ "$_uf_ok" = 1 ]; then
         http_code="200"
     else
         http_code=$(sed -n 's/.*HTTP error \([0-9][0-9]*\).*/\1/p' "$uf_err" | head -n 1)
@@ -6348,7 +6381,9 @@ elif command -v uclient-fetch >/dev/null 2>&1; then
     rm -f "$uf_err"
 elif command -v wget >/dev/null 2>&1; then
     headers_file=$(mktemp /tmp/status-openwrt-wget-hdr.XXXXXX 2>/dev/null || echo "/tmp/status-openwrt-wget-hdr-$$")
-    body=$(wget -T "$bk_post_t" -t "$bk_wget_tries" --post-data="$payload" --header="Content-Type: application/json" --server-response -q -O - "$API_URL" 2>"$headers_file")
+    bk_post_body "$payload"
+    body=$(wget -T "$bk_post_t" -t "$bk_wget_tries" "$_pf_arg" --header="Content-Type: application/json" --server-response -q -O - "$API_URL" 2>"$headers_file")
+    rm -f "$BK_POST_BODY"
     http_code=$(grep -E '^[[:space:]]*HTTP/' "$headers_file" | tail -n 1 | awk '{print $2}')
     rm -f "$headers_file"
 else
@@ -6495,13 +6530,15 @@ if [ "$http_code" = "200" ]; then
         # WW-04: bounded by the deadline, never skipped - the action has
         # already run, and without its result it stays "sent" for ever.
         bk_time_left; bk_limit 3 10 2
+        bk_post_body "$ar_payload"
         if command -v curl >/dev/null 2>&1; then
-            curl -s -m "$_lim" -X POST -H "Content-Type: application/json" -d "$ar_payload" "$API_URL" >/dev/null 2>&1
+            curl -s -m "$_lim" -X POST -H "Content-Type: application/json" "$_cd_opt" "$_cd_val" "$API_URL" >/dev/null 2>&1
         elif command -v uclient-fetch >/dev/null 2>&1; then
-            uclient-fetch -q -T "$_lim" -O /dev/null --post-data="$ar_payload" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
+            uclient-fetch -q -T "$_lim" -O /dev/null "$_pf_arg" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
         elif command -v wget >/dev/null 2>&1; then
-            wget -T "$_lim" --post-data="$ar_payload" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1
+            wget -T "$_lim" "$_pf_arg" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1
         fi
+        rm -f "$BK_POST_BODY"
     }
 
     # --- Spracovani vzdalenych akci (Remote Actions) ---
@@ -6778,12 +6815,16 @@ if [ "$http_code" = "200" ]; then
             bk_time_left; bk_limit 3 10 2
             if [ -n "$BK_TEST_RESPONSE" ]; then
                 : # response seam: a dry run never POSTs
-            elif command -v curl >/dev/null 2>&1; then
-                curl -s -m "$_lim" -X POST -H "Content-Type: application/json" -d "$sc_payload" "$API_URL" >/dev/null 2>&1
-            elif command -v uclient-fetch >/dev/null 2>&1; then
-                uclient-fetch -q -T "$_lim" -O /dev/null --post-data="$sc_payload" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
-            elif command -v wget >/dev/null 2>&1; then
-                wget -T "$_lim" --post-data="$sc_payload" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1
+            else
+                bk_post_body "$sc_payload"
+                if command -v curl >/dev/null 2>&1; then
+                    curl -s -m "$_lim" -X POST -H "Content-Type: application/json" "$_cd_opt" "$_cd_val" "$API_URL" >/dev/null 2>&1
+                elif command -v uclient-fetch >/dev/null 2>&1; then
+                    uclient-fetch -q -T "$_lim" -O /dev/null "$_pf_arg" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1
+                elif command -v wget >/dev/null 2>&1; then
+                    wget -T "$_lim" "$_pf_arg" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1
+                fi
+                rm -f "$BK_POST_BODY"
             fi
             log_debug "Odeslany vysledky agent-side kontrol sluzeb."
         fi

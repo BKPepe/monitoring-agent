@@ -250,6 +250,42 @@ grep -v '^[[:space:]]*#' agent_openwrt.sh | grep 'STATUS_TEST_RESPONSE' > $OUT/s
 # pointed at a fake /sys would report somebody else's disks as the router's.
 grep -v '^[[:space:]]*#' agent_openwrt.sh | grep -E 'STATUS_TEST_|BK_ROOT=' > $OUT/seam_guard_all.txt || true
 
+# Real runs, no --dry-run, once with each client the agent can POST with
+# (R338): the report, the service checks and an action's result go to the
+# client as a 0600 file in the private directory, never in its argv, and
+# the file is gone afterwards. The answer asks for one service check and
+# brings an action with a wrong signature, so all three POSTs happen. The
+# key is one no other run uses, so a grep finds only these runs' copies.
+write_cfg POSTKEY789 'API_URL="http://api.test/agent_api.php"' REMOTE_ACTIONS_ENABLED=1 LTE_API=off
+for _c in curl:curl uf:uclient-fetch wget:wget; do
+    mkdir -p "/tmp/post-${_c%%:*}"
+    ln -sf /work/stubs/post/shim.sh "/tmp/post-${_c%%:*}/${_c#*:}"
+done
+for _c in curl uf wget; do
+    printf '{"status":"ok","service_checks":[{"monitor_id":7,"process":"","port":22}],"pending_action":{"action_id":31,"action":"restart_wan","timestamp":%s,"nonce":"b1b2c3d4e5f6003%s","signature":"00"}}\n' \
+        "$(date +%s)" "${#_c}" > /tmp/post-resp.json
+    echo "# wpost-$_c" >> $OUT/post_argv.log
+    _rc=0
+    # The busybox image has no curl; the stubs' wget (the modem's) and
+    # uclient-fetch must not answer for these runs either: the run's own
+    # client comes first, and the other two are absent.
+    BK_POST_TAG="wpost-$_c" PATH="/tmp/post-$_c:$PATH" sh agent_openwrt.sh > "$OUT/wpost-$_c.out" 2>&1 || _rc=$?
+    echo "$_rc" > "$OUT/wpost-${_c}_rc.txt"
+    ls -A "$PRIV" > "$OUT/wpost-${_c}_priv.txt"
+done
+# A body that cannot be written - a full tmpfs; here post.body is a
+# directory - goes the old way, in argv, with a warning: the report still
+# arrives instead of an empty body (R338).
+mkdir -p "$PRIV/post.body"
+echo "# wpost-full" >> $OUT/post_argv.log
+_rc=0
+BK_POST_TAG=wpost-full PATH="/tmp/post-curl:$PATH" sh agent_openwrt.sh > "$OUT/wpost-full.out" 2>&1 || _rc=$?
+echo "$_rc" > "$OUT/wpost-full_rc.txt"
+grep 'Telo POSTu nejde zapsat' /tmp/status-agent-openwrt.log > "$OUT/wpost-full_log.txt" 2>/dev/null || true
+rmdir "$PRIV/post.body"
+rm -rf /tmp/post-curl /tmp/post-uf /tmp/post-wget /tmp/post-resp.json
+rm -f /root/agent/agent_openwrt.cfg
+
 # --register again on a configured router (R188): the new URL and key
 # replace the old lines - an indented one too - and every other line stays.
 # curl answers with a key, as the server does.

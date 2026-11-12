@@ -144,6 +144,22 @@ wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wdnsm = payload("wdnsm")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
+# R338: the real runs' client calls, and the bodies they were handed.
+post_runs = by_run("post_argv.log")
+def post_bodies(c):
+    bodies, i = [], 0
+    while os.path.exists(f"{out}/wpost-{c}_body_{i}.json"):
+        try:
+            bodies.append(json.load(open(f"{out}/wpost-{c}_body_{i}.json")))
+        except ValueError:
+            bodies.append({})
+        i += 1
+    return bodies
+def post_kinds(c):
+    return ["action_result" if "action_result" in b else "service_check_results" if "service_check_results" in b else "report"
+            for b in post_bodies(c)]
+def post_report(c):
+    return next((b for b in post_bodies(c) if "action_result" not in b and "service_check_results" not in b), {})
 w401 = [(text(f"w401b{i}_target.txt"), (text(f"w401b{i}_state.txt") or "").split("\n")[0]) for i in range(1, 5)]
 wpath1b, wpath1c = payload("wpath1b"), payload("wpath1c")
 wstk = [payload(f"wstk{n}") for n in range(1, 4)]
@@ -866,6 +882,26 @@ checks = {
             'API_URL="http://new.example/agent_api.php"', 'AGENT_KEY="NEWKEY456"']
         and text("wreg2_mode.txt") == "-rw-------"
         and "agent_openwrt.cfg.new" not in (text("wreg2_dir.txt") or ""),
+    "post: a real run with each client hands the report, the service checks and an action's result over as a 0600 file - the key is in no argv, and the file is gone afterwards (R338)":
+        all(
+            text(f"wpost-{c}_rc.txt") == "0"
+            and post_runs.get(f"wpost-{c}") is not None
+            and not any("POSTKEY789" in l for l in post_runs[f"wpost-{c}"])
+            and sorted(post_kinds(c)) == ["action_result", "report", "service_check_results"]
+            and all(text(f"wpost-{c}_mode_{i}.txt") == "-rw-------" for i in range(3))
+            and "post.body" not in (text(f"wpost-{c}_priv.txt") or "")
+            for c in ("curl", "uf", "wget")),
+    "post: the report's body is the payload with the key, the client read it from the file (curl --data-binary @, --post-file) (R338)":
+        all(post_report(c).get("agent_key") == "POSTKEY789" and post_report(c).get("version") == d["version"]
+            for c in ("curl", "uf", "wget"))
+        and any("--data-binary @" in l for l in post_runs.get("wpost-curl", []))
+        and all(any("--post-file" in l for l in post_runs.get(f"wpost-{c}", [])) for c in ("uf", "wget")),
+    "post: a body that cannot be written goes the old way with a warning - the report still arrives (R338)":
+        text("wpost-full_rc.txt") == "0"
+        # The body spans lines in the shim's log: the payload is pretty-printed.
+        and "curl " in "\n".join(post_runs.get("wpost-full", [])) and " -d {" in "\n".join(post_runs.get("wpost-full", []))
+        and "POSTKEY789" in "\n".join(post_runs.get("wpost-full", []))
+        and "Telo POSTu nejde zapsat" in (text("wpost-full_log.txt") or ""),
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":
