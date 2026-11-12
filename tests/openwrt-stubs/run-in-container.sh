@@ -515,6 +515,16 @@ fresh
 pl wfw2
 BK_STUB_NFT=empty sh agent_openwrt.sh --dry-run > $OUT/wfw2.json 2> $OUT/wfw2.err
 fresh
+# nft that cannot ask the kernel is no answer either (R243): an empty list
+# from a failed nft read as "the rules are not loaded", three times an alert.
+# Its calls go to a log of their own: the count of "list ruleset" calls is a
+# check about the other runs.
+mv $OUT/nft_calls.log $OUT/nft_calls.keep 2>/dev/null || true
+pl wfw4
+BK_STUB_NFT=fail sh agent_openwrt.sh --dry-run > $OUT/wfw4.json 2> $OUT/wfw4.err
+mv $OUT/nft_calls.log $OUT/wfw4_nft_calls.log 2>/dev/null || true
+mv $OUT/nft_calls.keep $OUT/nft_calls.log 2>/dev/null || true
+fresh
 # Neither nft nor iptables: unknown, not "off". The image has no iptables
 # applet at all, which is what a router without the compat layer looks like.
 stub_off nft

@@ -2241,6 +2241,7 @@ fw_rejected="null"
 # nothing at all when nft printed nothing - "an empty kernel" stays what it
 # was before: no counters from nft, then the iptables branch.
 BK_NFT_AWK='
+    /^BKNFTRC [0-9]+$/ { rc = $2; next }
     length($0) > 0 { any = 1 }
     index($0, "table inet fw4") { fw4 = 1 }
     index($0, "flowtable ") { ft = 1 }
@@ -2261,7 +2262,10 @@ BK_NFT_AWK='
             if (hr) { sr += f[i+1]; nr++ }
         }
     }
-    END { if (any) print fw4 " " ft " |" (na > 0 ? sa : "") "|" (nd > 0 ? sd : "") "|" (nr > 0 ? sr : "") }'
+    END {
+        if (any) print fw4 " " ft " |" (na > 0 ? sa : "") "|" (nd > 0 ? sd : "") "|" (nr > 0 ? sr : "")
+        else if (rc != "" && rc != 0) print "FAILED"
+    }'
 
 # Secte sloupec pkts u radku iptables s danym cilem (ACCEPT/DROP/REJECT).
 _ipt_target_packets() {
@@ -2282,13 +2286,20 @@ bk_nft_out=""
 bk_nft_fw4=0
 bk_nft_ft=0
 bk_have_nft=0
+bk_nft_failed=0
 if command -v nft >/dev/null 2>&1; then
     bk_have_nft=1
     bk_nft_out=$(nft -t list ruleset 2>/dev/null | awk "$BK_NFT_AWK")
     # An nft too old for -t fails without printing anything, and so answers
     # like an empty kernel: ask once more without it. On a kernel that really
     # is empty this lists nothing a second time; the answer is the same.
-    [ -n "$bk_nft_out" ] || bk_nft_out=$(nft list ruleset 2>/dev/null | awk "$BK_NFT_AWK")
+    # This second answer carries nft's exit status: an nft that could not
+    # ask the kernel at all is no empty kernel, and its "no fw4 table" was
+    # three reports later an alert that the firewall was off.
+    if [ -z "$bk_nft_out" ]; then
+        bk_nft_out=$( { nft list ruleset 2>/dev/null; echo "BKNFTRC $?"; } | awk "$BK_NFT_AWK")
+        [ "$bk_nft_out" = "FAILED" ] && { bk_nft_failed=1; bk_nft_out=""; }
+    fi
 fi
 if [ -n "$bk_nft_out" ]; then
     bk_nft_fw4=${bk_nft_out%% *}; _fw_r=${bk_nft_out#* }
@@ -2319,7 +2330,9 @@ fi
 # No nft and no iptables is still null: "we do not know" is not "off", and the
 # server raises nothing on a null.
 firewall_enabled="null"
-if [ "$bk_have_nft" = 1 ]; then
+if [ "$bk_have_nft" = 1 ] && [ "$bk_nft_failed" = 1 ]; then
+    : # nft could not tell: unknown, as without nft
+elif [ "$bk_have_nft" = 1 ]; then
     case "$bk_nft_fw4" in
         1) firewall_enabled="true" ;;
         *) firewall_enabled="false" ;;
@@ -3424,7 +3437,7 @@ else
     # that offloading really is in the kernel. The ruleset was fetched once
     # for the firewall counters, so this costs no fork.
     wp_flowtable="null"
-    if command -v nft >/dev/null 2>&1; then
+    if command -v nft >/dev/null 2>&1 && [ "$bk_nft_failed" != 1 ]; then
         case "$bk_nft_ft" in
             1) wp_flowtable="true" ;;
             *) wp_flowtable="false" ;;
