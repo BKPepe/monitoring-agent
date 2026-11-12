@@ -21,5 +21,11 @@ check "cpu: guest is inside user, not counted twice" \
 check "cpu: counters that did not move give nothing" \
     "$(bk_cpu_from_stat "cpu  1 2 3 4 5 6 7 8 0 0" "cpu  1 2 3 4 5 6 7 8 0 0")" ""
 
+load bk_net_stats
+# eth0 only: 1 MB in, 2 MB out, 1+2+3+4 errors; wg0, tailscale0, tun0 carried
+# the same bytes over eth0 already, lo and docker0 are not the host's line.
+check "net: tunnels, loopback and containers stay out of the traffic" \
+    "$(bk_net_stats "$(dirname "$0")/fixtures/net_dev_tunnels")" "3000000,10"
+
 [ "$fails" -eq 0 ] && echo "agent.sh units: all passed" || echo "agent.sh units: $fails failed"
 exit "$fails"

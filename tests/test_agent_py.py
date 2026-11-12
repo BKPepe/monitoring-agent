@@ -117,6 +117,13 @@ class CpuTimes(AgentTestCase):
         self.assertEqual((idle, steal, iowait, total), (1000.0, 50.0, 0.0, 1250.0))
 
 
+class NetworkBytes(AgentTestCase):
+    # R195: tunnels carried the same bytes over the physical interface.
+    def test_tunnels_are_not_counted_twice(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'linux', 'fixtures', 'net_dev_tunnels')
+        self.assertEqual(self.agent.get_network_bytes(path), (1000000, 2000000, 10))
+
+
 class CloudProvider(AgentTestCase):
     # R77: a guess from DMI was shown as a fact - every Hyper-V machine read
     # "Azure". Only a marker no other host carries names a provider.

@@ -905,23 +905,30 @@ def get_process_snapshot(limit=5):
 
     return zombie_count, top_cpu, top_ram
 
-def get_network_bytes():
+# A tunnel's traffic (WireGuard, Tailscale, OpenVPN's tun/tap, ZeroTier,
+# IPsec, GRE) already crossed the physical interface once; counted again it
+# doubled a server's traffic for every byte sent through a VPN.
+_UNCOUNTED_IFACES = ('veth', 'docker', 'br-', 'wg', 'tailscale', 'tun', 'tap', 'zt', 'ipsec', 'vti',
+                     'ip_vti', 'ip6_vti', 'gre', 'gretap', 'ip6gre', 'sit', 'ip6tnl')
+
+
+def get_network_bytes(path='/proc/net/dev'):
     """
-    Vrátí (rx_bytes, tx_bytes, error_count) součet přes všechna síťová rozhraní kromě
-    loopbacku a virtuálních Docker rozhraní. error_count sčítá rx_errs+rx_drop+tx_errs+tx_drop.
+    Vrátí (rx_bytes, tx_bytes, error_count) součet přes síťová rozhraní kromě
+    loopbacku, kontejnerů a tunelů. error_count sčítá rx_errs+rx_drop+tx_errs+tx_drop.
     """
     rx_total = 0
     tx_total = 0
     err_total = 0
     try:
-        with open('/proc/net/dev', 'r') as f:
+        with open(path, 'r') as f:
             lines = f.readlines()[2:]
         for line in lines:
             if ':' not in line:
                 continue
             iface, rest = line.split(':', 1)
             iface = iface.strip()
-            if iface == 'lo' or iface.startswith(('veth', 'docker', 'br-')):
+            if iface == 'lo' or iface.startswith(_UNCOUNTED_IFACES):
                 continue
             fields = rest.split()
             rx_total += int(fields[0])

@@ -563,20 +563,29 @@ fi
 
 # 3.5 Propustnost sítě (KB/s, RX+TX) a síťové chyby/zahozené pakety - potřebuje 2 vzorky,
 # proto se mezi běhy ukládá kumulativní počet bajtů/chyb a čas; první běh vrací null.
-net_stats=$(awk '
-NR > 2 {
-    line = $0;
-    colon = index(line, ":");
-    if (colon == 0) next;
-    iface = substr(line, 1, colon - 1);
-    gsub(/^[ \t]+|[ \t]+$/, "", iface);
-    if (iface == "lo" || iface ~ /^veth/ || iface ~ /^docker/ || iface ~ /^br-/) next;
-    n = split(substr(line, colon + 1), f, " ");
-    total += (f[1] + 0) + (f[9] + 0);
-    errs += (f[3] + 0) + (f[4] + 0) + (f[11] + 0) + (f[12] + 0);
+# Bytes and errors of every interface in a /proc/net/dev file, as
+# "bytes,errors". Loopback, container and tunnel interfaces stay out: a
+# tunnel's traffic (WireGuard, Tailscale, OpenVPN's tun/tap, ZeroTier,
+# IPsec, GRE) already crossed the physical interface once, and counting it
+# again doubled a server's traffic for every byte it sent through a VPN.
+bk_net_stats() {
+    awk '
+    NR > 2 {
+        line = $0;
+        colon = index(line, ":");
+        if (colon == 0) next;
+        iface = substr(line, 1, colon - 1);
+        gsub(/^[ \t]+|[ \t]+$/, "", iface);
+        if (iface == "lo" || iface ~ /^(veth|docker|br-)/) next;
+        if (iface ~ /^(wg|tailscale|tun|tap|zt|ipsec|vti|ip_vti|ip6_vti|gre|gretap|ip6gre|sit|ip6tnl)/) next;
+        n = split(substr(line, colon + 1), f, " ");
+        total += (f[1] + 0) + (f[9] + 0);
+        errs += (f[3] + 0) + (f[4] + 0) + (f[11] + 0) + (f[12] + 0);
+    }
+    END { printf "%.0f,%.0f", total, errs }
+    ' "$1" 2>/dev/null
 }
-END { printf "%.0f,%.0f", total, errs }
-' /proc/net/dev 2>/dev/null)
+net_stats=$(bk_net_stats /proc/net/dev)
 # An unreadable /proc/net/dev is "unknown", not a silent 0 B/s.
 net_json="null"
 net_errors_json="null"

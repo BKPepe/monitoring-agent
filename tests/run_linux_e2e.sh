@@ -37,6 +37,8 @@ trap 'bk_e2e_exit $? "$work" bk-agent-e2e "$name" keep_out' EXIT
 mkdir -p "$work/agent" "$work/out" "$work/tests"
 cp "$here/../vps-agent/agent.sh" "$here/../vps-agent/agent.py" "$work/agent/"
 cp "$here/test_agent_py.py" "$work/tests/"
+# The unit tests read their fixtures next to themselves.
+mkdir -p "$work/tests/linux" && cp -R "$here/linux/fixtures" "$work/tests/linux/"
 docker build -q -t bk-agent-e2e "$here/linux" >/dev/null
 # Two small tmpfs mounts: the update case for a directory without room for
 # the new file.
