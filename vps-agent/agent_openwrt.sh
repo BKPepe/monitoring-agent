@@ -3747,6 +3747,10 @@ lte_up="null"
 lte_device="null"
 lte_uptime="null"
 lte_ipv4="null"
+# netifd's protocol of the link and the gateway of its default route: only a
+# DHCP ethernet modem has a HiLink web API, and it sits at that gateway.
+lte_proto=""
+lte_gw=""
 # From the one interface dump above: the usual names first, then any
 # interface whose protocol is a modem one - the uplink does not have to be
 # called "lte" for the backup to count. Five speculative ubus calls a run
@@ -3762,6 +3766,19 @@ if bk_iface_load "lte wwan wwan0 modem lte1" "qmi mbim ncm modemmanager 3g" "wan
     json_get_var _lte_dev l3_device
     [ -z "$_lte_dev" ] && json_get_var _lte_dev device
     [ -n "$_lte_dev" ] && lte_device="$_lte_dev"
+    json_get_var lte_proto proto
+    _lte_rk=""
+    json_get_keys _lte_rk route
+    for _lte_k in $_lte_rk; do
+        json_select route
+        json_select "$_lte_k"
+        _lte_m=""
+        json_get_var _lte_m mask
+        [ "$_lte_m" = "0" ] && json_get_var lte_gw nexthop
+        json_select ..
+        json_select ..
+        [ -n "$lte_gw" ] && break
+    done
     _lte_up_sec=""
     json_get_var _lte_up_sec uptime
     case "$_lte_up_sec" in
@@ -4321,15 +4338,32 @@ bk_hilink_state() {
 # lte_uptime and lte_ipv4 come from netifd, net_lte from /proc/net/dev above,
 # and the uqmi/mmcli block below does not talk to the web API. What only the
 # modem knows - signal, SIM, operator - is then null.
+#
+# Only a modem that is an ethernet device with DHCP has that API (HiLink).
+# A QMI, MBIM, NCM or 3g link was asked as well (R236): every minute an HTTP
+# request went to .1 of an address in the operator's network, and the log
+# said "HiLink does not answer". A Wi-Fi client uplink ("wwan" in LuCI) is
+# DHCP too, and its .1 is the upstream router: a wireless device - one with
+# the phy80211 link cfg80211 gives every Wi-Fi netdev, which the radio list
+# below reads as well - is no modem. The API is at the gateway of the link's
+# default route; without a route (defaultroute 0 on a backup link) it stays
+# .1 of the address.
 if [ "$LTE_API" = off ]; then
     log_debug "LTE: webove API modemu je vypnute (LTE_API=off), modem se na nic nepta."
+elif [ "$lte_up" = "true" ] && [ "$lte_proto" != "dhcp" ]; then
+    log_debug "LTE: rozhrani ma proto '$lte_proto', webove API (HiLink) ma jen ethernetovy modem s DHCP - modem se na nic nepta."
+elif [ "$lte_up" = "true" ] && [ -e "$BK_SYS/class/net/$lte_device/phy80211" ]; then
+    log_debug "LTE: $lte_device je Wi-Fi klient, ne modem - webove API se nepta."
 elif [ "$lte_up" = "true" ] && [ "$lte_ipv4" != "null" ] && [ -n "$lte_ipv4" ]; then
     # The last octet becomes .1 (`sed 's/\.[0-9]*$/.1/'`) without the two
     # forks; an address that is not plain digits and dots still goes to sed.
-    case "$lte_ipv4" in
-        *[!0-9.]*) lte_api_host=$(echo "$lte_ipv4" | sed 's/\.[0-9]*$/.1/') ;;
-        *.*) lte_api_host=${lte_ipv4%.*}.1 ;;
-        *) lte_api_host=$lte_ipv4 ;;
+    case "$lte_gw" in
+        *[!0-9.]*|'') case "$lte_ipv4" in
+                *[!0-9.]*) lte_api_host=$(echo "$lte_ipv4" | sed 's/\.[0-9]*$/.1/') ;;
+                *.*) lte_api_host=${lte_ipv4%.*}.1 ;;
+                *) lte_api_host=$lte_ipv4 ;;
+            esac ;;
+        *) lte_api_host=$lte_gw ;;
     esac
     bk_hilink_session_load
 

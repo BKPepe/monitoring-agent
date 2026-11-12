@@ -44,7 +44,7 @@ json_get_keys() {
     _p="$BK_SEL"; [ -n "$2" ] && _p="$BK_SEL/$2"
     case "$_p" in
         /interface) eval "$1='0 1 2'" ;;
-        /interface/0/ipv4-address|/interface/0/route|/interface/1/ipv4-address|/interface/2/ipv4-address) eval "$1='0'" ;;
+        /interface/0/ipv4-address|/interface/0/route|/interface/1/ipv4-address|/interface/2/ipv4-address|/interface/2/route) eval "$1='0'" ;;
         *) eval "$1=''" ;;
     esac
 }
@@ -83,12 +83,17 @@ json_get_var() {
         /interface/1/ipv4-address/0:mask) eval "$1=24" ;;
         /interface/2:interface) eval "$1=lte" ;;
         /interface/2:up) eval "$1=1" ;;
-        /interface/2:proto) eval "$1=dhcp" ;;
+        # BK_STUB_LTE_PROTO=qmi: a QMI link, which has no HiLink web API.
+        /interface/2:proto) eval "$1=${BK_STUB_LTE_PROTO:-dhcp}" ;;
         # loopback: exists in the container, so the LTE rate path has counters to read.
         # BK_STUB_LTE_DEV=eth3 is the owner's modem port, for the speedtest uplink runs.
         /interface/2:l3_device) eval "$1=${BK_STUB_LTE_DEV:-lo}" ;;
         /interface/2:uptime) eval "$1=700" ;;
         /interface/2/ipv4-address/0:address) eval "$1=192.168.8.100" ;;
+        # The modem's default route. BK_STUB_LTE_GW: a gateway that is not
+        # .1 of the address, where the web API then has to be asked.
+        /interface/2/route/0:mask) eval "$1=0" ;;
+        /interface/2/route/0:nexthop) eval "$1=${BK_STUB_LTE_GW:-192.168.8.1}" ;;
         *) eval "$1=''" ;;
     esac
 }

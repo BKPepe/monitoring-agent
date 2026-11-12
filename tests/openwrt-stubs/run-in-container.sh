@@ -1535,6 +1535,26 @@ echo "LTE_API=nope" > /root/agent/agent_openwrt.cfg
 hl wlte2
 rm -f /root/agent/agent_openwrt.cfg
 fresh
+# Only a DHCP ethernet modem has the web API (R236): a QMI link is asked
+# nothing (wlte3). The API is at the gateway of the link's default route,
+# which need not be .1 of its address (wlte4).
+export BK_STUB_LTE_PROTO=qmi
+hl wlte3
+unset BK_STUB_LTE_PROTO
+fresh
+export BK_STUB_LTE_GW=192.168.8.254
+hl wlte4
+unset BK_STUB_LTE_GW
+fresh
+# A Wi-Fi client uplink is DHCP too: its device has phy80211, and its .1 is
+# the upstream router, which is asked nothing (wlte5).
+mkdir -p /tmp/fakeroot/sys/class/net/wlan9
+: > /tmp/fakeroot/sys/class/net/wlan9/phy80211
+export BK_STUB_LTE_DEV=wlan9
+hl wlte5
+unset BK_STUB_LTE_DEV
+rm -rf /tmp/fakeroot/sys/class/net/wlan9
+fresh
 # --help says what a dry run really does - it asks the modem and the radios
 # like a cron run - and names the switch.
 sh agent_openwrt.sh --help > $OUT/help.txt 2>&1

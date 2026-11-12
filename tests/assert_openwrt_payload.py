@@ -1384,6 +1384,7 @@ hl_calls = by_run("hilink_calls.log")
 def lte(p, *keys):
     return None if p is None else [p.get(k, "MISSING") for k in keys]
 wlte1, wlte2 = maybe("wlte1"), maybe("wlte2")
+wlte3, wlte4, wlte5 = maybe("wlte3"), maybe("wlte4"), maybe("wlte5")
 help_text = text("help.txt") or ""
 checks.update({
     "lte_api: LTE_API=off asks the modem nothing at all, and netifd's view of the link is still reported (wlte1)":
@@ -1392,6 +1393,13 @@ checks.update({
         lte(wlte1, "lte_rsrp", "lte_connected", "lte_sim_state", "lte_conn_code", "lte_carrier") == [None] * 5,
     "lte_api: any other value is auto - a typo does not switch the modem off (wlte2)":
         len(hl_calls.get("wlte2") or []) == 4 and lte(wlte2, "lte_rsrp", "lte_connected") == [-85, True],
+    "lte_api: a QMI link has no web API and is asked nothing; netifd's view of it is still reported (wlte3, R236)":
+        hl_calls.get("wlte3") == [] and lte(wlte3, "lte_up", "lte_ipv4", "lte_rsrp") == [True, "192.168.8.100", None],
+    "lte_api: a Wi-Fi client uplink (phy80211) is no modem - its upstream router is asked nothing (wlte5, R236)":
+        hl_calls.get("wlte5") == [] and lte(wlte5, "lte_up", "lte_rsrp") == [True, None],
+    "lte_api: the web API is asked at the gateway of the link's default route (wlte4, R236)":
+        len(hl_calls.get("wlte4") or []) == 4 and all("//192.168.8.254/api/" in c for c in hl_calls["wlte4"])
+        and lte(wlte4, "lte_rsrp", "lte_connected") == [-85, True],
     "help: --dry-run says it asks the modem and the radios like a cron run and skips only the POST, actions and update; LTE_API=off is named":
         "pta se modemu i Wi-Fi radii" in help_text and "vynecha jen odeslani, vzdalene akce a aktualizaci" in help_text
         and "LTE_API=off" in help_text,
