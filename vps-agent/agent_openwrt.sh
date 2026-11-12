@@ -2481,18 +2481,25 @@ if command -v df >/dev/null 2>&1; then
         df_has_type=0
     fi
     if [ -n "$df_out" ]; then
+        # The mount point is everything after the percentage, spaces and all
+        # (it was its first word), escaped for JSON like every name the agent
+        # sends: a quote in "/mnt/usb #1 "disk"" would have broken the payload.
         filesystems_json=$(echo "$df_out" | awk -v has_type="$df_has_type" '
+            function esc(s,   o, c, i, n) { gsub(/[\001-\037]/, "", s); if (!index(s, "\\") && !index(s, "\"")) return s; o = ""; n = length(s); for (i = 1; i <= n; i++) { c = substr(s, i, 1); o = o ((c == "\\" || c == "\"") ? "\\" c : c) } return o }
             NR == 1 { next }
             {
-                if (has_type) { dev=$1; type=$2; total=$3; used=$4; avail=$5; pct=$6; mnt=$7 }
-                else          { dev=$1; type="";  total=$2; used=$3; avail=$4; pct=$5; mnt=$6 }
+                first = has_type ? 7 : 6
+                if (has_type) { dev=$1; type=$2; total=$3; used=$4; avail=$5; pct=$6 }
+                else          { dev=$1; type="";  total=$2; used=$3; avail=$4; pct=$5 }
+                mnt = ""
+                for (i = first; i <= NF; i++) mnt = mnt (i > first ? " " : "") $i
                 if (mnt == "") next;
                 if (type ~ /^(tmpfs|devtmpfs|proc|sysfs|debugfs|cgroup|overlayfs)$/) next;
                 if (has_type == 0 && dev ~ /^(tmpfs|devtmpfs|none|proc|sysfs)$/) next;
                 gsub("%", "", pct);
                 if (pct !~ /^[0-9]+$/) next;
                 printf "%s{\"mount\":\"%s\",\"device\":\"%s\",\"fstype\":\"%s\",\"total_kb\":%s,\"used_kb\":%s,\"avail_kb\":%s,\"used_pct\":%s}",
-                       (n++ ? "," : "["), mnt, dev, type, total+0, used+0, avail+0, pct+0;
+                       (n++ ? "," : "["), esc(mnt), esc(dev), esc(type), total+0, used+0, avail+0, pct+0;
             }
             END { printf "%s", (n ? "]" : "[]") }')
     fi

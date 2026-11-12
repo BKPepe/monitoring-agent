@@ -445,6 +445,11 @@ checks = {
         and [p["name"] for p in sd4["mmcblk0"]["partitions"]] == ["mmcblk0p1", "mmcblk0p2"]
         and "/dev/mmcblk0" not in smartctl_devs(smartctl_calls),
     # CORE e2e #38
+    # R189: the mount point was its first word, and a quote in it would have
+    # broken the JSON had the rest come along.
+    "filesystems: a mount point with a space, a # and quotes arrives whole, escaped":
+        [f["mount"] for f in d["filesystems"]] == ["/", "/srv", '/mnt/usb #1 "disk"']
+        and d["filesystems"][2]["device"] == "/dev/sdb1" and d["filesystems"][2]["fstype"] == "ext4",
     "agent_tools: flags typed; smart_probe_running_s null when idle":
         d["agent_tools"] == {"smartctl": True, "smart_drivedb": False, "hostapd_cli": True, "iw": True, "pkg_manager": None,
                              "smart_probe_age_s": d["agent_tools"]["smart_probe_age_s"], "smart_probe_running_s": None,
