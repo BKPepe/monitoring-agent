@@ -761,8 +761,9 @@ get_smart_status() {
                 fi
             done
         fi
+        # No disk is no verdict: "OK" about nothing was drawn green.
         if [ -z "$drives" ]; then
-            echo "OK (Nebyly detekovány fyzické disky)"
+            echo "N/A (Nebyly detekovány fyzické disky)"
             return
         fi
         sm_failed=""; sm_unknown=""

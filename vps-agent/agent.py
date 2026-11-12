@@ -1004,7 +1004,9 @@ def _probe_smart_status():
     except Exception:
         return "N/A", False
     if not drives:
-        return "OK (Nebyly detekovány fyzické disky)", True
+        # No disk is no verdict, and listing them costs nothing: asked again
+        # next run, so a disk attached later is not unseen for a day.
+        return "N/A (Nebyly detekovány fyzické disky)", False
     failed = []
     unknown = []
     for drive in drives:

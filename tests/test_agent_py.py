@@ -131,6 +131,32 @@ class CloudProvider(AgentTestCase):
         self.assertIsNone(self.provider("QEMU", "Standard PC (Q35 + ICH9, 2009)", "SeaBIOS"))
 
 
+class SmartProbe(AgentTestCase):
+    def probe(self, drives, answers):
+        """_probe_smart_status() over fake drives; answers maps a drive to its
+        smartctl stdout and exit code, or to an exception to raise."""
+        def run(cmd, **kw):
+            a = answers[cmd[-1].rsplit('/', 1)[-1]]
+            if isinstance(a, BaseException):
+                raise a
+            return types.SimpleNamespace(stdout=a[0], returncode=a[1])
+        listdir = self.agent.os.listdir
+        exists = self.agent.os.path.exists
+        with unittest.mock.patch.object(self.agent.os, 'listdir',
+                                        lambda p: drives if p == '/sys/class/block' else listdir(p)), \
+             unittest.mock.patch.object(self.agent.os.path, 'exists',
+                                        lambda p: p.startswith('/sys/class/block/') or exists(p)), \
+             unittest.mock.patch.object(self.agent.subprocess, 'run', run):
+            return self.agent._probe_smart_status()
+
+    def test_no_disk_is_no_verdict_and_is_asked_again(self):
+        # R45: "OK" about no disk at all was drawn green, and kept for a day.
+        self.assertEqual(self.probe([], {}), ("N/A (Nebyly detekovány fyzické disky)", False))
+
+    def test_a_healthy_set_is_final(self):
+        self.assertEqual(self.probe(['sda'], {'sda': ('SMART overall-health: PASSED', 0)}), ("OK", True))
+
+
 class NonceGate(AgentTestCase):
     def gate(self, nonce="abc123", act_type="restart_service", svc="nginx", now=None):
         return self.agent._action_gate(act_type, nonce, svc, int(time.time()) if now is None else now)
