@@ -537,6 +537,11 @@ pl wclk2
 BK_STUB_DATE_S=1790000000 sh agent_openwrt.sh --dry-run > $OUT/wclk2.json 2> $OUT/wclk2.err
 cp /tmp/wclk-uptime.save /tmp/fakeroot/proc/uptime
 fresh
+# Tailscale up with two peers (R41): "BackendState": "Running" has a space
+# after the colon, and TailscaleIPs is also at the top and in Self.
+pl wts1
+BK_STUB_TAILSCALE=up sh agent_openwrt.sh --dry-run > $OUT/wts1.json 2> $OUT/wts1.err
+fresh
 # Neither nft nor iptables: unknown, not "off". The image has no iptables
 # applet at all, which is what a router without the compat layer looks like.
 stub_off nft

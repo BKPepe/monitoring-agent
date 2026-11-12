@@ -1,0 +1,48 @@
+#!/bin/sh
+# tailscale stub: nothing (as a tailscale that is not up) unless
+# BK_STUB_TAILSCALE=up, then `status --json` the way the real CLI prints it -
+# indented, "key": value with a space, a top-level TailscaleIPs, Self with its
+# own, and two peers in the Peer map keyed by their node keys (R41). Keys and
+# addresses are made up; Documentation addresses stand in for Tailscale's 100.64/10.
+[ "$BK_STUB_TAILSCALE" = up ] && [ "$*" = "status --json" ] || exit 1
+cat <<'J'
+{
+  "Version": "1.76.6-t1234567-g89abcdef",
+  "TUN": true,
+  "BackendState": "Running",
+  "AuthURL": "",
+  "TailscaleIPs": [
+    "192.0.2.1",
+    "fd7a:115c:a1e0::1"
+  ],
+  "Self": {
+    "ID": "n1111111111CNTRL",
+    "PublicKey": "nodekey:1111111111111111111111111111111111111111111111111111111111111111",
+    "HostName": "router",
+    "TailscaleIPs": [
+      "192.0.2.1",
+      "fd7a:115c:a1e0::1"
+    ],
+    "Online": true
+  },
+  "Peer": {
+    "nodekey:2222222222222222222222222222222222222222222222222222222222222222": {
+      "ID": "n2222222222CNTRL",
+      "HostName": "laptop",
+      "TailscaleIPs": [
+        "192.0.2.2"
+      ],
+      "Online": true
+    },
+    "nodekey:3333333333333333333333333333333333333333333333333333333333333333": {
+      "ID": "n3333333333CNTRL",
+      "HostName": "phone",
+      "TailscaleIPs": [
+        "192.0.2.3"
+      ],
+      "Online": false
+    }
+  },
+  "MagicDNSSuffix": "example.ts.net"
+}
+J

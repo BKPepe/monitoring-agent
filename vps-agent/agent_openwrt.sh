@@ -4701,10 +4701,12 @@ tailscale_peers_json="null"
 if command -v tailscale >/dev/null 2>&1; then
     ts_json=$(tailscale status --json 2>/dev/null)
     if [ -n "$ts_json" ]; then
-        echo "$ts_json" | grep -q '"BackendState":"Running"' && tailscale_up_json=true || tailscale_up_json=false
-        tailscale_peers_json=$(echo "$ts_json" | grep -c '"TailscaleIPs"')
-        # Self je v JSONu taky - odecist
-        [ "$tailscale_peers_json" -gt 0 ] 2>/dev/null && tailscale_peers_json=$((tailscale_peers_json - 1))
+        # The CLI prints indented JSON, "BackendState": "Running" with a space:
+        # matched without one the state was always false. Peers are the keys
+        # of the Peer map, one "nodekey:...": { line each; counting
+        # TailscaleIPs took in the top-level list and Self's too.
+        echo "$ts_json" | grep -q '"BackendState": *"Running"' && tailscale_up_json=true || tailscale_up_json=false
+        tailscale_peers_json=$(echo "$ts_json" | grep -c '"nodekey:[0-9a-f]*": *{')
     fi
 fi
 
