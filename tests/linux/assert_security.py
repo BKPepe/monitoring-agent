@@ -259,5 +259,20 @@ check("sh: version order: only strictly newer dotted numbers pass",
       all(f"ver newer {p}" in rules for p in newer)
       and all(f"ver notnewer {p}" in rules for p in notnewer))
 
+# --register (R334): the token in the body, not in argv; agent.cfg 0600 with
+# the new key and every option the old one had.
+reg = facts("sh-register")
+cfg = reg.get("cfg", "").split("|")
+check("sh register: done, through curl", reg.get("rc") == "0" and reg.get("curl_ran") == "1")
+check("sh register: the token never in curl's argv", reg.get("argv_has_token") == "0")
+check("sh register: the token in the posted body", reg.get("posted_token") == "1")
+check("sh register: agent.cfg is the owner's alone (600)", reg.get("cfg_mode") == "600")
+check("sh register: the new key and URL, the old key gone",
+      'AGENT_KEY="bk-registered-key-0123456789"' in cfg and 'AGENT_KEY="old-key"' not in cfg
+      and any(l.startswith("API_URL=") and l.endswith('/agent_api.php"') for l in cfg))
+check("sh register: the options it found stay",
+      all(o in cfg for o in ("AUTO_UPDATE=1", "REMOTE_ACTIONS_ENABLED=1", "ALLOWED_ACTIONS=restart_service",
+                             "HEAVY_OP_INTERVAL_HOURS=6")))
+
 print(f"{'all passed' if not failed else str(len(failed)) + ' failed'}")
 sys.exit(1 if failed else 0)

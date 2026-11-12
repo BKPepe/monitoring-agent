@@ -91,14 +91,35 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     if [ -n "$3" ]; then
         API_URL="$3"
     fi
-    HOSTNAME_VAL=$(hostname 2>/dev/null || echo "Linux-Server")
+    # The token is the admin's own text: escaped for JSON (a quote in it
+    # broke the body), through sed's stdin, never its argv. The hostname
+    # keeps the characters a hostname has.
+    REG_TOKEN_JSON=$(printf '%s' "$REG_TOKEN" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
+    HOSTNAME_VAL=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')
+    [ -n "$HOSTNAME_VAL" ] || HOSTNAME_VAL="Linux-Server"
     echo "Registruji nového agenta na $API_URL..."
-    RESP=$(curl -s -m 20 -X POST -H "Content-Type: application/json" -d "{\"action\":\"register\", \"token\":\"$REG_TOKEN\", \"hostname\":\"$HOSTNAME_VAL\", \"agent_type\":\"bash\"}" "$API_URL")
+    # The body goes to curl on stdin: in its argv the token was readable to
+    # every local user in /proc/<pid>/cmdline. printf is a builtin, no argv.
+    RESP=$(printf '{"action":"register", "token":"%s", "hostname":"%s", "agent_type":"bash"}' "$REG_TOKEN_JSON" "$HOSTNAME_VAL" \
+        | curl -s -m 20 -X POST -H "Content-Type: application/json" --data-binary @- "$API_URL")
     NEW_KEY=$(echo "$RESP" | sed -n 's/.*"agent_key":"\([^"]*\)".*/\1/p')
     if [ -n "$NEW_KEY" ]; then
-        echo "API_URL=\"$API_URL\"" > "$ScriptPath/agent.cfg"
-        echo "AGENT_KEY=\"$NEW_KEY\"" >> "$ScriptPath/agent.cfg"
-        echo "OK: Agent byl úspěšně zaregistrován a nastavení bylo uloženo do $ScriptPath/agent.cfg (AGENT_KEY=$NEW_KEY)"
+        # agent.cfg holds the key: written 0600, and a re-registration keeps
+        # every other line it finds (AUTO_UPDATE, remote actions, ...) - it
+        # used to keep only API_URL and AGENT_KEY.
+        cfg_new="$ScriptPath/agent.cfg.new.$$"
+        (
+            umask 077
+            if [ -f "$ScriptPath/agent.cfg" ]; then
+                grep -v -E '^[[:space:]]*(API_URL|AGENT_KEY)[[:space:]]*=' "$ScriptPath/agent.cfg" || true
+            fi
+            printf 'API_URL="%s"\nAGENT_KEY="%s"\n' "$API_URL" "$NEW_KEY"
+        ) > "$cfg_new" && chmod 600 "$cfg_new" && mv "$cfg_new" "$ScriptPath/agent.cfg" || {
+            rm -f "$cfg_new"
+            echo "CHYBA: nastavení se nepodařilo uložit do $ScriptPath/agent.cfg"
+            exit 1
+        }
+        echo "OK: Agent byl úspěšně zaregistrován a nastavení bylo uloženo do $ScriptPath/agent.cfg"
         exit 0
     else
         echo "CHYBA při registraci: $RESP"

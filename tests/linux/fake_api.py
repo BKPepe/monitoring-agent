@@ -80,6 +80,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if "action_result" in doc:
             self.reply(200, '{"success":true}')
             return
+        # --register, answered the way agent_api.php does: compact JSON.
+        if doc.get("action") == "register":
+            self.reply(200, '{"success":true,"agent_key":"bk-registered-key-0123456789","monitor_id":7,'
+                            '"name":"test","message":"Agent \\u00fasp\\u011b\\u0161n\\u011b zaregistrov\\u00e1n."}')
+            return
 
         scen = scenario()
         status = int(scen.get("status", 200))

@@ -418,5 +418,42 @@ done
     done
 } > "$OUT/sh-rules.txt" 2>&1
 
+# --- Registration (R334) ---------------------------------------------------
+# The token goes to the server in the body, never in curl's argv, which any
+# local user reads in /proc; agent.cfg holds the key and is the owner's
+# alone; a re-registration keeps the options it finds.
+d=$(mktemp -d /tmp/bk-reg.XXXXXX)
+cp "$SRC/agent.sh" "$d/"
+cat > "$d/agent.cfg" <<CFG
+API_URL="http://127.0.0.1:$PORT/old"
+AGENT_KEY="old-key"
+AUTO_UPDATE=1
+REMOTE_ACTIONS_ENABLED=1
+ALLOWED_ACTIONS=restart_service
+HEAVY_OP_INTERVAL_HOURS=6
+CFG
+chmod 644 "$d/agent.cfg"
+mkdir -p "$d/shim"
+real_curl=$(command -v curl)
+cat > "$d/shim/curl" <<SHIM
+#!/bin/sh
+printf '%s\n' "\$*" >> "$d/curl-argv.log"
+exec "$real_curl" "\$@"
+SHIM
+chmod +x "$d/shim/curl"
+: > "$API/posts.jsonl"
+PATH="$d/shim:$PATH" bash "$d/agent.sh" --register reg-token-SECRET-42 "http://127.0.0.1:$PORT/agent_api.php" \
+    > "$OUT/sh-register.stdout" 2>&1 < /dev/null
+echo $? > "$OUT/sh-register.rc"
+{
+    echo "rc=$(cat "$OUT/sh-register.rc")"
+    echo "curl_ran=$([ -s "$d/curl-argv.log" ] && echo 1 || echo 0)"
+    echo "argv_has_token=$(grep -c 'reg-token-SECRET-42' "$d/curl-argv.log" 2>/dev/null)"
+    echo "posted_token=$(grep -c '"token": *"reg-token-SECRET-42"' "$API/posts.jsonl")"
+    echo "cfg_mode=$(stat -c %a "$d/agent.cfg")"
+    echo "cfg=$(tr '\n' '|' < "$d/agent.cfg")"
+} > "$OUT/sh-register.facts"
+rm -rf "$d"
+
 kill "$api_pid" 2>/dev/null
 exit 0
