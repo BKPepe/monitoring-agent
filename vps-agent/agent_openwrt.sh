@@ -2771,7 +2771,7 @@ smart_due=${_storage_out##*#}
 # jadro to neumi" misto toho, aby jen mlcky nic neukazalo.
 top_io_json="[]"
 io_accounting_json="false"
-if [ -r /proc/1/io ]; then
+if [ -r "$BK_PROC/1/io" ]; then
     io_accounting_json="true"
 fi
 if [ "$io_accounting_json" = "true" ]; then
@@ -2783,21 +2783,34 @@ if [ "$io_accounting_json" = "true" ]; then
     # open(), and busybox awk treats an unopenable input file as fatal - it
     # would abort mid-scan and silently truncate the ranking. getline just
     # returns -1 for the vanished ones.
+    # Ranked inside awk, as a number: busybox `sort -rn` reads through
+    # atoi(), which overflows past 2^31, and the biggest writers - past 2 GiB
+    # on any router up for a while - came last. Through $BK_PROC, so the e2e
+    # can plant them.
     top_io_json=$(
-        for io_file in /proc/[0-9]*/io; do [ -r "$io_file" ] && printf '%s\n' "$io_file"; done | awk '
+        for io_file in "$BK_PROC"/[0-9]*/io; do [ -r "$io_file" ] && printf '%s\n' "$io_file"; done | awk '
             {
-                f = $0; pid = f; sub(/^\/proc\//, "", pid); sub(/\/io$/, "", pid);
+                f = $0; dir = f; sub(/\/io$/, "", dir); pid = dir; sub(/^.*\//, "", pid);
                 wb = "";
                 while ((getline line < f) > 0) {
                     if (line ~ /^write_bytes:/) { split(line, a, " "); wb = a[2] }
                 }
                 close(f);
                 if (wb == "" || wb + 0 <= 0) next;
-                cf = "/proc/" pid "/comm"; name = "";
+                cf = dir "/comm"; name = "";
                 if ((getline name < cf) > 0) close(cf);
                 close(cf);
-                if (name != "") print wb "|" pid "|" name;
-            }' 2>/dev/null | sort -rn | head -5 | awk -F'|' '
+                if (name != "") { n++; w[n] = wb; p[n] = pid; nm[n] = name }
+            }
+            END {
+                for (k = 1; k <= 5; k++) {
+                    best = 0
+                    for (i = 1; i <= n; i++) if (!(i in used) && (best == 0 || w[i] + 0 > w[best] + 0)) best = i
+                    if (best == 0) break
+                    used[best] = 1
+                    print w[best] "|" p[best] "|" nm[best]
+                }
+            }' 2>/dev/null | awk -F'|' '
             # A process names itself, quotes included: escaped as in
             # BK_STORAGE_AWK, character by character (see there).
             function esc(s,   o, c, i, n) { gsub(/[\001-\037]/, "", s); if (!index(s, "\\") && !index(s, "\"")) return s; o = ""; n = length(s); for (i = 1; i <= n; i++) { c = substr(s, i, 1); o = o ((c == "\\" || c == "\"") ? "\\" c : c) } return o }

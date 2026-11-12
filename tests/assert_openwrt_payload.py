@@ -445,6 +445,10 @@ checks = {
         and [p["name"] for p in sd4["mmcblk0"]["partitions"]] == ["mmcblk0p1", "mmcblk0p2"]
         and "/dev/mmcblk0" not in smartctl_devs(smartctl_calls),
     # CORE e2e #38
+    # R80: atoi() in busybox sort put the writers past 2 GiB last.
+    "top I/O: ranked as numbers, 3 GB before 2.5 GB before 1 kB, init with nothing written left out":
+        [(x["name"], x["write_bytes"]) for x in d["top_io_processes"]]
+        == [("bigwriter", 3000000000), ("second", 2500000000), ("small", 1000)],
     # R189: the mount point was its first word, and a quote in it would have
     # broken the JSON had the rest come along.
     "filesystems: a mount point with a space, a # and quotes arrives whole, escaped":

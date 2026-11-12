@@ -121,6 +121,15 @@ intr 22345 1 2 3
 ctxt 2
 M
 echo "1000.00 1500.00" > "$P/uptime"
+# Per-process I/O: init with nothing written, two writers past 2 GiB and a
+# small one. busybox `sort -rn` reads numbers through atoi(), which overflows
+# past 2^31: the biggest writer came last (R80).
+for _pio in "1 init 0" "4242 bigwriter 3000000000" "77 second 2500000000" "88 small 1000"; do
+    set -- $_pio
+    mkdir -p "$P/$1"
+    printf 'rchar: 1\nwchar: 1\nsyscr: 1\nsyscw: 1\nread_bytes: 0\nwrite_bytes: %s\ncancelled_write_bytes: 0\n' "$3" > "$P/$1/io"
+    echo "$2" > "$P/$1/comm"
+done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cp "$HERE/omnia/softnet_stat.txt" "$P/net/softnet_stat"          # real: 15 hex columns, col 13 = CPU index
 cp "$HERE/omnia/nf_conntrack.txt" "$P/net/stat/nf_conntrack"     # real: 880 entries, no drops
