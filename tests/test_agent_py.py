@@ -109,6 +109,14 @@ class Rules(AgentTestCase):
         self.assertFalse(ok('["python","0.1.4"]\n', "0.1.4"))
 
 
+class CpuTimes(AgentTestCase):
+    # R196: the total is the eight time fields, steal included; guest and
+    # guest_nice are already inside user and nice and were counted twice.
+    def test_guest_is_not_counted_twice(self):
+        idle, steal, iowait, total = self.agent.cpu_times("cpu  200 0 0 1000 0 0 0 50 100 0")
+        self.assertEqual((idle, steal, iowait, total), (1000.0, 50.0, 0.0, 1250.0))
+
+
 class CloudProvider(AgentTestCase):
     # R77: a guess from DMI was shown as a fact - every Hyper-V machine read
     # "Azure". Only a marker no other host carries names a provider.

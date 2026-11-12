@@ -80,6 +80,11 @@ PATH="/ups/bin:$PATH" python3 agent.py --dry-run > /work/out/py_ups.json 2>/work
 mkdir -p /nonroot && cp agent.sh /nonroot/ && chown -R nobody /nonroot
 su -s /bin/bash nobody -c "bash /nonroot/agent.sh --dry-run" > /work/out/sh_nonroot.json 2>/work/out/sh_nonroot.err
 
+# agent.sh's functions on their own, on this image's bash and awk.
+bash /harness/agent_sh_units.sh /agent/agent.sh > /work/out/sh_units.txt 2>&1 \
+    || { cat /work/out/sh_units.txt >&2; exit 1; }
+tail -n 1 /work/out/sh_units.txt
+
 # agent.py's unit tests, on this image's Python.
 BK_AGENT_PY=/agent/agent.py python3 -m unittest discover -s /work/tests -p 'test_agent_py.py' > /work/out/py_unit.txt 2>&1 \
     || { cat /work/out/py_unit.txt >&2; exit 1; }

@@ -255,12 +255,7 @@ def get_cpu_usage():
                 lines = f.readlines()
             for line in lines:
                 if line.startswith('cpu '):
-                    fields = [float(x) for x in line.strip().split()[1:]]
-                    iowait = fields[4] if len(fields) > 4 else 0.0
-                    idle = fields[3] + iowait
-                    steal = fields[7] if len(fields) > 7 else 0.0
-                    total = sum(fields)
-                    return idle, steal, iowait, total
+                    return cpu_times(line)
         except IOError:
             pass
         return None, None, None, 0.0
@@ -692,6 +687,17 @@ def cloud_provider_from_dmi(sys_vendor, product_name, bios_vendor, chassis_asset
         if hint in text:
             return name
     return None
+
+
+def cpu_times(line):
+    """(idle, steal, iowait, total) of a "cpu " line of /proc/stat. The total
+    is the eight time fields user..steal: guest and guest_nice are already
+    inside user and nice, and summing every field counted them twice."""
+    fields = [float(x) for x in line.strip().split()[1:]]
+    iowait = fields[4] if len(fields) > 4 else 0.0
+    idle = fields[3] + iowait
+    steal = fields[7] if len(fields) > 7 else 0.0
+    return idle, steal, iowait, sum(fields[:8])
 
 
 def get_system_identity():

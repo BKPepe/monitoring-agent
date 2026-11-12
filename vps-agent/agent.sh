@@ -379,6 +379,28 @@ if [ -n "$st_boot_id" ] && [ "$st_boot_id" != "$cur_boot_id" ]; then
     st_cpu=""; st_diskio=""; st_net=""; st_forks=""; st_ts3=""; st_procs=""
 fi
 
+# CPU, steal and iowait in % between two "cpu " lines of /proc/stat. The
+# total is the eight time fields user..steal: guest and guest_nice are
+# already inside user and nice. Steal was left out of the total, so the
+# steal share was counted against a total that did not hold it, and a VM
+# whose host took half its time read 100 % steal. No output when the
+# counters did not advance or went backwards - the caller keeps null
+# instead of a 0.0 nobody measured.
+bk_cpu_from_stat() {
+    awk -v s1="$1" -v s2="$2" '
+    BEGIN {
+        split(s1, a1); split(s2, a2);
+        idle1 = a1[5] + a1[6]; idle2 = a2[5] + a2[6];
+        total1 = 0; total2 = 0;
+        for (i = 2; i <= 9; i++) { total1 += a1[i]; total2 += a2[i] }
+        idle_delta = idle2 - idle1; total_delta = total2 - total1;
+        steal_delta = a2[9] - a1[9]; iowait_delta = a2[6] - a1[6];
+        if (total_delta > 0) {
+            printf "%.1f %.1f %.1f", (1.0 - idle_delta / total_delta) * 100, (steal_delta / total_delta) * 100, (iowait_delta / total_delta) * 100;
+        }
+    }'
+}
+
 # 1. CPU usage from the /proc/stat delta against the previous run.
 stat_now=$(grep '^cpu ' /proc/stat 2>/dev/null)
 # Not measured = null, not zero: the first run, the run after a reboot and an
@@ -386,23 +408,7 @@ stat_now=$(grep '^cpu ' /proc/stat 2>/dev/null)
 cpu="null"; cpu_steal="null"; iowait="null"
 prev_stat="${st_cpu#*|}"
 if [ -n "$st_cpu" ] && [ -n "$prev_stat" ] && [ -n "$stat_now" ]; then
-    cpu_steal_out=$(awk -v s1="$prev_stat" -v s2="$stat_now" '
-    BEGIN {
-        split(s1, a1); split(s2, a2);
-        iowait1 = a1[6] + 0; idle1 = a1[5] + a1[6];
-        total1 = a1[2]+a1[3]+a1[4]+a1[5]+a1[6]+a1[7]+a1[8];
-        steal1 = a1[9] + 0;
-        iowait2 = a2[6] + 0; idle2 = a2[5] + a2[6];
-        total2 = a2[2]+a2[3]+a2[4]+a2[5]+a2[6]+a2[7]+a2[8];
-        steal2 = a2[9] + 0;
-        idle_delta = idle2 - idle1; total_delta = total2 - total1;
-        steal_delta = steal2 - steal1; iowait_delta = iowait2 - iowait1;
-        # No output when the counters did not advance or went backwards -
-        # the caller keeps null instead of a 0.0 nobody measured.
-        if (total_delta > 0) {
-            printf "%.1f %.1f %.1f", (1.0 - idle_delta / total_delta) * 100, (steal_delta / total_delta) * 100, (iowait_delta / total_delta) * 100;
-        }
-    }')
+    cpu_steal_out=$(bk_cpu_from_stat "$prev_stat" "$stat_now")
     [ -n "$cpu_steal_out" ] && read -r cpu cpu_steal iowait <<< "$cpu_steal_out"
 fi
 new_st_cpu=""
