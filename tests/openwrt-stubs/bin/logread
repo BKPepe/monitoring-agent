@@ -31,6 +31,24 @@ fi
 #   cut      the lines that would make the masks expensive (see below).
 bk_ld() { date -d "@$1" '+%a %b %e %H:%M:%S %Y'; }
 case "$BK_STUB_LOG" in
+    severity)
+        # Every facility.level an error or a warning comes with (R190): the
+        # agent knew daemon.* and kern.* only. A notice and a file name
+        # ending in .err are neither.
+        n=$(date +%s)
+        echo "$(bk_ld $((n - 900))) user.err myscript: disk sync went wrong"
+        echo "$(bk_ld $((n - 800))) authpriv.err dropbear[812]: Bad password attempt for root"
+        echo "$(bk_ld $((n - 700))) local3.err backupd: copy aborted"
+        echo "$(bk_ld $((n - 600))) daemon.crit procd: watchdog fired"
+        echo "$(bk_ld $((n - 500))) kern.alert kernel: [ 99.100000] thermal shutdown imminent"
+        echo "$(bk_ld $((n - 400))) user.emerg shutdowner: going down now"
+        echo "$(bk_ld $((n - 300))) user.warn myscript: slow disk"
+        echo "$(bk_ld $((n - 250))) authpriv.warn dropbear[812]: Exit before auth"
+        echo "$(bk_ld $((n - 200))) local7.warn backupd: retrying"
+        echo "$(bk_ld $((n - 100))) daemon.notice netifd: Interface 'wan' is now up"
+        echo "$(bk_ld $((n - 50))) daemon.info sysupgrade: keeping /etc/file.err as a backup"
+        exit 0
+        ;;
     pii)
         n=$(date +%s)
         echo "pii $n" >> /work/out/logread_now.log

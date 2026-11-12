@@ -1334,6 +1334,9 @@ rm -f $OUT/logread_now.log
 pl wlog9
 BK_STUB_LOG=cut sh agent_openwrt.sh --dry-run > $OUT/wlog9.json 2> $OUT/wlog9.err
 mv $OUT/logread_now.log $OUT/wlog9_now.txt
+fresh
+pl wlog10
+BK_STUB_LOG=severity sh agent_openwrt.sh --dry-run > $OUT/wlog10.json 2> $OUT/wlog10.err
 rm -f "$BK_LOG_OFF" $OUT/logread_now.log
 fresh
 

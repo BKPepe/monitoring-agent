@@ -4605,8 +4605,12 @@ if [ -n "$log_buf" ]; then
             }
             if (lt >= 0 && first < 0) first = lt
             low = tolower($0)
-            if (low ~ /<warn>|(^| )warn(ing)?[: ]|daemon\.warn|kern\.warn/) nw++
-            if (low !~ /<err>|(^| )err(or)?[: ]|daemon\.err|kern\.err|critical|fatal|panic/) next
+            # A level after any facility (user, authpriv, local0-7, ...; logd
+            # writes facility.level). Only daemon.* and kern.* were known,
+            # and crit, alert and emerg - worse than err - were no errors at
+            # all. A bare "alert" in a message stays no error.
+            if (low ~ /<warn>|(^| )warn(ing)?[: ]|(^| )(kern|user|mail|daemon|auth|authpriv|syslog|lpr|news|uucp|cron|ftp|local[0-7])\.warn(ing)?( |$)/) nw++
+            if (low !~ /<err>|(^| )err(or)?[: ]|(^| )(kern|user|mail|daemon|auth|authpriv|syslog|lpr|news|uucp|cron|ftp|local[0-7])\.(err|crit|alert|emerg)( |$)|critical|fatal|panic/) next
             ne++
             if (!lines) next
             # The program is the first "name[pid]:" within three fields of the

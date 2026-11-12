@@ -838,7 +838,7 @@ def stub_now(name):
         return int(rows[0].split()[1]) if len(rows) == 1 else None
     except (IndexError, ValueError):
         return None
-wl = {i: payload(f"wlog{i}") for i in range(1, 10)}
+wl = {i: payload(f"wlog{i}") for i in range(1, 11)}
 n1, n2 = stub_now("wlog1_now.txt"), stub_now("wlog2_now.txt")
 LOG_KEYS = ("log_errors_24h", "log_warnings_24h", "log_window_secs", "log_errors_recent", "log_lines_state")
 exp_pii = None if n1 is None else [
@@ -913,6 +913,9 @@ checks.update({
         exp_cut is not None and wl[9]["log_errors_recent"] == exp_cut and "198.51" not in json.dumps(wl[9]["log_errors_recent"]),
     "log: bez logu jsou všechna pole null - ne 0 a ne [] (wlog8)":
         [wl[8][k] for k in LOG_KEYS] == [None, None, None, None, "on"],
+    # R190: user.*, authpriv.*, local*.* and crit/alert/emerg were not errors.
+    "log: chyby a varování každé facility, i crit, alert a emerg; notice a soubor .err nic (wlog10)":
+        (wl[10]["log_errors_24h"], wl[10]["log_warnings_24h"]) == (6, 3),
 })
 # --- WW-07, IO-03, IO-11, WW-04, IO-07: waits and writes ---
 # (openwrt-stubs/run-in-container.sh: wtake*, wskip*, wlp*, wdl*, wupd*)
