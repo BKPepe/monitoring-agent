@@ -1,0 +1,9 @@
+#!/bin/sh
+# date stub: the container's own date, except `date +%s` while
+# BK_STUB_DATE_S=<epoch> names the wall clock - a router whose clock NTP
+# just stepped (R244). Every other form is the real date.
+if [ -n "$BK_STUB_DATE_S" ] && [ "$*" = "+%s" ]; then
+    echo "$BK_STUB_DATE_S"
+    exit 0
+fi
+exec /bin/date "$@"

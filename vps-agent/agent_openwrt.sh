@@ -1316,6 +1316,13 @@ now_ts=$(date +%s)
 # The uptime at the same moment: agent_time is moved on from here to the
 # payload without a second `date` (see agent_run_ms).
 bk_uptime_cs; BK_NOW_TS_CS=$_up_cs
+# The rates between two runs (WAN, IPv4/IPv6, LTE, disks) are timed by the
+# kernel's uptime, not by the wall clock: a router without an RTC boots in
+# the past and NTP steps its clock by hours, and a step between two runs
+# gave a zero or a negative interval - no sample, or one spread over hours.
+# Empty when the uptime cannot be read: then no rate, not a guessed one.
+bk_mono_s=""
+case "$BK_NOW_TS_CS" in ''|*[!0-9]*) ;; *) bk_mono_s=$((BK_NOW_TS_CS / 100)) ;; esac
 BK_CORES_NOW="$BK_PRIVATE_DIR/cores.now"
 BK_CORES_PREV="$BK_PRIVATE_DIR/cores.prev"
 # One builtin loop instead of the `grep '^cpu '` fork: the aggregate line and
@@ -1720,15 +1727,15 @@ if [ -n "$wan_l3_device" ] && [ -f /proc/net/dev ]; then
                 prev_dev=$(cut -d',' -f2 "$NET_STATE_FILE" 2>/dev/null)
                 prev_bytes=$(cut -d',' -f3 "$NET_STATE_FILE" 2>/dev/null)
             fi
-            if [ "$prev_dev" = "$wan_l3_device" ] && [ -n "$prev_ts" ] && [ -n "$prev_bytes" ]; then
-                elapsed=$((now_ts - prev_ts))
+            if [ "$prev_dev" = "$wan_l3_device" ] && [ -n "$bk_mono_s" ] && [ -n "$prev_ts" ] && [ -n "$prev_bytes" ]; then
+                elapsed=$((bk_mono_s - prev_ts))
                 delta=$((net_bytes - prev_bytes))
                 if [ "$elapsed" -gt 0 ] && [ "$delta" -ge 0 ]; then
                     bk_fdiv "$delta" "$((elapsed * 1024))" 1; net=$_fd
                 fi
             fi
         fi
-        echo "${now_ts},${wan_l3_device},${net_bytes}" > "$NET_STATE_FILE" 2>/dev/null || true
+        echo "${bk_mono_s},${wan_l3_device},${net_bytes}" > "$NET_STATE_FILE" 2>/dev/null || true
     fi
 fi
 
@@ -1749,8 +1756,8 @@ if [ -n "$v4_bytes" ] && [ "$v4_bytes" -gt 0 ]; then
             prev_v4=$(cut -d',' -f2 "$NET_IP_STATE_FILE" 2>/dev/null)
             prev_v6=$(cut -d',' -f3 "$NET_IP_STATE_FILE" 2>/dev/null)
         fi
-        if [ -n "$prev_ts" ] && [ -n "$prev_v4" ] && [ "$now_ts" -gt "$prev_ts" ]; then
-            elapsed=$((now_ts - prev_ts))
+        if [ -n "$prev_ts" ] && [ -n "$prev_v4" ] && [ -n "$bk_mono_s" ] && [ "$bk_mono_s" -gt "$prev_ts" ] 2>/dev/null; then
+            elapsed=$((bk_mono_s - prev_ts))
             d_v4=$((v4_bytes - prev_v4))
             # An unreadable /proc/net/snmp6 leaves v6_bytes empty; $(( )) would
             # quietly treat that as 0 and report a fabricated 0.0 KB/s.
@@ -1764,7 +1771,7 @@ if [ -n "$v4_bytes" ] && [ "$v4_bytes" -gt 0 ]; then
             fi
         fi
     fi
-    echo "${now_ts},${v4_bytes},${v6_bytes}" > "$NET_IP_STATE_FILE" 2>/dev/null || true
+    echo "${bk_mono_s},${v4_bytes},${v6_bytes}" > "$NET_IP_STATE_FILE" 2>/dev/null || true
 fi
 
 # --- 4b. Realna smerovatelna IPv6 - hleda se na samostatnem logickem rozhrani
@@ -2536,7 +2543,7 @@ diskdev_active=" "
 # and the disk health list have to describe the same disks, and in a test
 # those are the fake root's, not the CI runner's.
 if [ -f "$BK_PROC/diskstats" ]; then
-    diskdev_now=$now_ts   # the run's clock, not one more `date` fork
+    diskdev_now=$bk_mono_s   # the kernel's uptime, see bk_mono_s
     # Kotva $ za nazvem znamenala, ze `mmcblk` sedelo jen na zarizeni doslova
     # pojmenovane "mmcblk" - jenze skutecne se jmenuje mmcblk0. Stejne tak
     # mtdblock0 a ubiblock0_0. Ze seznamu tedy vypadlo hlavni uloziste routeru
@@ -3707,15 +3714,15 @@ if [ -n "$lte_device" ] && [ "$lte_device" != "null" ] && [ -f /proc/net/dev ]; 
                 prev_lte_dev=$(cut -d',' -f2 "$NET_LTE_STATE_FILE" 2>/dev/null)
                 prev_lte_bytes=$(cut -d',' -f3 "$NET_LTE_STATE_FILE" 2>/dev/null)
             fi
-            if [ "$prev_lte_dev" = "$lte_device" ] && [ -n "$prev_lte_ts" ] && [ -n "$prev_lte_bytes" ]; then
-                elapsed_lte=$((now_ts - prev_lte_ts))
+            if [ "$prev_lte_dev" = "$lte_device" ] && [ -n "$bk_mono_s" ] && [ -n "$prev_lte_ts" ] && [ -n "$prev_lte_bytes" ]; then
+                elapsed_lte=$((bk_mono_s - prev_lte_ts))
                 delta_lte=$((lte_bytes - prev_lte_bytes))
                 if [ "$elapsed_lte" -gt 0 ] && [ "$delta_lte" -ge 0 ]; then
                     bk_fdiv "$delta_lte" "$((elapsed_lte * 1024))" 1; net_lte=$_fd
                 fi
             fi
         fi
-        echo "${now_ts},${lte_device},${lte_bytes}" > "$NET_LTE_STATE_FILE" 2>/dev/null || true
+        echo "${bk_mono_s},${lte_device},${lte_bytes}" > "$NET_LTE_STATE_FILE" 2>/dev/null || true
     fi
 fi
 

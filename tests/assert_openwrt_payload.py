@@ -127,6 +127,7 @@ wupl = {n: payload(f"wupl{n}") for n in (1, 3, 4, 6, 7)}
 # (G20), the DNS probe's exit status (G41), and the run's own clock together
 # with the runs that never produced a report (G42).
 wfw1, wfw2, wfw3, wfw4 = (payload(f"wfw{n}") for n in (1, 2, 3, 4))
+wclk2 = payload("wclk2")
 wdns1, wdns3 = payload("wdns1"), payload("wdns3")
 wrun2, wrun3, wrun4 = (payload(f"wrun{n}") for n in (2, 3, 4))
 wrun5, wrun6, wrun7 = (payload(f"wrun{n}") for n in (5, 6, 7))
@@ -769,6 +770,8 @@ checks = {
         wfw2["firewall_enabled"] is False,
     "gap: no nft and no iptables is unknown, not off - and still not what init.d claims":
         wfw3["firewall_enabled"] is None,
+    "rates: a clock NTP stepped back a day between two runs still gives the WAN, IP and disk rates over the 60 s the router ran (R244)":
+        all(isinstance(wclk2[k], (int, float)) for k in ("net", "net_ipv4_kbps")) and write_kbps(wclk2, "sda") is not None,
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":
         wfw4["firewall_enabled"] is None and wfw4["fw_accepted"] is None,
     # G24: the five claim-defaults (sqm_enabled is the wpath5 check above)

@@ -525,6 +525,18 @@ BK_STUB_NFT=fail sh agent_openwrt.sh --dry-run > $OUT/wfw4.json 2> $OUT/wfw4.err
 mv $OUT/nft_calls.log $OUT/wfw4_nft_calls.log 2>/dev/null || true
 mv $OUT/nft_calls.keep $OUT/nft_calls.log 2>/dev/null || true
 fresh
+# The rates are timed by the kernel's uptime (R244): between these two runs
+# NTP stepped the clock back by a day while the router ran 60 s - the wall
+# clock would give a negative interval and no rate at all.
+cp /tmp/fakeroot/proc/uptime /tmp/wclk-uptime.save
+pl wclk1
+BK_STUB_DATE_S=1790086400 sh agent_openwrt.sh --dry-run > $OUT/wclk1.json 2> $OUT/wclk1.err
+read -r _wu _wi < /tmp/fakeroot/proc/uptime
+awk -v u="$_wu" -v i="$_wi" 'BEGIN { printf "%.2f %.2f\n", u + 60, i }' > /tmp/fakeroot/proc/uptime
+pl wclk2
+BK_STUB_DATE_S=1790000000 sh agent_openwrt.sh --dry-run > $OUT/wclk2.json 2> $OUT/wclk2.err
+cp /tmp/wclk-uptime.save /tmp/fakeroot/proc/uptime
+fresh
 # Neither nft nor iptables: unknown, not "off". The image has no iptables
 # applet at all, which is what a router without the compat layer looks like.
 stub_off nft
