@@ -423,8 +423,10 @@ done; done
 # for an hour and a second run would only read the cache back.
 stub_on ethtool
 fresh
+echo "# wpath1" >> $OUT/ping_calls.log
 pl wpath1
 BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath1.json 2> $OUT/wpath1.err
+echo "# end" >> $OUT/ping_calls.log
 # The next run reads wpath1's hourly cache, but the drop counter is a counter
 # and is read again (R42): it moved from 12 to 99. Then tc is gone, and the
 # counter is unknown rather than the cached 12.

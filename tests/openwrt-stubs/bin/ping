@@ -1,4 +1,6 @@
 #!/bin/sh
-# canned: every target answers
+# canned: every target answers. Each call is logged, so a run can tell which
+# device a ping was bound to.
+echo "$*" >> /work/out/ping_calls.log
 echo "round-trip min/avg/max = 1.234/2.345/3.456 ms"
 exit 0

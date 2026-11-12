@@ -5027,15 +5027,21 @@ fi
 # rika, jak rychle odpovida INTERNET routeru, ne jak dobre je videt zvenku.
 #
 # Cil: nejdriv WAN brana (odezva prvniho hopu poskytovatele), pri neuspechu
-# verejny resolver. Bere se prumer ze tri paketu; kdyz ping neni nebo
+# verejny resolver. Bere se prumer ze dvou paketu; kdyz ping neni nebo
 # neprojde, zustava null - nulou se to nenahrazuje.
+#
+# Both pings leave through the WAN device (-I), like the wan_internet echo
+# below (R44). The resolver fallback followed the routing table: with the
+# WAN down it went out over the LTE backup, and the chart - and the
+# monitor's response time - showed the backup's latency as the WAN's.
+# Without a WAN device there is no WAN latency to measure: null.
 wan_latency_ms="null"
-if command -v ping >/dev/null 2>&1; then
+if [ -n "$wan_l3_device" ] && command -v ping >/dev/null 2>&1; then
     for lat_target in "$wan_gateway" "1.1.1.1"; do
         [ -z "$lat_target" ] && continue
         # -w caps the whole call: a gateway that drops ICMP (common) used to
         # hold the report for the full 3 x (1 s + 2 s) before the fallback.
-        lat_out=$(ping -c 2 -W 1 -w 3 "$lat_target" 2>/dev/null | sed -n 's|.*= [0-9.]*/\([0-9.]*\)/.*|\1|p')
+        lat_out=$(ping -I "$wan_l3_device" -c 2 -W 1 -w 3 "$lat_target" 2>/dev/null | sed -n 's|.*= [0-9.]*/\([0-9.]*\)/.*|\1|p')
         if [ -n "$lat_out" ]; then
             wan_latency_ms=$(awk -v v="$lat_out" 'BEGIN { printf "%.1f", v }')
             break

@@ -144,6 +144,7 @@ wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wdnsm = payload("wdnsm")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
+ping_runs = by_run("ping_calls.log")
 # R338: the real runs' client calls, and the bodies they were handed.
 post_runs = by_run("post_argv.log")
 def post_bodies(c):
@@ -896,6 +897,11 @@ checks = {
             for c in ("curl", "uf", "wget"))
         and any("--data-binary @" in l for l in post_runs.get("wpost-curl", []))
         and all(any("--post-file" in l for l in post_runs.get(f"wpost-{c}", [])) for c in ("uf", "wget")),
+    "wan: the latency ping leaves through the WAN device, as the wan_internet echo does - never by the route, which may be the LTE backup (R44)":
+        wpath[0]["wan_latency_ms"] == 2.3
+        and [c for c in ping_runs.get("wpath1", []) if "-c 2" in c] == ["-I eth2 -c 2 -W 1 -w 3 203.0.113.1"],
+    "wan: no WAN device, no WAN latency (R44)":
+        wpath[5]["wan_latency_ms"] is None,
     "post: a body that cannot be written goes the old way with a warning - the report still arrives (R338)":
         text("wpost-full_rc.txt") == "0"
         # The body spans lines in the shim's log: the payload is pretty-printed.
