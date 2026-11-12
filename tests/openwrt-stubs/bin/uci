@@ -11,6 +11,7 @@
 #   BK_STUB_SPEED_DIR=<dir>    the data_dir uci reports
 #   BK_STUB_SQM=off            the queue on the WAN port is enabled='0' too,
 #                              so every section of the file is disabled
+#   BK_STUB_RESOLVER=<name>    resolver.common.prefered_resolver (Turris)
 echo "$*" >> /work/out/uci_calls.log 2>/dev/null
 # `uci -q get x` and `uci get x` are the same question here.
 set -- $(echo "$*" | sed 's/^-q //')
@@ -36,6 +37,9 @@ case "$*" in
     # off while still naming the port the traffic really takes.
     printf 'sqm.wan=queue\nsqm.wan.enabled=%s\nsqm.wan.interface=%s\nsqm.wan.download=%s\nsqm.wan.upload=%s\n' \
       "$([ "$BK_STUB_SQM" = off ] && echo "'0'" || echo "'1'")" "'eth2'" "'50000'" "'0'" ;;
+  "get resolver.common.prefered_resolver")
+    [ -n "$BK_STUB_RESOLVER" ] || exit 1
+    echo "$BK_STUB_RESOLVER" ;;
   "show dhcp") printf 'dhcp.@host[0]=host\ndhcp.@host[0].name=a\ndhcp.@host[1]=host\ndhcp.@host[2]=host\n' ;;
   *) exit 1 ;;
 esac

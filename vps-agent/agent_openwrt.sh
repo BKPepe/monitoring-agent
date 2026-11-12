@@ -5262,7 +5262,10 @@ bk_running() {
     case "$bk_top_names" in *" $1 "*) return 0 ;; esac
     return 1
 }
-if bk_running kresd || [ -f /etc/config/resolver ]; then
+# /etc/config/resolver is on every Turris, whichever resolver runs: by itself
+# it said "Knot Resolver" on a router running Unbound. It counts with uci
+# naming kresd as the preferred one, or kresd running.
+if bk_running kresd || { [ -f /etc/config/resolver ] && [ "$(uci -q get resolver.common.prefered_resolver 2>/dev/null)" = "kresd" ]; }; then
     dns_engine="Knot Resolver (kresd)"
     res_fwd=$(uci -q get resolver.common.forward_custom 2>/dev/null)
     res_tls=$(uci -q get resolver.common.forward_upstream 2>/dev/null)

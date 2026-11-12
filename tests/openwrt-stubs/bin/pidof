@@ -10,4 +10,7 @@ if [ "$1" = "librespeed-cli" ]; then
     echo 4321
     exit 0
 fi
+# BK_STUB_PIDOF_RUNNING="name ...": these run too. busybox picks its applet by
+# the process name, so this container cannot start a process called unbound.
+case " $BK_STUB_PIDOF_RUNNING " in *" $1 "*) echo 4400; exit 0 ;; esac
 exec /bin/busybox pidof "$@"

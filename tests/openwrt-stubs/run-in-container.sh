@@ -542,6 +542,16 @@ fresh
 pl wts1
 BK_STUB_TAILSCALE=up sh agent_openwrt.sh --dry-run > $OUT/wts1.json 2> $OUT/wts1.err
 fresh
+# A Turris has /etc/config/resolver whichever resolver it runs (R75): here
+# Unbound, chosen in uci and running.
+# No top for this run, so the agent asks pidof, whose stub says unbound runs.
+mkdir -p /etc/config /tmp/notop && : > /etc/config/resolver
+printf '#!/bin/sh\nexit 1\n' > /tmp/notop/top && chmod +x /tmp/notop/top
+pl wdnsu
+PATH="/tmp/notop:$PATH" BK_STUB_PIDOF_RUNNING=unbound BK_STUB_RESOLVER=unbound \
+    sh agent_openwrt.sh --dry-run > $OUT/wdnsu.json 2> $OUT/wdnsu.err
+rm -rf /etc/config/resolver /tmp/notop
+fresh
 # Neither nft nor iptables: unknown, not "off". The image has no iptables
 # applet at all, which is what a router without the compat layer looks like.
 stub_off nft
