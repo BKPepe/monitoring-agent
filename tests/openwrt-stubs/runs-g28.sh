@@ -205,4 +205,22 @@ grep -v '^[[:space:]]*#' agent_openwrt.sh | grep 'STATUS_TEST_RESPONSE' > $OUT/s
 # The same for every test variable, the fake root first of all: a cron run
 # pointed at a fake /sys would report somebody else's disks as the router's.
 grep -v '^[[:space:]]*#' agent_openwrt.sh | grep -E 'STATUS_TEST_|BK_ROOT=' > $OUT/seam_guard_all.txt || true
+
+# --register again on a configured router (R188): the new URL and key
+# replace the old lines - an indented one too - and every other line stays.
+# curl answers with a key, as the server does.
+mkdir -p /tmp/regbin
+printf '#!/bin/sh\necho %s\n' "'{\"success\":true,\"agent_key\":\"NEWKEY456\"}'" > /tmp/regbin/curl
+chmod +x /tmp/regbin/curl
+printf '%s\n' 'API_URL="http://old.example/agent_api.php"' '  AGENT_KEY = "OLDKEY123"' 'LOG_LINES_ENABLED=0' \
+    'LTE_API=off' 'ALLOWED_ACTIONS=restart_wan' > /root/agent/agent_openwrt.cfg
+chmod 644 /root/agent/agent_openwrt.cfg
+_rc=0
+BK_REG_TOKEN=regtoken PATH="/tmp/regbin:$PATH" sh agent_openwrt.sh --register - http://new.example/agent_api.php \
+    > $OUT/wreg2.out 2>&1 || _rc=$?
+echo "$_rc" > $OUT/wreg2_rc.txt
+cp /root/agent/agent_openwrt.cfg $OUT/wreg2_cfg.txt
+ls -l /root/agent/agent_openwrt.cfg | cut -c1-10 > $OUT/wreg2_mode.txt
+ls -A /root/agent > $OUT/wreg2_dir.txt
+rm -rf /tmp/regbin
 rm -f /root/agent/agent_openwrt.cfg

@@ -179,9 +179,22 @@ if [ "$1" = "--register" ] || [ "$1" = "--auto-register" ]; then
     NEW_KEY=$(echo "$RESP" | sed -n 's/.*"agent_key":"\([^"]*\)".*/\1/p')
     if [ -n "$NEW_KEY" ]; then
         # 0600: the key signs every report and unlocks the remote actions.
-        ( umask 077
-          printf 'API_URL="%s"\nAGENT_KEY="%s"\n' "$API_URL" "$NEW_KEY" > "$ScriptPath/agent_openwrt.cfg" )
-        chmod 600 "$ScriptPath/agent_openwrt.cfg" 2>/dev/null
+        # Only API_URL and AGENT_KEY are the registration's; every other
+        # line is the owner's and stays (R188). The file used to be cut to
+        # those two, so registering again switched LOG_LINES_ENABLED=0 and
+        # LTE_API=off back on and dropped the action list.
+        _reg_cfg="$ScriptPath/agent_openwrt.cfg"
+        (
+            umask 077
+            if [ -f "$_reg_cfg" ]; then
+                grep -v -E '^[[:space:]]*(API_URL|AGENT_KEY)[[:space:]]*=' "$_reg_cfg" || true
+            fi
+            printf 'API_URL="%s"\nAGENT_KEY="%s"\n' "$API_URL" "$NEW_KEY"
+        ) > "$_reg_cfg.new.$$" && chmod 600 "$_reg_cfg.new.$$" && mv -f "$_reg_cfg.new.$$" "$_reg_cfg" || {
+            rm -f "$_reg_cfg.new.$$"
+            echo "CHYBA: nastaveni se nepodarilo ulozit do $_reg_cfg"
+            exit 1
+        }
         echo "OK: Router zaregistrovan, klic ulozen do $ScriptPath/agent_openwrt.cfg (jen pro roota)."
         # sysupgrade.conf needs absolute paths; "./" would name nothing.
         _reg_dir=$(cd "$ScriptPath" 2>/dev/null && pwd) || _reg_dir=$ScriptPath

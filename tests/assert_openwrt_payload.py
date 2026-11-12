@@ -846,6 +846,13 @@ checks = {
         and [int(s.split(" ")[2]) for _, s in w401] == sorted(int(s.split(" ")[2]) for _, s in w401),
     "update: a 401 is still a run without a report - at the 30-run limit the version goes back, as with no answer (R187)":
         text("w401c1_target.txt") == "new" and text("w401c2_target.txt") == "old",
+    "register: a second --register replaces API_URL and AGENT_KEY, keeps every other line, and the file stays 0600 (R188)":
+        text("wreg2_rc.txt") == "0"
+        and (text("wreg2_cfg.txt") or "").splitlines() == [
+            "LOG_LINES_ENABLED=0", "LTE_API=off", "ALLOWED_ACTIONS=restart_wan",
+            'API_URL="http://new.example/agent_api.php"', 'AGENT_KEY="NEWKEY456"']
+        and text("wreg2_mode.txt") == "-rw-------"
+        and "agent_openwrt.cfg.new" not in (text("wreg2_dir.txt") or ""),
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":
