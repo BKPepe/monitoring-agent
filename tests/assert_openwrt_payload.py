@@ -130,6 +130,7 @@ wfw1, wfw2, wfw3, wfw4 = (payload(f"wfw{n}") for n in (1, 2, 3, 4))
 wclk2 = payload("wclk2")
 wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
+wpath1b, wpath1c = payload("wpath1b"), payload("wpath1c")
 wstk = [payload(f"wstk{n}") for n in range(1, 4)]
 with open(f"{out}/wrss1.rss") as _f:
     wrss_mb = int(_f.read().strip()) / 1024
@@ -791,6 +792,11 @@ checks = {
     "top: busybox prints VSZ, the memory is the VmRSS of /proc/PID/status - and unknown for a process gone since (R258)":
         rss_rows(wrss1["top_ram_processes"]) == [{"name": "AdGuardHome", "ram_mb": "rss", "cpu": 50.0}]
         and rss_rows(wrss1["top_cpu_processes"]) == [{"name": "AdGuardHome", "cpu": 50.0, "ram_mb": "rss"}, {"name": "gone", "cpu": 40.0, "ram_mb": None}],
+    "sqm: the drop counter is read on every run, the queue's configuration comes from the hourly cache (R42)":
+        (wpath1b["sqm_enabled"], wpath1b["sqm_download_kbps"], wpath1b["sqm_dropped"]) == (True, 50000, 99)
+        and wpath1b["wan_path"] == wpath[0]["wan_path"],
+    "sqm: a counter that cannot be read now is unknown, not the cached value (R42)":
+        (wpath1c["sqm_enabled"], wpath1c["sqm_dropped"]) == (True, None),
     "speed: a result the server never confirms holds speedtest_active for one run, not for good (R198)":
         [p["speedtest_active"] for p in wstk] == [True, False, True]
         and [x["timestamp"] for x in wstk[2]["speedtests"]] == ["2026-09-21T00:05:00+02:00"],

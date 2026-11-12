@@ -425,6 +425,15 @@ stub_on ethtool
 fresh
 pl wpath1
 BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath1.json 2> $OUT/wpath1.err
+# The next run reads wpath1's hourly cache, but the drop counter is a counter
+# and is read again (R42): it moved from 12 to 99. Then tc is gone, and the
+# counter is unknown rather than the cached 12.
+pl wpath1b
+BK_STUB_WAN=eth2 BK_STUB_TC_DROPPED=99 sh agent_openwrt.sh --dry-run > $OUT/wpath1b.json 2> $OUT/wpath1b.err
+stub_off tc
+pl wpath1c
+BK_STUB_WAN=eth2 sh agent_openwrt.sh --dry-run > $OUT/wpath1c.json 2> $OUT/wpath1c.err
+stub_on tc
 fresh
 # A driver whose MIB carries neither counter name: null, never 0.
 pl wpath2

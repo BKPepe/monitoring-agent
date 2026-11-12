@@ -3070,6 +3070,9 @@ sqm_enabled="null"
 sqm_download_kbps="null"
 sqm_upload_kbps="null"
 sqm_dropped="null"
+# The device of the WAN queue the legacy keys describe. The hourly cache keeps
+# it, so the drop counter can be read again on every run.
+sqm_iface=""
 # ECN marks are a per-tin table of `tc -s qdisc`; not parsed here.
 sqm_ecn="null"
 
@@ -3133,6 +3136,7 @@ bk_sqm_flush() {
         sqm_download_kbps="$_wp_dlk"
         sqm_upload_kbps="$_wp_ulk"
         sqm_dropped="$_wp_eg"
+        sqm_iface="$_wp_if"
     fi
 }
 
@@ -3441,7 +3445,7 @@ EOF_UBUS_DEV
 fi
 log_debug "LAN porty: most=${lan_port_max:-null} strop=${lan_port_cap:-null} bridge=$BK_LAN_BRIDGE"
 
-wp_ts=""; wp_body=""; wp_sq_en=""; wp_sq_dl=""; wp_sq_ul=""; wp_sq_dr=""; wp_end=""
+wp_ts=""; wp_body=""; wp_sq_en=""; wp_sq_dl=""; wp_sq_ul=""; wp_sq_dr=""; wp_sq_if=""; wp_end=""
 if [ -f "$BK_WAN_PATH_CACHE" ]; then
     {
         IFS= read -r wp_ts
@@ -3450,6 +3454,7 @@ if [ -f "$BK_WAN_PATH_CACHE" ]; then
         IFS= read -r wp_sq_dl
         IFS= read -r wp_sq_ul
         IFS= read -r wp_sq_dr
+        IFS= read -r wp_sq_if
         IFS= read -r wp_end
     } < "$BK_WAN_PATH_CACHE" 2>/dev/null
 fi
@@ -3461,6 +3466,24 @@ if [ "$wp_end" = "end" ] && [ "$wp_age" -ge 0 ] && [ "$wp_age" -lt "$BK_WAN_PATH
     sqm_download_kbps="$wp_sq_dl"
     sqm_upload_kbps="$wp_sq_ul"
     sqm_dropped="$wp_sq_dr"
+    # The drop counter is a counter, and the server charts its increase per
+    # report. Taken from the hourly cache, it stood still for 59 minutes and
+    # then put the whole hour's drops into one minute. So it is read again on
+    # every run (one tc fork, and only on a router that shapes its WAN); the
+    # queue's configuration stays cached. A counter that cannot be read now
+    # is unknown, not the hour-old value.
+    if [ "$wp_sq_en" = "true" ] && [ -n "$wp_sq_if" ]; then
+        sqm_dropped="null"
+        case "$wp_sq_if" in
+            *[!A-Za-z0-9._-]*) ;;
+            *)
+                if command -v tc >/dev/null 2>&1; then
+                    bk_tc_dropped "$wp_sq_if"
+                    [ -n "$_tc_v" ] && sqm_dropped="$_tc_v"
+                fi
+                ;;
+        esac
+    fi
 else
     bk_have_uci=0; command -v uci >/dev/null 2>&1 && bk_have_uci=1
     bk_have_tc=0; command -v tc >/dev/null 2>&1 && bk_have_tc=1
@@ -3668,8 +3691,10 @@ EOF_SQM
 
     # Written through a temporary name, like the identity cache: a run killed
     # half way must not leave a file whose lines have shifted by one.
+    # A cache of the old seven-line format has "end" where the device now
+    # is, so it is simply measured again once.
     printf '%s\n' "$now_ts" "$wan_path_json" "$sqm_enabled" "$sqm_download_kbps" \
-        "$sqm_upload_kbps" "$sqm_dropped" "end" \
+        "$sqm_upload_kbps" "$sqm_dropped" "$sqm_iface" "end" \
         > "$BK_WAN_PATH_CACHE.tmp" 2>/dev/null && mv "$BK_WAN_PATH_CACHE.tmp" "$BK_WAN_PATH_CACHE" 2>/dev/null
     log_debug "WAN cesta: flow=$wp_flow flowtable=$wp_flowtable steering=$wp_steering/$wp_steer_active ring=$wp_ring crc=$wp_crc overrun=$wp_overrun sfp=$wp_sfp_temp/$wp_sfp_phy sqm=$sqm_enabled"
 fi
