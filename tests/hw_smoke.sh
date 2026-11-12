@@ -209,6 +209,9 @@ command -v ubus >/dev/null 2>&1 && echo "ubus=yes" || echo "ubus=no"
 [ -f /usr/share/libubox/jshn.sh ] && echo "jshn=yes" || echo "jshn=no"
 echo "tmp_free_kb=$(df -k /tmp 2>/dev/null | awk "NR == 2 {print \$4}")"
 command -v sha256sum >/dev/null 2>&1 && echo "sum=sha256sum" || echo "sum=md5sum"
+command -v hexdump >/dev/null 2>&1 && echo "hexdump=yes" || echo "hexdump=no"
+command -v mwan3 >/dev/null 2>&1 && echo "mwan3=yes" || echo "mwan3=no"
+pidof sentinel-proxy >/dev/null 2>&1 && echo "sentinel_proxy=running" || echo "sentinel_proxy=no"
 if [ -e /proc/net/stat/nf_conntrack ]; then echo "nf_stat=present"
 elif [ -e /proc/sys/net/netfilter/nf_conntrack_count ]; then
     echo "nf_stat=absent: nf_conntrack is loaded, the kernel has no CONFIG_NF_CONNTRACK_PROCFS"
@@ -233,6 +236,40 @@ sum=$(fact sum)
 nf_stat=$(fact nf_stat)
 echo "hw_smoke: /proc/net/stat/nf_conntrack on $target: ${nf_stat:-no answer}"
 printf '%s\n' "$nf_stat" > "$local_dir/nf_stat.txt"
+echo "hw_smoke: sentinel-proxy on $target: $(fact sentinel_proxy)"
+
+# The remote actions' HMAC (bk_hmac_sha256, cut out of the tested agent) on
+# the router's own busybox, over the e2e's vectors, against Python's hmac
+# here. Without sha256sum or hexdump the router cannot verify an action at
+# all (a warning: actions are opt-in); a wrong MAC fails the smoke.
+hmac_ok=1
+if [ "$(fact sum)" = sha256sum ] && [ "$(fact hexdump)" = yes ]; then
+    {
+        sed -n '/^bk_hmac_sha256() {/,/^}/p' "$agent"
+        printf '%s\n' '_t=$(printf "\t")' 'while IFS="$_t" read -r _k _m; do bk_hmac_sha256 "$_k" "$_m" || _hm=FAILED; printf "%s\n" "$_hm"; done <<'"'"'BKVEC'"'"''
+        cat "$here/openwrt-stubs/hmac_vectors.txt"
+        echo BKVEC
+    } > "$local_dir/hmac.sh"
+    rshi 30 "sh -s" < "$local_dir/hmac.sh" > "$local_dir/hmac.out" || true
+    if python3 - "$here/openwrt-stubs/hmac_vectors.txt" "$local_dir/hmac.out" <<'PY'
+import hashlib, hmac, sys
+vec = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[1], encoding="utf-8")]
+got = open(sys.argv[2]).read().split()
+want = [hmac.new(k.encode(), m.encode(), hashlib.sha256).hexdigest() for k, m in vec]
+print("hw_smoke: remote-action HMAC: %d/%d vectors equal Python's hmac" % (sum(a == b for a, b in zip(got, want)), len(want)))
+sys.exit(0 if got == want else 1)
+PY
+    then :; else hmac_ok=0; fi
+else
+    echo "hw_smoke: WARNING - $target has no $( [ "$(fact hexdump)" = yes ] || printf hexdump)$( [ "$(fact sum)" = sha256sum ] || printf ' sha256sum'): it cannot verify a remote action"
+fi
+# mwan3's interfaces and policies, for the gateway rule (R73): names, states
+# and shares only - the sections with networks and rules are left out.
+if [ "$(fact mwan3)" = yes ]; then
+    rsh 20 "mwan3 status" 2>/dev/null | awk '/^ *interface [^ ]+ is /{ print "interface", $2, $4; next }
+        /^Current ipv4 policies:/{ p = 1; print; next } p && /^$/{ p = 0 } p && /^[A-Za-z0-9_]+:$|^ +[A-Za-z0-9_.-]+( \([0-9]+%\))?$/{ print }' > "$local_dir/mwan3.txt"
+    echo "hw_smoke: mwan3 on $target: $(wc -l < "$local_dir/mwan3.txt" | tr -d ' ') interface/policy lines kept"
+fi
 
 # --- 2./3. what the agent already has there -------------------------------------
 rshi 30 "sh -s" <<< "$remote_list" > "$pre" || die 2 "listing the agent files on $target failed"
@@ -376,9 +413,9 @@ print("cpu %s  ram %s  hdd %s  wan %s (%s, %s)  radios %d  disks %d  pkg %s" % (
     (p.get("agent_tools") or {}).get("pkg_manager")))
 print("clean-up: %s" % ("%s removed, no agent state left behind" % rdir if cleanup_rc == "0" else "NOT verified"))
 EOF
-if [ "$assert_rc" = 0 ] && [ "$golden_rc" = 0 ]; then
+if [ "$assert_rc" = 0 ] && [ "$golden_rc" = 0 ] && [ "$hmac_ok" = 1 ]; then
     [ "$cleanup_rc" = 0 ] && echo "PASS"
     exit 0
 fi
-echo "FAIL (details: assert.txt and golden.txt${keep:+ in $keep})"
+echo "FAIL (details: assert.txt, golden.txt and hmac.out${keep:+ in $keep})"
 exit 1
