@@ -160,6 +160,20 @@ def bndl_cs(d, key, i):
     v = (d.get(key) or [])[i:i + 1]
     return int(v[0]) if v and v[0].isdigit() else 10 ** 9
 wsta1 = payload("wsta1")
+# E3: the refused-report runs and the heartbeats the seam wrote.
+wrej = {t: payload(t) for t in ("wrej1", "wrej1b", "wrej2", "wrej3", "wrej4", "wrej5")}
+def hbeat(t):
+    try:
+        return json.load(open(f"{out}/{t}_hb.json"))
+    except (FileNotFoundError, ValueError):
+        return None
+def wrej6_invalid():
+    try:
+        json.load(open(f"{out}/wrej6.json"))
+        return False
+    except ValueError:
+        return True
+HB_KEYS = {"agent_key", "agent_type", "version", "uptime", "payload_rejected", "rejected_http", "payload_len", "suspect_keys"}
 ping_runs = by_run("ping_calls.log")
 # R338: the real runs' client calls, and the bodies they were handed.
 post_runs = by_run("post_argv.log")
@@ -976,6 +990,20 @@ checks = {
     "bounded: the read-write fallback (the fourth open) answers within a slice and calls a hung tool a timeout, not stuck (C1)":
         (wbndl_rw.get("rwq") or [""])[:2] == ["0", "quick"] and bndl_cs(wbndl_rw, "rwq", 2) < 200
         and wbndl_rw.get("rwh") == ["124"] and wbndl_rw.get("errs") == ["timeout:rwh"],
+    "refused: a 400 is followed by a heartbeat of a fixed shape - key, type, version, uptime, the code, the length, no metric (E3)":
+        (lambda h, p: h is not None and set(h) == HB_KEYS and h["agent_key"] == "HBTESTKEY01"
+         and h["agent_type"] == "openwrt" and h["version"] == p["version"] and h["uptime"] == p["uptime"]
+         and h["payload_rejected"] is True and h["rejected_http"] == 400 and h["suspect_keys"] == []
+         and isinstance(h["payload_len"], int) and h["payload_len"] > 1000)(hbeat("wrej1"), wrej["wrej1"])
+        and text("wrej1_rc.txt") == "1" and "(HTTP 400); zivotni signal zapsan. Odpoved:" in (text("wrej1_log.txt") or ""),
+    "refused: the refused minute still counts as not stored in the next report, which brings no heartbeat (E3)":
+        wrej["wrej1b"]["runs_skipped_post"] == 1 and text("wrej1b_hb.json") == "none" and text("wrej1b_rc.txt") == "0",
+    "refused: a 413 brings a heartbeat without the member scan; 401, 500 and 000 bring none (E3)":
+        (hbeat("wrej2") or {}).get("rejected_http") == 413 and (hbeat("wrej2") or {}).get("suspect_keys") == []
+        and all(text(f"{t}_hb.json") == "none" for t in ("wrej3", "wrej4", "wrej5")),
+    "refused: a member that is no JSON is named in the heartbeat, by name only (E3)":
+        wrej6_invalid() and (hbeat("wrej6") or {}).get("suspect_keys") == ["sqm_enabled"]
+        and "podezrele klice: \"sqm_enabled\"" in (text("wrej6_log.txt") or ""),
     "top: procps prints RES, the resident set in kB, taken as it is (R258)":
         wrss2["top_ram_processes"] == [{"name": "AdGuardHome", "ram_mb": 20.0, "cpu": 30.0}],
     "gap: an nft that cannot ask the kernel is unknown, not an empty kernel (R243)":

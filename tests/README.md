@@ -213,7 +213,14 @@ with nobody on it.
   folds 25,000 queued skips while 200 more are appended and checks that
   every line is counted exactly once; `wskip2` saturates the counters at
   100,000. `wlp1..3` show the debug copy kept after a failed POST,
-  removed after an accepted one and kept by `last-payload.on`. `wdl0..2`
+  removed after an accepted one and kept by `last-payload.on`. `wrej1..6`
+  (E3) answer the report with a refusal: after a 400 a heartbeat of a fixed
+  shape goes out instead of silence (the seam writes it next to the canned
+  answer) - key, type, version, uptime, the code, the payload's length, no
+  metric - and the next report still counts the refused minute; a 413 sends
+  one without the member scan, 401, 500 and 000 send none, and a member that
+  is no JSON (`sqm_enabled` from a planted WAN path cache) is named, by name
+  only. `wdl0..2`
   reach the POST 0, 40 and 50 s late (`BK_STUB_UPTIME_ADD` on the `logread`
   stub) and read the POST limit and the skipped service checks from the log.
   `wsc1` plants `proc/net/tcp`, `tcp6`, `udp` and `udp6` with one listening

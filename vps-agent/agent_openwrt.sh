@@ -1601,9 +1601,15 @@ fi
 # towards the 30-run limit, like a run that got no answer at all: a 403
 # can come from a filter in front of the server reacting to the new
 # payload, and a version that never gets a report through must still go.
-# Called from the POST's else branch.
+# bk_refused_code is that set - for the probation here and for the
+# heartbeat after the POST (E3) - and bk_upd_refused counts a refusal.
+# Both are called from the POST's else branch.
+bk_refused_code() { # HTTP_CODE -> 0 when the answer refuses the report itself
+    case "$1" in 400|413|422) return 0 ;; esac
+    return 1
+}
 bk_upd_refused() { # HTTP_CODE
-    case "$1" in 400|413|422) ;; *) return 0 ;; esac
+    bk_refused_code "$1" || return 0
     bk_upd_probation_read || return 0
     printf '%s %s %s %s\n' "$_pb_v" "$_pb_sha" "$_pb_runs" "$((_pb_ref + 1))" > "$BK_UPD_PROBATION" 2>/dev/null
     return 0
@@ -6791,6 +6797,68 @@ bk_hmac_sha256() {
     [ ${#_hm} -eq 64 ] || { _hm=""; return 1; }
 }
 
+# E3: the members of $payload whose value cannot be JSON, by NAME only - no
+# value leaves the router this way. The heredoc prints one member per line;
+# a string, an object or an array is not looked into. Builtins only. At most
+# ten names, into _hbt_keys as the body of a JSON list.
+bk_suspect_keys() {
+    _hbt_keys=""; _hbt_n=0; _hbt_r=$payload
+    while [ -n "$_hbt_r" ] && [ "$_hbt_n" -lt 10 ]; do
+        case "$_hbt_r" in
+            *"$BK_NL"*) _hbt_l=${_hbt_r%%"$BK_NL"*}; _hbt_r=${_hbt_r#*"$BK_NL"} ;;
+            *) _hbt_l=$_hbt_r; _hbt_r="" ;;
+        esac
+        case "$_hbt_l" in '  "'*'": '*) ;; *) continue ;; esac
+        _hbt_k=${_hbt_l#'  "'}; _hbt_k=${_hbt_k%%'"'*}
+        case "$_hbt_k" in ''|*[!a-z0-9_]*) continue ;; esac
+        _hbt_v=${_hbt_l#*'": '}; _hbt_v=${_hbt_v%,}
+        case "$_hbt_v" in
+            null|true|false|'"'*|'{'*|'['*) continue ;;
+            -*|[0-9]*) bk_jnum "$_hbt_v" && continue ;;
+        esac
+        _hbt_keys="$_hbt_keys${_hbt_keys:+,}\"$_hbt_k\""
+        _hbt_n=$((_hbt_n + 1))
+    done
+}
+# E3: the server answered and refused this minute's report whole. The router
+# is up and the server reachable, yet without a word the router would look
+# switched off once the offline timeout passed. One small POST of a fixed
+# shape says so: who, which version, the uptime, why. It carries no metric -
+# the minute stays a gap, which the server shows as an unreadable report -
+# and its answer is not read: no update offer, no action and no
+# acknowledgement rides on it, and it changes neither the probation nor the
+# skip counters, which belong to the refused report. A server without the
+# handler would take it for a report of nulls, so the server goes first.
+# Sets _hbt_note for the run's one log line.
+bk_heartbeat() { # HTTP_CODE of the refused report
+    _hbt_note=""; _hbt_keys=""
+    [ -n "$AGENT_KEY" ] || return 0
+    [ "$1" = 400 ] && bk_suspect_keys
+    bk_js "$AGENT_KEY"
+    _hbt_json="{\"agent_key\":\"$_jr\",\"agent_type\":\"openwrt\",\"version\":\"$AGENT_VERSION\",\"uptime\":$uptime_sec,\"payload_rejected\":true,\"rejected_http\":$1,\"payload_len\":${#payload},\"suspect_keys\":[$_hbt_keys]}"
+    if [ -n "$BK_TEST_RESPONSE" ]; then
+        # Response seam: written next to the canned answer, nothing is POSTed.
+        printf '%s\n' "$_hbt_json" > "$BK_TEST_RESPONSE.heartbeat" 2>/dev/null
+        _hbt_note="; zivotni signal zapsan"
+    else
+        # Bounded like an action's result, and through the same body file.
+        bk_time_left; bk_limit 3 10 2
+        bk_post_body "$_hbt_json"
+        _hbt_ok=0
+        if command -v curl >/dev/null 2>&1; then
+            curl -fs -m "$_lim" --connect-timeout 5 -o /dev/null -X POST -H "Content-Type: application/json" "$_cd_opt" "$_cd_val" "$API_URL" >/dev/null 2>&1 && _hbt_ok=1
+        elif command -v uclient-fetch >/dev/null 2>&1; then
+            uclient-fetch -q -T "$_lim" -O /dev/null "$_pf_arg" --header="Content-Type: application/json" "$API_URL" >/dev/null 2>&1 && _hbt_ok=1
+        elif command -v wget >/dev/null 2>&1; then
+            wget -T "$_lim" -t 1 "$_pf_arg" --header="Content-Type: application/json" -q -O /dev/null "$API_URL" >/dev/null 2>&1 && _hbt_ok=1
+        fi
+        rm -f "$BK_POST_BODY"
+        if [ "$_hbt_ok" = 1 ]; then _hbt_note="; zivotni signal prijat"; else _hbt_note="; zivotni signal neprijat"; fi
+    fi
+    [ -n "$_hbt_keys" ] && _hbt_note="$_hbt_note (podezrele klice: $_hbt_keys)"
+    return 0
+}
+
 if [ "$http_code" = "200" ]; then
     log_debug "OK: Statistiky uspesne odeslany."
     # W1-B: a normal run pays three `[ ]` tests here, nothing else.
@@ -7318,7 +7386,6 @@ if [ "$http_code" = "200" ]; then
 
     log_debug "Hotovo."
 else
-    log_message "CHYBA: Odeslani selhalo (HTTP $http_code). Odpoved: $body"
     bk_keep_last_payload
     [ -f "$BK_UPD_PROBATION" ] && bk_upd_refused "$http_code"
     # G42: this minute produced no stored report either. Counted here and
@@ -7327,6 +7394,12 @@ else
     # run holds the lock and has the counters in hand, so no line has to be
     # written and read back.
     runs_skipped_post=$((runs_skipped_post + 1)); bk_sk_cap; bk_sk_save
+    # E3: once the state above is safe, and only for a refusal of the report
+    # itself - a 401/403 would refuse the heartbeat too, a 000 or a 5xx is the
+    # server's own trouble. Its outcome joins the one log line.
+    _hbt_note=""
+    bk_refused_code "$http_code" && bk_heartbeat "$http_code"
+    log_message "CHYBA: Odeslani selhalo (HTTP $http_code)$_hbt_note. Odpoved: $body"
     exit 1
 fi
 # W1-B: the end mark. The self-update of every later version takes a file

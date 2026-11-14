@@ -33,8 +33,9 @@
 # cached of its answers), wnum1 with wjnum (a value that is no JSON number is
 # null), wst1..3 (the modem's answer changing, in syslog), wreg1 (the file
 # --register sends its token from), wbnd1..10 with wbndl (a tool that
-# hangs: killed, skipped once, abandoned while the kernel holds it) - and
-# the hardening runs (runs-g28.sh, remote actions w19_1..18).
+# hangs: killed, skipped once, abandoned while the kernel holds it),
+# wrej1..6 (a refused report and the heartbeat after it) - and the
+# hardening runs (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -983,6 +984,49 @@ touch "$PRIV/last-payload.on"
 pl wlp3
 STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > $OUT/wlp3.json 2> $OUT/wlp3.err
 cp "$PRIV/last-payload.json" $OUT/wlp3_last.json 2>/dev/null || true
+fresh
+
+# --- wrej1..wrej6: a refused report is followed by a heartbeat (E3) -----------
+# The seam writes the heartbeat next to the canned answer instead of POSTing.
+#   wrej1   400: a heartbeat of a fixed shape - who, version, uptime, the code,
+#           the payload's length, no member named (the report is valid JSON
+#           here) - and the run's one log line says so
+#   wrej1b  the next report is accepted: the refused minute counted as not
+#           stored, and no heartbeat
+#   wrej2   413: a heartbeat; the member scan runs on a 400 only
+#   wrej3..5  401, 500 and 000: no heartbeat
+#   wrej6   a member that is no JSON (sqm_enabled from a planted WAN path
+#           cache): the 400's heartbeat names it, and only it. Not listed
+#           with pl: its payload is invalid on purpose.
+hb() { # TAG CODE BODY
+    resp "$2" "$3"
+    rm -f /tmp/wack-resp.json.heartbeat
+    _rc=0
+    STATUS_TEST_RESPONSE=/tmp/wack-resp.json sh agent_openwrt.sh --dry-run > "$OUT/$1.json" 2> "$OUT/$1.err" || _rc=$?
+    echo "$_rc" > "$OUT/$1_rc.txt"
+    if [ -e /tmp/wack-resp.json.heartbeat ]; then cp /tmp/wack-resp.json.heartbeat "$OUT/$1_hb.json"
+    else echo none > "$OUT/$1_hb.json"; fi
+    # The heartbeat holds the key: nothing of it stays in /tmp.
+    rm -f /tmp/wack-resp.json.heartbeat
+    grep 'Odeslani selhalo' /tmp/status-agent-openwrt.log 2>/dev/null | tail -n 1 > "$OUT/$1_log.txt" || true
+}
+echo "AGENT_KEY=HBTESTKEY01" > /root/agent/agent_openwrt.cfg
+pl wrej1
+hb wrej1 400 '{"success":false,"message":"Neplatny JSON format: Syntax error"}'
+pl wrej1b
+hb wrej1b 200 '{"status":"ok"}'
+pl wrej2
+hb wrej2 413 ''
+pl wrej3
+hb wrej3 401 '{"success":false}'
+pl wrej4
+hb wrej4 500 ''
+pl wrej5
+hb wrej5 000 ''
+fresh
+printf '%s\n{}\nmaybe\nnull\nnull\nnull\n\nend\n' "$(date +%s)" > "$PRIV/wan-path.cache"
+hb wrej6 400 '{"success":false,"message":"Neplatny JSON format: Syntax error"}'
+rm -f /root/agent/agent_openwrt.cfg
 fresh
 
 # --- wdl0..wdl2: the run's deadline (WW-04) -----------------------------------
