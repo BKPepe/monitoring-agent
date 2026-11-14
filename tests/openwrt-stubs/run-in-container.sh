@@ -656,7 +656,6 @@ fresh
 # prints RES, which is used as it is.
 sleep 600 &
 _rss_pid=$!
-awk '/^VmRSS:/ { print $2 }' "/proc/$_rss_pid/status" > $OUT/wrss1.rss
 mkdir -p /tmp/rsstop
 cat > /tmp/rsstop/top <<EOT
 #!/bin/sh
@@ -672,6 +671,10 @@ EOT
 chmod +x /tmp/rsstop/top
 pl wrss1
 PATH="/tmp/rsstop:$PATH" sh agent_openwrt.sh --dry-run > $OUT/wrss1.json 2> $OUT/wrss1.err
+# The resident set the agent must have read, taken after its run: straight
+# after the fork the process can still be in its setup (152 kB against the
+# 1,880 kB it settles at, seen under load).
+awk '/^VmRSS:/ { print $2 }' "/proc/$_rss_pid/status" > $OUT/wrss1.rss
 cat > /tmp/rsstop/top <<EOT
 #!/bin/sh
 cat <<'EOP'
