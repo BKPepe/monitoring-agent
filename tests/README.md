@@ -235,7 +235,13 @@ with nobody on it.
   `bnd.skip`: the tag is skipped while that process lives (`stuck:df_fs`)
   and asked again once it is gone. `wbnd6/7` leave a process outside the
   tool's tree on the FIFO (`BK_STUB_DF_ESCAPE`): abandoned at once, and the
-  later calls of the run get 1 s. `wbndl` runs `bk_bounded` itself, lifted
+  later calls of the run get 1 s. `wbnd8` hangs `btrfs`, `nft`, `wg`, `top`
+  and `logread` at once (`BK_STUB_HANG` on the stubs, a PATH of hanging
+  `top` and `btrfs`): each is killed at its bound and what it would have
+  told is null, not empty, and the WAN path is not cached; `wbnd9` skips
+  all five once without calling them, and `wbnd10` asks them again, leaving
+  the top snapshot and the log ring as empty files. `wbndl` runs
+  `bk_bounded` itself, lifted
   from the agent, through what a full run cannot make happen on cue: a child
   that exits just before each of 60 calls (busybox fails the FIFO's open
   with EINTR in a quarter to a third of them, and each call must still be

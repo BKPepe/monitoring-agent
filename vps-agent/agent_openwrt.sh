@@ -1803,12 +1803,12 @@ case "$hdd" in ''|*[!0-9]*) hdd="null" ;; esac
 # OpenWrt squashfs+jffs2/overlay btrfs vubec nezna a prikaz jen tise selze
 # (zustane null). Soucet vsech 5 typu chyb pres vsechny disky v poli -
 # 0 = zdrave, cokoli vic znamena problem se zapisem/ctenim/checksumy.
+# An ioctl on the root filesystem every minute, so it is bounded like df.
 btrfs_errors="null"
 if command -v btrfs >/dev/null 2>&1; then
-    btrfs_out=$(btrfs device stats "$df_target" 2>/dev/null)
-    if [ -n "$btrfs_out" ]; then
-        btrfs_errors=$(echo "$btrfs_out" | awk '{sum += $NF} END {print sum+0}')
-    fi
+    bk_bounded 5 btrfs "$BK_BND_OUT" btrfs device stats "$df_target"
+    [ -s "$BK_BND_OUT" ] && btrfs_errors=$(awk '{sum += $NF} END {print sum+0}' "$BK_BND_OUT")
+    : > "$BK_BND_OUT"
 fi
 
 # --- 2c. Flash Wear / Disk Write Rate (čte zapsané sektory z /proc/diskstats) ---
@@ -2609,8 +2609,8 @@ fw_rejected="null"
 # Output: "FW4 FT |ACCEPT|DROP|REJECT" (an empty sum = no counted rule), and
 # nothing at all when nft printed nothing - "an empty kernel" stays what it
 # was before: no counters from nft, then the iptables branch.
+# rc: nft's exit status, passed (-v) with the second listing only.
 BK_NFT_AWK='
-    /^BKNFTRC [0-9]+$/ { rc = $2; next }
     length($0) > 0 { any = 1 }
     index($0, "table inet fw4") { fw4 = 1 }
     index($0, "flowtable ") { ft = 1 }
@@ -2656,26 +2656,34 @@ bk_nft_fw4=0
 bk_nft_ft=0
 bk_have_nft=0
 bk_nft_failed=0
+bk_nft_hung=0
 if command -v nft >/dev/null 2>&1; then
     bk_have_nft=1
-    bk_nft_out=$(nft -t list ruleset 2>/dev/null | awk "$BK_NFT_AWK")
+    # nft asks the kernel over netlink, under the nfnl mutex: bounded.
+    bk_bounded 5 nft "$BK_BND_OUT" nft -t list ruleset
+    [ "$_bb_rc" -lt 124 ] && bk_nft_out=$(awk "$BK_NFT_AWK" "$BK_BND_OUT")
     # An nft too old for -t fails without printing anything, and so answers
     # like an empty kernel: ask once more without it. On a kernel that really
     # is empty this lists nothing a second time; the answer is the same.
     # This second answer carries nft's exit status: an nft that could not
     # ask the kernel at all is no empty kernel, and its "no fw4 table" was
     # three reports later an alert that the firewall was off.
-    if [ -z "$bk_nft_out" ]; then
-        bk_nft_out=$( { nft list ruleset 2>/dev/null; echo "BKNFTRC $?"; } | awk "$BK_NFT_AWK")
+    if [ -z "$bk_nft_out" ] && [ "$_bb_rc" -lt 124 ]; then
+        bk_bounded 5 nft "$BK_BND_OUT" nft list ruleset
+        [ "$_bb_rc" -lt 124 ] && bk_nft_out=$(awk -v rc="$_bb_rc" "$BK_NFT_AWK" "$BK_BND_OUT")
         [ "$bk_nft_out" = "FAILED" ] && { bk_nft_failed=1; bk_nft_out=""; }
     fi
+    # Out of time, skipped or stuck, nft told nothing either: unknown. And
+    # iptables-nft would wait on the same mutex, so it is not asked instead.
+    [ "$_bb_rc" -ge 124 ] && { bk_nft_failed=1; bk_nft_hung=1; }
+    : > "$BK_BND_OUT"
 fi
 if [ -n "$bk_nft_out" ]; then
     bk_nft_fw4=${bk_nft_out%% *}; _fw_r=${bk_nft_out#* }
     bk_nft_ft=${_fw_r%% *}; _fw_r=${_fw_r#* |}
     fw_accepted=${_fw_r%%|*}; _fw_r=${_fw_r#*|}
     fw_dropped=${_fw_r%%|*}; fw_rejected=${_fw_r#*|}
-elif command -v iptables >/dev/null 2>&1; then
+elif [ "$bk_nft_hung" != 1 ] && command -v iptables >/dev/null 2>&1; then
     fw_accepted=$(_ipt_target_packets ACCEPT)
     fw_dropped=$(_ipt_target_packets DROP)
     fw_rejected=$(_ipt_target_packets REJECT)
@@ -2734,8 +2742,11 @@ done
 # --- WireGuard peers (if wg command or wg0 interface exists) ---
 wireguard_peers_json="[]"
 if command -v wg >/dev/null 2>&1; then
-    wg_dump=$(wg show all dump 2>/dev/null)
-    if [ -n "$wg_dump" ]; then
+    # Generic netlink, bounded. A dump that did not come is no "no peers":
+    # out of time, skipped or stuck, the list is null.
+    bk_bounded 3 wg "$BK_BND_OUT" wg show all dump
+    [ "$_bb_rc" -ge 124 ] && wireguard_peers_json="null"
+    if [ -s "$BK_BND_OUT" ]; then
         # `wg show all dump`: the first line per interface has 5 columns
         # (iface, PRIVATE key, pubkey, port, fwmark), every peer line 9
         # (iface, pubkey, psk, endpoint, allowed-ips, handshake, rx, tx,
@@ -2744,7 +2755,7 @@ if command -v wg >/dev/null 2>&1; then
         # the server rejected the JSON - so a router with WireGuard up sent
         # no telemetry at all - and the interface line leaked a private-key
         # prefix as "public_key".
-        wireguard_peers_json=$(echo "$wg_dump" | awk '
+        wireguard_peers_json=$(awk '
         BEGIN { printf "[" }
         NF < 9 { next }
         {
@@ -2762,8 +2773,10 @@ if command -v wg >/dev/null 2>&1; then
             printf "{\"interface\":\"%s\",\"public_key\":\"%s\",\"endpoint\":\"%s\",\"latest_handshake\":%s,\"rx_bytes\":%s,\"tx_bytes\":%s}", $1, substr($2,1,12)"...", endpoint, handshake, rx, tx;
             count++;
         }
-        END { printf "]" }')
+        END { printf "]" }' "$BK_BND_OUT")
     fi
+    # Each interface's first line carries its PRIVATE key: gone at once.
+    : > "$BK_BND_OUT"
 fi
 
 # --- Vysledky mereni rychlosti (librespeed-cli) ---
@@ -3252,21 +3265,26 @@ if command -v top >/dev/null 2>&1; then
     #
     # Dohledat rodicovstvi az potom nejde: proces uz je mrtvy a /proc o nem nic
     # nevi. $! je jediny spolehlivy zpusob, jak jeho PID znat.
-    BK_TOP_OUT="/tmp/status-agent-openwrt-top.$$"
+    # A walk of every /proc entry, bounded; the snapshot sits in the private
+    # directory and is emptied after the parse.
+    BK_TOP_OUT="$BK_PRIVATE_DIR/top.out"
     # busybox top has no -w: the procps form failed first on every run and
     # each report paid for two top invocations. Pick the form once.
     bk_top_args="-bn1 -w 512"
     case "$(readlink -f "$(command -v top)" 2>/dev/null)" in *busybox*) bk_top_args="-bn1" ;; esac
-    COLUMNS=512 top $bk_top_args >"$BK_TOP_OUT" 2>/dev/null &
-    bk_top_pid=$!
-    wait "$bk_top_pid" 2>/dev/null
+    # env execs top, so the bounded call's PID is top's own: the sampler's
+    # line is still told apart below.
+    # shellcheck disable=SC2086
+    bk_bounded 5 top "$BK_TOP_OUT" env COLUMNS=512 top $bk_top_args
+    bk_top_pid=$_bb_pid
     # `-s` asks the question without reading the file into the shell: the
     # awk below reads the snapshot itself.
-    if [ ! -s "$BK_TOP_OUT" ] && [ "$bk_top_args" != "-bn1" ]; then
-        COLUMNS=512 top -bn1 >"$BK_TOP_OUT" 2>/dev/null &
-        bk_top_pid=$!
-        wait "$bk_top_pid" 2>/dev/null
+    if [ ! -s "$BK_TOP_OUT" ] && [ "$_bb_rc" -lt 124 ] && [ "$bk_top_args" != "-bn1" ]; then
+        bk_bounded 5 top "$BK_TOP_OUT" env COLUMNS=512 top -bn1
+        bk_top_pid=$_bb_pid
     fi
+    # A snapshot that did not come is no "nothing ran": unknown.
+    [ "$_bb_rc" -ge 124 ] && { top_cpu_json="null"; top_ram_json="null"; }
     if [ -s "$BK_TOP_OUT" ]; then
         # ONE awk over the snapshot. It was cat + a parse + a PID filter + two
         # rankings of `awk | sort -rn | head -5 | awk` each: 17 forks, and the
@@ -3383,7 +3401,7 @@ if command -v top >/dev/null 2>&1; then
                 [ "$bk_top_names" = " " ] && bk_top_names="" ;;
         esac
     fi
-    rm -f "$BK_TOP_OUT" 2>/dev/null
+    : > "$BK_TOP_OUT"
 fi
 [ -z "$top_cpu_json" ] && top_cpu_json="[]"
 [ -z "$top_ram_json" ] && top_ram_json="[]"
@@ -4099,10 +4117,14 @@ EOF_SQM
     # Written through a temporary name, like the identity cache: a run killed
     # half way must not leave a file whose lines have shifted by one.
     # A cache of the old seven-line format has "end" where the device now
-    # is, so it is simply measured again once.
-    printf '%s\n' "$now_ts" "$wan_path_json" "$sqm_enabled" "$sqm_download_kbps" \
-        "$sqm_upload_kbps" "$sqm_dropped" "$sqm_iface" "end" \
-        > "$BK_WAN_PATH_CACHE.tmp" 2>/dev/null && mv "$BK_WAN_PATH_CACHE.tmp" "$BK_WAN_PATH_CACHE" 2>/dev/null
+    # is, so it is simply measured again once. A ruleset nft could not list
+    # leaves flowtable_active unknown, and that is not kept for an hour: the
+    # next run measures again.
+    if [ "$bk_nft_failed" != 1 ]; then
+        printf '%s\n' "$now_ts" "$wan_path_json" "$sqm_enabled" "$sqm_download_kbps" \
+            "$sqm_upload_kbps" "$sqm_dropped" "$sqm_iface" "end" \
+            > "$BK_WAN_PATH_CACHE.tmp" 2>/dev/null && mv "$BK_WAN_PATH_CACHE.tmp" "$BK_WAN_PATH_CACHE" 2>/dev/null
+    fi
     log_debug "WAN cesta: flow=$wp_flow flowtable=$wp_flowtable steering=$wp_steering/$wp_steer_active ring=$wp_ring crc=$wp_crc overrun=$wp_overrun sfp=$wp_sfp_temp/$wp_sfp_phy sqm=$sqm_enabled"
 fi
 
@@ -4956,18 +4978,27 @@ fi
 # once per service - five to seven times a minute - and once more for the
 # error counts) and a single awk pass for all services.
 service_restarts_json="{}"
-bk_log_full=""
-command -v logread >/dev/null 2>&1 && bk_log_full=$(logread 2>/dev/null)
-if [ -n "$bk_log_full" ]; then
+# The ring goes to a file in the private directory, not into the shell (about
+# 1 MB on Turris' syslog-ng), and logread is bounded: logd can stall, and on
+# Turris /var/log may sit on a disk. The file is emptied once log_buf has its
+# lines (below): it holds hostnames and addresses.
+BK_LOG_OUT="$BK_PRIVATE_DIR/logread.out"
+bk_log_have=""; bk_log_hung=""
+if command -v logread >/dev/null 2>&1; then
+    bk_bounded 5 logread "$BK_LOG_OUT" logread
+    [ -s "$BK_LOG_OUT" ] && bk_log_have=1
+    [ "$_bb_rc" -ge 124 ] && bk_log_hung=1
+fi
+if [ -n "$bk_log_have" ]; then
     svc_names=""
     for svc in dnsmasq odhcpd hostapd mwan3 uhttpd nginx wireguard; do
         [ -f "/etc/init.d/$svc" ] && svc_names="$svc_names $svc"
     done
     if [ -n "$svc_names" ]; then
-        service_restarts_json=$(printf '%s\n' "$bk_log_full" | awk -v names="$svc_names" '
+        service_restarts_json=$(awk -v names="$svc_names" '
             BEGIN { n = split(names, s, " "); for (i = 1; i <= n; i++) if (s[i] != "") cnt[s[i]] = 0 }
             { low = tolower($0); if (index(low, "start") == 0) next; for (k in cnt) if (index(low, k) > 0) cnt[k]++ }
-            END { printf "{"; for (i = 1; i <= n; i++) { if (s[i] == "") continue; printf "%s\"%s\": %d", (c++ ? ", " : ""), s[i], cnt[s[i]] } printf "}" }')
+            END { printf "{"; for (i = 1; i <= n; i++) { if (s[i] == "") continue; printf "%s\"%s\": %d", (c++ ? ", " : ""), s[i], cnt[s[i]] } printf "}" }' "$BK_LOG_OUT")
     fi
 fi
 
@@ -5057,13 +5088,16 @@ case "$LOG_LINES_ENABLED" in
         ;;
 esac
 log_buf=""
-if [ -n "$bk_log_full" ]; then
-    log_buf=$(printf '%s\n' "$bk_log_full" | tail -n 500)
+if [ -n "$bk_log_have" ]; then
+    log_buf=$(tail -n 500 "$BK_LOG_OUT")
+    : > "$BK_LOG_OUT"
 fi
-if [ -z "$log_buf" ] && command -v journalctl >/dev/null 2>&1; then
+# A logread that hung is not stood in for: Turris' logread reads the same
+# /var/log/messages, and a tail of it would hang on the same disk unbounded.
+if [ -z "$log_buf" ] && [ -z "$bk_log_hung" ] && command -v journalctl >/dev/null 2>&1; then
     log_buf=$(journalctl --since "24 hours ago" --no-pager -n 500 2>/dev/null)
 fi
-if [ -z "$log_buf" ] && [ -r /var/log/messages ]; then
+if [ -z "$log_buf" ] && [ -z "$bk_log_hung" ] && [ -r /var/log/messages ]; then
     log_buf=$(tail -n 500 /var/log/messages 2>/dev/null)
 fi
 if [ -n "$log_buf" ]; then

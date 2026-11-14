@@ -15,6 +15,9 @@
 # no verdict, so the firewall sums are the same with and without -t. Every
 # call is logged.
 echo "$*" >> /work/out/nft_calls.log
+# BK_STUB_HANG: the tools that hang (C1), as a list of names. This one then
+# becomes a sleep that only a signal ends, like a tool the kernel holds.
+case " $BK_STUB_HANG " in *" nft "*) exec sleep 30 ;; esac
 bk_terse=0
 if [ "$1" = "-t" ]; then
     [ "$BK_STUB_NFT_NOTERSE" = 1 ] && { echo "nft: invalid option -- 't'" >&2; exit 1; }

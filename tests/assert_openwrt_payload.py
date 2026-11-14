@@ -145,7 +145,9 @@ wts1, wdnsu = payload("wts1"), payload("wdnsu")
 wdnsm = payload("wdnsm")
 wrss1, wrss2 = payload("wrss1"), payload("wrss2")
 # C1: the bounded calls (run-in-container.sh wbnd1..wbnd7).
-wbnd = {t: payload(t) for t in ("wbnd1", "wbnd2", "wbnd3", "wbnd4", "wbnd5", "wbnd6", "wbnd7")}
+wbnd = {t: payload(t) for t in ("wbnd1", "wbnd2", "wbnd3", "wbnd4", "wbnd5", "wbnd6", "wbnd7",
+                                 "wbnd8", "wbnd9", "wbnd10")}
+nft_runs = by_run("nft_calls.log")
 def bnd_cs(t):
     v = text(f"{t}_cs.txt") or ""
     return int(v) if v.isdigit() else 10 ** 9
@@ -950,6 +952,20 @@ checks = {
         and text("wbnd6_skip.txt") == "df_root" and text("wbnd6_fifo.txt") == "none"
         and any("mimo jeho strom" in l for l in bnd_log.get("wbnd6", []))
         and wbnd["wbnd7"]["collect_errors"] == ["skipped:df_root"],
+    "bounded: btrfs, nft, wg, top and logread that hang are each killed at their bound, and what they would have told is unknown, not empty (C1)":
+        wbnd["wbnd8"]["collect_errors"] == ["timeout:btrfs", "timeout:nft", "timeout:wg", "timeout:top", "timeout:logread"]
+        and all(wbnd["wbnd8"][k] is None for k in ("btrfs_errors", "firewall_enabled", "fw_accepted", "fw_dropped",
+                                                   "fw_rejected", "wireguard_peers", "top_cpu_processes", "top_ram_processes",
+                                                   "log_errors_24h"))
+        and wbnd["wbnd8"]["wan_path"]["flowtable_active"] is None
+        and "wan-path.cache" not in (text("wbnd8_priv.txt") or "").split() and bnd_cs("wbnd8") < 4500,
+    "bounded: the next run skips those five once without calling them, and the one after asks them again (C1)":
+        wbnd["wbnd9"]["collect_errors"] == ["skipped:btrfs", "skipped:nft", "skipped:wg", "skipped:top", "skipped:logread"]
+        and wbnd["wbnd9"]["firewall_enabled"] is None and nft_runs.get("wbnd9") == [] and bnd_cs("wbnd9") < 1500
+        and wbnd["wbnd10"]["collect_errors"] == [] and wbnd["wbnd10"]["btrfs_errors"] == 3
+        and wbnd["wbnd10"]["firewall_enabled"] is True and len(wbnd["wbnd10"]["wireguard_peers"]) == 2
+        and len(wbnd["wbnd10"]["top_cpu_processes"]) > 0 and len(nft_runs.get("wbnd10", [])) > 0
+        and text("wbnd10_scratch.txt") == "top.out 0 logread.out 0",
     "bounded: a child gone just before each of 60 calls interrupts the FIFO's open, and every call is still bounded and answered, ash's \"can't open\" never shown (C1)":
         wbndl.get("race") == ["60/60"] and "can't open" not in (text("wbndl.txt") or ""),
     "bounded: a child gone 3 s into a 5 s bound restarts busybox's read -t, the call still ends within the bound and a slice (C1)":
@@ -1290,7 +1306,7 @@ checks.update({
 # reason there. 0.1.11: 28 - uplink.ring (the counter snapshots the speedtest
 # uplink is judged on) and uplink.cache (the verdict of a result not yet
 # acknowledged), one page each.
-FORK_BUDGET = 194
+FORK_BUDGET = 186
 FORK_SLACK = 9
 MAX_RSS_KB = 6144
 SHELL_ANON_KB = 768

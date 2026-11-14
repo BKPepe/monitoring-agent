@@ -32,9 +32,9 @@
 # wlogin1..2, wnoplmn1..2, wcut1..2 and wdead (the modem's session, what is
 # cached of its answers), wnum1 with wjnum (a value that is no JSON number is
 # null), wst1..3 (the modem's answer changing, in syslog), wreg1 (the file
-# --register sends its token from), wbnd1..7 with wbndl (a tool that hangs:
-# killed, skipped once, abandoned while the kernel holds it) - and the
-# hardening runs (runs-g28.sh, remote actions w19_1..18).
+# --register sends its token from), wbnd1..10 with wbndl (a tool that
+# hangs: killed, skipped once, abandoned while the kernel holds it) - and
+# the hardening runs (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -1049,6 +1049,46 @@ for _p in /proc/[0-9]*; do
     case "$_pc" in sleep60) kill -9 "${_p#/proc/}" 2>/dev/null ;; esac
 done
 rm -f /tmp/df.hold /tmp/df.escape
+fresh
+
+# --- wbnd8..wbnd10: the other bounded tools (C1) -------------------------------
+# btrfs, nft, wg, top and logread under the same bound. BK_STUB_HANG names the
+# stubs that hang (nft, wg, logread); top and btrfs hang from a PATH of their
+# own: the container's top is busybox's (a stub in bin/ would change which
+# form the agent picks), and there is no btrfs by default.
+#   wbnd8   all five hang: each is killed at its bound, and what it would
+#           have told is unknown - btrfs_errors, firewall_enabled and the
+#           counters, wireguard_peers and both top lists are null, and the
+#           WAN path is not cached with an unknown flowtable
+#   wbnd9   the next run skips all five once, without calling them
+#   wbnd10  they answer again (btrfs from a stub that counts 3 errors), and
+#           the top snapshot and the log ring are left as empty files
+mkdir -p /tmp/hangbin /tmp/okbin
+printf '#!/bin/sh\nexec sleep 30\n' > /tmp/hangbin/top
+cp /tmp/hangbin/top /tmp/hangbin/btrfs
+cat > /tmp/okbin/btrfs <<'EOF_BTRFS'
+#!/bin/sh
+printf '[/dev/sda2].write_io_errs    0\n[/dev/sda2].read_io_errs     2\n'
+printf '[/dev/sda2].flush_io_errs    0\n[/dev/sda2].corruption_errs  1\n'
+printf '[/dev/sda2].generation_errs  0\n'
+EOF_BTRFS
+chmod +x /tmp/hangbin/top /tmp/hangbin/btrfs /tmp/okbin/btrfs
+fresh
+echo "# wbnd8" >> $OUT/nft_calls.log
+bnd wbnd8 BK_STUB_HANG="nft wg logread" PATH="/tmp/hangbin:$PATH"
+ls -A "$PRIV" > $OUT/wbnd8_priv.txt
+echo "# wbnd9" >> $OUT/nft_calls.log
+bnd wbnd9 PATH="/tmp/hangbin:$PATH"
+echo "# wbnd10" >> $OUT/nft_calls.log
+bnd wbnd10 PATH="/tmp/okbin:$PATH"
+echo "# end" >> $OUT/nft_calls.log
+printf 'top.out %s logread.out %s\n' "$(wc -c < "$PRIV/top.out" | tr -d ' ')" \
+    "$(wc -c < "$PRIV/logread.out" | tr -d ' ')" > $OUT/wbnd10_scratch.txt
+for _p in /proc/[0-9]*; do
+    read -r _pc 2>/dev/null < "$_p/cmdline" || continue
+    case "$_pc" in sleep30) kill -9 "${_p#/proc/}" 2>/dev/null ;; esac
+done
+rm -rf /tmp/hangbin /tmp/okbin
 fresh
 
 # --- wbndl: bk_bounded itself, lifted from the agent (C1) ----------------------

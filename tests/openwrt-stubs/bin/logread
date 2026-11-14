@@ -1,4 +1,7 @@
 #!/bin/sh
+# BK_STUB_HANG: the tools that hang (C1), as a list of names. This one then
+# becomes a sleep that only a signal ends, like a tool the kernel holds.
+case " $BK_STUB_HANG " in *" logread "*) exec sleep 30 ;; esac
 # BK_STUB_UPTIME_BUMP=1: this call also moves the fake root's uptime 4.20 s
 # forward. G42 measures a run from the kernel uptime at its start to the
 # uptime at payload assembly, and inside ONE run both reads would hit the same
