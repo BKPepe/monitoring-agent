@@ -240,12 +240,22 @@ payload_text = "".join(
 uci_asked = collections.Counter(log_lines("uci_calls.log", core_only=True))
 # The switch is read on EVERY run, so the six payload runs (r1, r2, r2b, r3,
 # r4, r5) must show six dumps - one each. Two a run would be the hourly
-# WAN-path block asking ubus for the same 27 kB again. Only five fdb reads:
-# r3 is the access point whose ubus has no netifd at all, and a run that
-# never saw a switch has no bridge to ask about either.
+# WAN-path block asking ubus for the same 27 kB again. The forwarding
+# database is kept for 300 s on the same switch (C3): r1 asks, the runs after
+# it take the cache, and r3 - the access point whose ubus has no netifd at
+# all - never saw a switch to ask about.
+FDB_CORE_READS = 1
 dev_dumps = sum(1 for c in log_lines("ubus_calls.log", core_only=True)
                 if c == "call network.device status")
 fdb_reads = len(log_lines("bridge_calls.log", core_only=True))
+# C3: the wfdb runs, and whether each one asked `bridge`.
+wfdb = {t: payload(t) for t in ("wfdb0", "wfdb1", "wfdb2", "wfdb3", "wfdb4", "wfdb5", "wfdb6")}
+fdb_runs = by_run("bridge_calls.log")
+def fdb_asked(t):
+    return len([l for l in fdb_runs.get(t, []) if l.startswith("fdb show br")])
+def lan_counts(p):
+    lp = p.get("lan_ports") or {}
+    return ([(x.get("name"), x.get("clients")) for x in lp.get("ports") or []], lp.get("clients_total"))
 
 # No address that belongs to somebody may live in this suite: neither in a
 # fixture nor in a payload the fixtures produce. Allowed are the documentation
@@ -832,8 +842,19 @@ checks = {
         len(json.dumps(d1.get("lan_ports"), separators=(",", ":"))) <= 800,
     "lan: the switch is read every run, not once an hour - r2b reports it although the WAN path came from the cache":
         d2b.get("lan_ports") == d1.get("lan_ports") and d2b["wan_path"] == d1["wan_path"],
-    "lan: one ubus device dump per payload run and never two, and no fdb read at all when there is no dump":
-        (dev_dumps, fdb_reads) == (6, 5),
+    "lan: one ubus device dump per payload run and never two; the forwarding database once, the later runs inside its 300 s (C3)":
+        (dev_dumps, fdb_reads) == (6, FDB_CORE_READS),
+    "lan: the counts come from the cache inside 300 s and on the same switch, and are the same counts (C3)":
+        [fdb_asked(t) for t in ("wfdb0", "wfdb1")] == [1, 0]
+        and lan_counts(wfdb["wfdb1"]) == lan_counts(wfdb["wfdb0"]) and lan_counts(wfdb["wfdb0"])[1] == 6,
+    "lan: a carrier that changed, a cache 301 s old, another key or a damaged line asks the bridge again (C3)":
+        [fdb_asked(t) for t in ("wfdb2", "wfdb3", "wfdb4", "wfdb5")] == [1, 1, 1, 1]
+        and wfdb["wfdb2"].get("lan_ports") == wpath[6].get("lan_ports")
+        and all(lan_counts(wfdb[t]) == lan_counts(wfdb["wfdb0"]) for t in ("wfdb3", "wfdb4", "wfdb5")),
+    "lan: a dump that fails leaves every count and the total null, not 0, and writes no cache (C3)":
+        fdb_asked("wfdb6") == 1 and lan_counts(wfdb["wfdb6"])[1] is None
+        and lan_counts(wfdb["wfdb6"])[0] and all(c is None for _, c in lan_counts(wfdb["wfdb6"])[0])
+        and text("wfdb6_fdb.cache") == "none",
     # 0.1.12 sent 329 B here (d1) and was held to 600. The MIB split and the
     # module facts of 0.1.13 are 13 keys more, sent every minute from the
     # hourly cache: 626 B in d1 and 698-714 B in the wpath runs, where they
@@ -1333,12 +1354,14 @@ checks.update({
 # file, or one that outgrows a page, raises it in its own commit, with the
 # reason there. 0.1.11: 28 - uplink.ring (the counter snapshots the speedtest
 # uplink is judged on) and uplink.cache (the verdict of a result not yet
-# acknowledged), one page each.
-FORK_BUDGET = 186
+# acknowledged), one page each. 0.1.15: 29 - fdb.cache (the bridge's client
+# counts, kept for 300 s); the bounded calls' scratch files are left empty,
+# no page, and their FIFO is no regular file.
+FORK_BUDGET = 183
 FORK_SLACK = 9
 MAX_RSS_KB = 6144
 SHELL_ANON_KB = 768
-PRIV_MAX_PAGES = 28
+PRIV_MAX_PAGES = 29
 def bud(name):
     """(forks or None, CPU ms by wait4, max RSS kB) of a run under `time`."""
     forks = text(f"{name}_forks.txt")

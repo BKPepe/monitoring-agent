@@ -175,6 +175,16 @@ with nobody on it.
   `wpath13`, without `ethtool`, zero-pads three of the module's files
   (049000, -075000, 0350): each is null on its own, and the plain values
   next to them, a 0 included, are still sent.
+- **The forwarding database every 5 minutes (`wfdb0..6`, C3).** The client
+  counts per port are kept for 300 s, the bridge's own ageing time, under a
+  key of the bridge and every DSA port with its carrier. `wfdb0` fills the
+  cache and `wfdb1` takes it (no `bridge` call, the same counts); `wfdb2`
+  pulls both gigabit cables (`BK_STUB_UBUS_DEV=lan1only`), so a carrier in
+  the key changed and the bridge is asked again; `wfdb3..5` plant `wfdb0`'s
+  cache 301 s old, under another key and with a damaged count line, and
+  each asks again; `wfdb6` has the dump fail (`BK_STUB_FDB=fail`): every
+  count and the total are null, not 0, and no cache is written. The payload
+  runs ask once: r1 fills the cache and the runs after it read it.
 - **The gap runs `wfw1..3`, `wdns1`/`wdns3`, `wrun1..7`.** What "the firewall
   is up" is read from: the `nft` stub serves three rulesets - fw4 (every other
   run), `BK_STUB_NFT=foreign` (mwan3's table and nothing else) and

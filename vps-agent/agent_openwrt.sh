@@ -456,8 +456,9 @@ if [ "$_sl" != "$AGENT_VERSION" ]; then
           /tmp/status-agent-openwrt-private/hilink-plmn.cache 2>/dev/null || true
     # Everything a parser of this version may read back from an older one:
     # Wi-Fi survey counters and card facts, the disk list and the SMART
-    # readings, the WAN path, the rate states and the modem's web session
-    # (hilink.session). NOT on the list, on purpose:
+    # readings, the WAN path, the rate states, the modem's web session
+    # (hilink.session) and the bridge's client counts (fdb.cache). NOT on
+    # the list, on purpose:
     # probe.count, probe.attempts, pending.state, probe-out/ and skipped -
     # spend the owner consented to and results not sent yet are no cache.
     # run.cpu goes too: the last run of the old version (the one that just
@@ -470,7 +471,7 @@ if [ "$_sl" != "$AGENT_VERSION" ]; then
         rm -f "$_bk_pd/wifi-survey.state" "$_bk_pd"/wifi-caps.* \
               "$_bk_pd/disks.static" "$_bk_pd/smart.cache" "$_bk_pd/smart.spawn" \
               "$_bk_pd/wan-path.cache" "$_bk_pd"/cores.* "$_bk_pd/wan-rate.state" \
-              "$_bk_pd/run.cpu" "$_bk_pd/hilink.session" 2>/dev/null || true
+              "$_bk_pd/run.cpu" "$_bk_pd/hilink.session" "$_bk_pd/fdb.cache" 2>/dev/null || true
     done
     # 0.1.6 remembered only the newest speedtest file here and so never sent
     # the older ones; without the file the first run offers them all again.
@@ -3748,8 +3749,7 @@ EOF_CON
 #   33:33:* 01:00:5e:*  IPv6 and IPv4 multicast groups, ff:ff... broadcast
 # One MAC learnt in several VLANs is one device, so the pair mac+dev counts
 # once.
-bk_fdb_counts() {
-    "$1" fdb show br "$2" 2>/dev/null | awk '
+BK_FDB_AWK='
         {
             mac = tolower($1); dev = ""; skip = 0
             for (i = 2; i <= NF; i++) {
@@ -3765,7 +3765,47 @@ bk_fdb_counts() {
             n[dev]++
         }
         END { for (d in n) print d " " n[d] }
-    '
+'
+# The dump takes rtnl, and on DSA an ATU walk over MDIO for every user port.
+# So the counts are kept for 300 s - the bridge's own ageing time: a count is
+# never older than what the FDB itself remembers - under a key of the bridge
+# and every DSA port with its carrier, so a cable pulled or plugged in, a
+# port added or a bridge renamed asks again at once. File: the time, the key,
+# "dev count" lines, "end". The dump is bounded, and one that fails or is
+# cut off leaves the counts unknown (_lp_fdb_ok empty) and writes nothing.
+BK_FDB_CACHE="$BK_PRIVATE_DIR/fdb.cache"
+BK_FDB_TTL_S=300
+bk_fdb_counts() { # BIN BRIDGE KEY -> _lp_counts ("dev count" lines), _lp_fdb_ok
+    _lp_counts=""; _lp_fdb_ok=""; _fc_ts=""; _fc_key=""; _fc_end=""; _fc_body=""
+    if [ -f "$BK_FDB_CACHE" ]; then
+        {
+            IFS= read -r _fc_ts
+            IFS= read -r _fc_key
+            while IFS= read -r _fc_l; do
+                # "dev count", the count digits without a leading zero, and
+                # nothing else: any other line is a cache to make again.
+                case "$_fc_l" in
+                    end) _fc_end=1; break ;;
+                    *" "*" "*|" "*|*" "|*" "*[!0-9]*|*" "0?*) break ;;
+                    *" "*) ;;
+                    *) break ;;
+                esac
+                _fc_body="$_fc_body$_fc_l$BK_NL"
+            done
+        } < "$BK_FDB_CACHE" 2>/dev/null
+    fi
+    case "$_fc_ts" in ''|*[!0-9]*) _fc_ts=0 ;; esac
+    _fc_age=$((now_ts - _fc_ts))
+    if [ "$_fc_end" = 1 ] && [ "$_fc_key" = "$3" ] && [ "$_fc_age" -ge 0 ] && [ "$_fc_age" -lt "$BK_FDB_TTL_S" ]; then
+        _lp_counts=$_fc_body; _lp_fdb_ok=1
+        return 0
+    fi
+    bk_bounded 5 bridge "$BK_BND_OUT" "$1" fdb show br "$2"
+    if [ "$_bb_rc" = 0 ]; then
+        _lp_counts=$(awk "$BK_FDB_AWK" "$BK_BND_OUT"); _lp_fdb_ok=1
+        { printf '%s\n%s\n' "$now_ts" "$3"; [ -n "$_lp_counts" ] && printf '%s\n' "$_lp_counts"; echo end; } > "$BK_FDB_CACHE" 2>/dev/null
+    fi
+    : > "$BK_BND_OUT"
 }
 
 # The wired switch ports, built from the dump bk_lan_caps has just walked
@@ -3788,17 +3828,17 @@ bk_lan_ports() {
     # so a `bridge` that is installed is found here like every other tool.
     command -v bridge >/dev/null 2>&1 || return 0
     _lp_bin=bridge
-    _lp_dsa=0
+    _lp_dsa=0; _lp_key="$BK_LAN_BRIDGE"
     while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp _lc_ca _lc_du _lc_pc; do
         [ -n "$_lc_d" ] || continue
         case " $_lc_members " in *" $_lc_d "*) ;; *) continue ;; esac
-        [ "$_lc_ty" = dsa ] && _lp_dsa=1
+        [ "$_lc_ty" = dsa ] && { _lp_dsa=1; _lp_key="$_lp_key $_lc_d:${_lc_ca:-x}"; }
     done <<EOF_DSA
 $_lc_recs
 EOF_DSA
     [ "$_lp_dsa" = 1 ] || return 0
 
-    _lp_counts=$(bk_fdb_counts "$_lp_bin" "$BK_LAN_BRIDGE")
+    bk_fdb_counts "$_lp_bin" "$BK_LAN_BRIDGE" "$_lp_key"
     _lp_ports=""; _lp_total=0; _lp_sep=""
     while IFS='|' read -r _lc_d _lc_ty _lc_c _lc_s _lc_cp _lc_ca _lc_du _lc_pc; do
         [ -n "$_lc_d" ] || continue
@@ -3807,15 +3847,20 @@ EOF_DSA
         # bridge members too and are not wired ports.
         [ "$_lc_ty" = dsa ] || continue
         _lp_n=0
-        while read -r _lp_k _lp_v; do
-            [ "$_lp_k" = "$_lc_d" ] || continue
-            # The count is fed into arithmetic below; anything that is not a
-            # number would end the run, and a number is all awk can print.
-            case "$_lp_v" in ''|*[!0-9]*) ;; *) _lp_n="$_lp_v" ;; esac
-        done <<EOF_CNT
+        if [ -n "$_lp_fdb_ok" ]; then
+            while read -r _lp_k _lp_v; do
+                [ "$_lp_k" = "$_lc_d" ] || continue
+                # The count is fed into arithmetic below; anything that is not
+                # a number would end the run, and a number is all awk prints.
+                case "$_lp_v" in ''|*[!0-9]*) ;; *) _lp_n="$_lp_v" ;; esac
+            done <<EOF_CNT
 $_lp_counts
 EOF_CNT
-        _lp_total=$((_lp_total + _lp_n))
+            _lp_total=$((_lp_total + _lp_n))
+        else
+            # The dump failed or was cut off: unknown, not "nobody there".
+            _lp_n=null
+        fi
         _lp_link=false
         [ "$_lc_ca" = true ] && _lp_link=true
         _lp_dq=null
@@ -3844,6 +3889,7 @@ EOF_CD
         _lp_cond="$_lp_cond$_lp_sep{\"dev\":\"$_lp_c\",\"link\":$_lp_cl,\"speed_mbit\":${_lp_cs:-null},\"duplex\":$_lp_dq}"
         _lp_sep=","
     done
+    [ -n "$_lp_fdb_ok" ] || _lp_total=null
     lan_ports_json="{\"bridge\":\"$BK_LAN_BRIDGE\",\"ports\":[$_lp_ports],\"conduits\":[$_lp_cond],\"clients_total\":$_lp_total}"
 }
 

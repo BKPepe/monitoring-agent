@@ -17,8 +17,14 @@
 # lan3 0, lan4 2 - total 6.
 # BK_STUB_FDB=empty: the same noise with not one learnt row, which is a
 # switch with nothing plugged in and must read 0, never null.
+# BK_STUB_FDB=fail: the dump fails (rtnl refused it), nothing on stdout -
+# the counts are unknown, which is not a switch with nothing plugged in.
 # BK_STUB_FDB=off is not handled here; that case removes the binary.
 echo "$*" >> /work/out/bridge_calls.log
+if [ "$BK_STUB_FDB" = fail ]; then
+    echo "RTNETLINK answers: Device or resource busy" >&2
+    exit 255
+fi
 [ "$1 $2 $3" = "fdb show br" ] || { echo "Usage: bridge fdb show" >&2; exit 255; }
 case "$4" in
     br-lan) ;;

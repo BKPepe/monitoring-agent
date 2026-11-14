@@ -34,8 +34,9 @@
 # null), wst1..3 (the modem's answer changing, in syslog), wreg1 (the file
 # --register sends its token from), wbnd1..10 with wbndl (a tool that
 # hangs: killed, skipped once, abandoned while the kernel holds it),
-# wrej1..6 (a refused report and the heartbeat after it) - and the
-# hardening runs (runs-g28.sh, remote actions w19_1..18).
+# wrej1..6 (a refused report and the heartbeat after it), wfdb0..6 (the
+# forwarding database every 5 minutes) - and the hardening runs
+# (runs-g28.sh, remote actions w19_1..18).
 set -e
 mkdir -p /usr/share/libubox /etc/config /etc/init.d /root/agent /work/out
 
@@ -552,6 +553,43 @@ stub_on bridge
 fresh
 pl wport3
 ( export BK_STUB_NO_WAN=1; sh agent_openwrt.sh --dry-run > $OUT/wport3.json 2> $OUT/wport3.err )
+fresh
+
+# --- wfdb0..wfdb6: the forwarding database every 5 minutes (C3) ---------------
+# The counts are kept for the FDB's own ageing time, 300 s, under a key of the
+# bridge and every DSA port with its carrier. bridge_calls.log says, per run,
+# whether `bridge` was asked again:
+#   wfdb0   a run that fills the cache
+#   wfdb1   the same switch a moment later: not asked, the same counts
+#   wfdb2   both gigabit cables out, so a carrier in the key changed: asked,
+#           and the ports are wpath7's
+#   wfdb3   wfdb0's cache, 301 s old: asked
+#   wfdb4   wfdb0's cache under another key: asked
+#   wfdb5   wfdb0's cache with a damaged count line: asked
+#   wfdb6   the dump fails: every count and the total are null, not 0, and
+#           no cache is written
+fdb() { # TAG [VAR=VALUE...]: one dry run; its fdb.cache is filed under TAG
+    _ft=$1; shift
+    echo "# $_ft" >> $OUT/bridge_calls.log
+    pl "$_ft"
+    env "$@" sh agent_openwrt.sh --dry-run > "$OUT/$_ft.json" 2> "$OUT/$_ft.err" || true
+    cp "$PRIV/fdb.cache" "$OUT/${_ft}_fdb.cache" 2>/dev/null || echo none > "$OUT/${_ft}_fdb.cache"
+}
+reseed() { # SED-SCRIPT: wfdb0's cache, changed, as the private one
+    sed "$1" "$OUT/wfdb0_fdb.cache" > "$PRIV/fdb.cache"
+}
+fdb wfdb0
+fdb wfdb1
+fdb wfdb2 BK_STUB_UBUS_DEV=lan1only
+reseed "1s/.*/$(( $(date +%s) - 301 ))/"
+fdb wfdb3
+reseed '2s/.*/br-lan x/'
+fdb wfdb4
+reseed 's/^lan0 .*/lan0 1+/'
+fdb wfdb5
+rm -f "$PRIV/fdb.cache"
+fdb wfdb6 BK_STUB_FDB=fail
+echo "# end" >> $OUT/bridge_calls.log
 fresh
 
 # --- wfw1..wfw3: what "the firewall is up" is read from (G20) ---------------
