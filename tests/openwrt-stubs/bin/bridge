@@ -1,0 +1,66 @@
+#!/bin/sh
+# `bridge fdb show br <name>`, in iproute2's own line format. Only the rows
+# a learnt client produces may be counted; everything else here is noise the
+# owner's real router prints too, and each kind is present on purpose:
+#   permanent            the bridge's and the ports' own addresses
+#   vlan 4095 ... self   the DSA CPU-port rows (one WITHOUT `permanent`, so
+#                        dropping it cannot be credited to the permanent rule)
+#   33:33:* 01:00:5e:*   IPv6 and IPv4 multicast groups - three of them are
+#                        NOT `permanent` (a solicited-node group on lan0, SSDP
+#                        on lan4, broadcast on lan3), because a rule the
+#                        permanent rule already covers is a rule nobody tests
+#   ff:ff:ff:ff:ff:ff    broadcast
+#   the same MAC in two VLANs on lan0  one device, not two
+#   phy0-ap0 / phy3-ap0  Wi-Fi stations: bridge members, not wired ports
+#   eth1                 the DSA conduit, not a bridge member at all
+# Counts that must come out of the default answer: lan0 3, lan1 1, lan2 0,
+# lan3 0, lan4 2 - total 6.
+# BK_STUB_FDB=empty: the same noise with not one learnt row, which is a
+# switch with nothing plugged in and must read 0, never null.
+# BK_STUB_FDB=off is not handled here; that case removes the binary.
+echo "$*" >> /work/out/bridge_calls.log
+[ "$1 $2 $3" = "fdb show br" ] || { echo "Usage: bridge fdb show" >&2; exit 255; }
+case "$4" in
+    br-lan) ;;
+    *) echo "Cannot find device \"$4\"" >&2; exit 255 ;;
+esac
+noise() {
+cat <<'M'
+02:00:00:00:01:01 dev lan0 vlan 1 master br-lan permanent
+02:00:00:00:01:01 dev lan0 master br-lan permanent
+33:33:00:00:00:01 dev lan0 self permanent
+01:00:5e:00:00:01 dev lan0 self permanent
+02:00:00:00:01:01 dev lan1 master br-lan permanent
+33:33:ff:00:01:01 dev lan1 self permanent
+02:00:00:00:01:01 dev lan2 master br-lan permanent
+33:33:00:00:00:fb dev lan2 self permanent
+01:00:5e:00:00:fb dev lan2 self permanent
+ff:ff:ff:ff:ff:ff dev lan2 self permanent
+02:00:00:00:01:01 dev lan3 vlan 4095 self
+33:33:00:00:00:02 dev lan3 self permanent
+ff:ff:ff:ff:ff:ff dev lan3 self
+33:33:ff:12:34:56 dev lan0 self
+01:00:5e:7f:ff:fa dev lan4 self
+02:00:00:00:01:01 dev lan4 master br-lan permanent
+02:00:00:00:01:01 dev eth1 vlan 4095 self permanent
+M
+}
+noise
+[ "$BK_STUB_FDB" = empty ] && exit 0
+cat <<'M'
+02:00:00:00:0a:01 dev lan0 vlan 1 master br-lan
+02:00:00:00:0a:01 dev lan0 vlan 3 master br-lan
+02:00:00:00:0a:02 dev lan0 master br-lan
+02:00:00:00:0a:03 dev lan0 master br-lan
+02:00:00:00:0b:01 dev lan1 master br-lan
+02:00:00:00:0e:01 dev lan4 master br-lan
+02:00:00:00:0e:02 dev lan4 master br-lan
+02:00:00:00:00:01 dev phy0-ap0 master br-lan
+02:00:00:00:00:02 dev phy0-ap0 master br-lan
+02:00:00:00:00:03 dev phy0-ap0 master br-lan
+02:00:00:00:00:04 dev phy0-ap0 master br-lan
+02:00:00:00:00:31 dev phy3-ap0 master br-lan
+02:00:00:00:00:32 dev phy3-ap0 master br-lan
+02:00:00:00:0f:01 dev eth1 master br-lan
+M
+exit 0

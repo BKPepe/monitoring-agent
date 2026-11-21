@@ -1,0 +1,213 @@
+#!/bin/sh
+# The stubs are the test's idea of a router; when one of them is wrong, every
+# parser check built on it is wrong with it. So the refusals and edge cases
+# the real tools have are pinned here, before the first agent run. One line
+# per check in /work/out/stub_selftest.txt; the call logs this leaves behind
+# are removed again so the counting checks start from zero.
+OUT=/work/out
+R=$OUT/stub_selftest.txt
+: > "$R"
+t() { # NAME CONDITION...
+    _name="$1"; shift
+    if "$@" >/dev/null 2>&1; then echo "ok   $_name" >> "$R"; else echo "FAIL $_name" >> "$R"; fi
+}
+eq() { [ "$1" = "$2" ]; }
+T=/tmp/bk-selftest; rm -rf $T; mkdir -p $T
+
+# iwinfo: one command per call, like iwinfo_cli.c
+iwinfo phy0-ap0 info assoclist > $T/o 2> $T/e; _rc=$?
+t "iwinfo: two commands in one call - exit 1" eq "$_rc" 1
+t "iwinfo: two commands in one call - nothing on stdout" eq "$(wc -c < $T/o | tr -cd 0-9)" 0
+t "iwinfo: two commands in one call - 'No such wireless backend' on stderr" grep -q "No such wireless backend: phy0-ap0" $T/e
+t "iwinfo: bare call lists six radios" eq "$(iwinfo | grep -c '^[a-z0-9]')" 6
+t "iwinfo: phy0-ap0 is the Omnia capture" eq "$(iwinfo phy0-ap0 info | grep -c 'Channel: 36 (5.180 GHz)  HT Mode: HE80')" 1
+t "iwinfo: phy0-ap0 has four stations, phy3-ap0 six" eq "$(iwinfo phy0-ap0 assoclist | grep -c ' ms ago'),$(iwinfo phy3-ap0 assoclist | grep -c ' ms ago')" "4,6"
+iwinfo wlan0 scan > /dev/null 2>&1
+t "iwinfo: a scan leaves its marker" grep -q SCAN $OUT/iwinfo_scan.log
+t "iwinfo: every call is logged with its arguments" grep -qx "phy0-ap0 info assoclist" $OUT/iwinfo_calls.log
+
+# hostapd_cli: empty AP = nothing + exit 0; no socket = 255
+hostapd_cli -i wlan7 all_sta > $T/o 2>/dev/null; _rc=$?
+t "hostapd_cli: an AP with nobody on it prints nothing and exits 0" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9)" "0,0"
+hostapd_cli -i wlan1 all_sta > /dev/null 2>&1; _rc=$?
+t "hostapd_cli: no socket exits 255" eq "$_rc" 255
+t "hostapd_cli: phy0-ap0 has four stations, two with an operating-class list" eq "$(hostapd_cli -i phy0-ap0 all_sta | grep -c '^flags='),$(hostapd_cli -i phy0-ap0 all_sta | grep -c '^supp_op_classes=')" "4,2"
+
+# iw: sample 1, then sample 2; the USB adapter has no survey at all
+t "iw: first survey call serves sample 1" eq "$(iw dev phy0-ap0 survey dump | grep -c '35029953 ms')" 1
+t "iw: later calls serve sample 2 (+12,000 ms)" eq "$(iw dev phy0-ap0 survey dump | grep -c '35041953 ms')" 1
+iw dev phy3-ap0 survey dump > $T/o 2>/dev/null; _rc=$?
+t "iw: phy3-ap0 answers nothing, exit 0" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9)" "0,0"
+
+# smartctl
+A="--json=g -q noserial -n standby,3 -i -H -A"
+# shellcheck disable=SC2086
+t "smartctl: no identifiers with -q noserial" eq "$(smartctl $A /dev/sda | grep -c 'DECOYSERIAL\|4276994270\|serial_number\|wwn')" 0
+t "smartctl: decoy serial and WWN without -q noserial" eq "$(smartctl --json=g -i /dev/sda | grep -c 'DECOYSERIAL-0042\|json.wwn.id = 4276994270')" 2
+# shellcheck disable=SC2086
+smartctl $A /dev/sdb > /dev/null; _rc=$?
+t "smartctl: a sleeping disk asked with -n standby,3 exits 3" eq "$_rc" 3
+smartctl --json=g -q noserial -i /dev/sdb > /dev/null; _rc=$?
+t "smartctl: the same disk asked without the flag answers (exit 0)" eq "$_rc" 0
+# shellcheck disable=SC2086
+smartctl $A /dev/sdc > $T/o; _rc=$?
+t "smartctl: unknown USB bridge - message and exit 1" eq "$_rc,$(grep -c 'Unknown USB bridge' $T/o)" "1,1"
+# shellcheck disable=SC2086
+smartctl $A /dev/nvme0n1 > $T/o; _rc=$?
+t "smartctl: NVMe critical warning 4, 2 media errors, exit 8" eq "$_rc,$(grep -c 'critical_warning = 4;\|media_errors = 2;' $T/o)" "8,2"
+# shellcheck disable=SC2086
+smartctl $A /dev/sdd > $T/o
+# 231 and 194 BOTH come out as Temperature_Celsius without the database: a
+# parser that keys attributes by name has to survive the collision.
+t "smartctl: sdd is outside the drive database - 241/231 get generic names, 194 and 231 collide on Temperature_Celsius, written bytes only from devstat" eq "$(grep -c 'in_smartctl_database = false;' $T/o),$(grep -c 'name = "Total_LBAs_Written";' $T/o),$(grep -c 'name = "Temperature_Celsius";' $T/o),$(grep -c 'name = "Logical Sectors Written";' $T/o)" "1,1,2,1"
+# shellcheck disable=SC2086
+smartctl $A /dev/sde > /dev/null 2>&1 &
+_p=$!; sleep 1; kill "$_p" 2>/dev/null; sleep 1
+if [ -d "/proc/$_p" ]; then _term=ignored; else _term=died; fi
+kill -9 "$_p" 2>/dev/null; sleep 1
+if [ -d "/proc/$_p" ]; then _kill=alive; else _kill=gone; fi
+t "smartctl: sde ignores TERM and dies of KILL" eq "$_term,$_kill" "ignored,gone"
+
+# ubus: hostapd answers without netifd; the device status is the capture itself
+t "ubus: hostapd objects answer on a box without netifd interfaces" eq "$(BK_STUB_NO_WAN=1 ubus call hostapd.phy0-ap0 get_clients | grep -c '"he": true')" 2
+BK_STUB_NO_WAN=1 ubus call network.interface dump > /dev/null 2>&1; _rc=$?
+t "ubus: network.interface fails on such a box" eq "$_rc" 1
+t "ubus: nested capabilities.vht is there to trip a loose parser" eq "$(ubus call hostapd.wlan6 get_clients | grep -c '"vht"')" 2
+ubus call network.device status > $T/o
+t "ubus: network.device status is the real capture, byte for byte" cmp -s $T/o /work/stubs/omnia/ubus_network_device_status.json
+t "ubus: BK_STUB_WAN=pppoe is PPPoE over eth2.848" eq "$(BK_STUB_WAN=pppoe ubus call network.interface.wan status)" '{"up":true,"proto":"pppoe","device":"eth2.848","l3_device":"pppoe-wan"}'
+
+# df
+t "df -PT: the mount point with a space, a # and quotes" eq "$(df -PT | grep -c '/mnt/usb #1 "disk"$')" 1
+t "df: any other call is the real df" df -P /
+
+# fake roots
+F=/tmp/fakeroot; E=/tmp/fakeroot-emmc
+t "root: the Omnia has no mmcblk0, the eMMC variant has" eq "$(ls $F/sys/block | grep -c mmcblk),$(ls $E/sys/block | grep -c '^mmcblk0$')" "0,1"
+t "root: the real block list is there (8 loop, 3 mtdblock, sda)" eq "$(ls $F/sys/block | grep -c '^loop[0-7]$\|^mtdblock[0-2]$\|^sda$')" 12
+t "root: decoy identifier files exist to be never read" eq "$(grep -rl SERIALLEAK $F/sys | wc -l | tr -cd 0-9),$(grep -rl SERIALLEAK $E/sys | wc -l | tr -cd 0-9)" "9,13"
+_x=unset; if read -r _x < $F/sys/class/net/pppoe-wan/speed; then _rd=ok; else _rd=failed; fi 2>/dev/null
+t "root: reading the speed of a ppp netdev fails, as on a router" eq "$_rd" failed
+t "root: only the physical port has a device link" eq "$([ -e $F/sys/class/net/eth2/device ] && echo y)$([ -e $F/sys/class/net/eth2.848/device ] || echo n)$([ -e $F/sys/class/net/pppoe-wan/device ] || echo n)" ynn
+t "root: the WAN chain is pppoe-wan -> eth2.848 -> eth2" eq "$(ls $F/sys/class/net/pppoe-wan | grep lower_),$(ls $F/sys/class/net/eth2.848 | grep lower_)" "lower_eth2.848,lower_eth2"
+t "root: the hwmon names of the capture - one sfp, one PHY inside the module" eq "$(cat $F/sys/class/hwmon/hwmon*/name | grep -c '^sfp$'),$(cat $F/sys/class/hwmon/hwmon*/name | grep -c '^i2csfp11$')" "1,1"
+t "root: the module's sensor reads 49 C against its own 70 / 75, and has no RX power" eq "$(cat $F/sys/class/hwmon/hwmon7/name $F/sys/class/hwmon/hwmon7/temp1_input $F/sys/class/hwmon/hwmon7/temp1_max $F/sys/class/hwmon/hwmon7/temp1_crit | tr '\n' ' ')$(ls $F/sys/class/hwmon/hwmon7 | grep -c power)" "sfp 49000 70000 75000 0"
+t "root: the PHY inside the module reads 49.5 C of its own die, a number the module's must not be" eq "$(cat $F/sys/class/hwmon/hwmon9/name $F/sys/class/hwmon/hwmon9/temp1_input | tr '\n' ' ')" "i2csfp11 49500 "
+t "root: softnet_stat is the real capture (2 CPUs, 15 columns)" eq "$(awk 'NF == 15' $F/proc/net/softnet_stat | wc -l | tr -cd 0-9)" 2
+t "root: the branches of the WAN walk - a bridge over one port, one over two, a lone ppp" eq "$(ls $F/sys/class/net/br-wan | grep -c lower_),$(ls $F/sys/class/net/br-wan2 | grep -c lower_),$(ls $F/sys/class/net/ppp0 | grep -c lower_)" "1,2,0"
+t "root: the DSA port has a device link, answers -1 and sits above a conduit at 1000" eq "$([ -e $F/sys/class/net/wan/device ] && echo y),$(cat $F/sys/class/net/wan/speed),$(cat $F/sys/class/net/eth1/speed)" "y,-1,1000"
+t "root: the real conntrack capture has no drops at all" eq "$(awk 'NR > 1 { print $10 $11 $12 }' $F/proc/net/stat/nf_conntrack | tr -d '0\n')" ""
+t "root: a conntrack file of a kernel that has no insert_failed column at all" eq "$(awk 'NR == 1 { print $10 "/" $11 "/" $12 }' $F/proc/net/stat/nf_conntrack.other)" "drop/early_drop/icmp_error"
+t "root: its busy copy carries 3 / 1 / 0x12 over two CPUs, in hex" eq "$(awk 'NR > 1 { print $10 "/" $11 "/" $12 }' $F/proc/net/stat/nf_conntrack.2 | tr '\n' ' ')" "00000002/00000001/00000012 00000001/00000000/00000000 "
+t "root: the second /proc/stat sample moves core 0 by 5,240 softirq ticks" eq "$(awk '/^cpu0 / { print $8 }' $F/proc/stat.2) $(awk '/^cpu0 / { print $8 }' $F/proc/stat)" "5550 310"
+
+# applets a router does not have
+if command -v timeout > /dev/null 2>&1; then _a=present; else _a=absent; fi
+t "image: no timeout applet" eq "$_a" absent
+if command -v stat > /dev/null 2>&1; then _a=present; else _a=absent; fi
+t "image: no stat applet" eq "$_a" absent
+if command -v jsonfilter > /dev/null 2>&1; then _a=present; else _a=absent; fi
+t "image: no jsonfilter - JSON is read with awk and read" eq "$_a" absent
+if [ -x /bin/tc ] || [ -x /usr/bin/tc ]; then _a=present; else _a=absent; fi
+t "image: no tc of its own - only the stub, so removing it really removes it" eq "$_a" absent
+if [ -x /bin/ethtool ] || [ -x /usr/bin/ethtool ]; then _a=present; else _a=absent; fi
+t "image: no ethtool of its own - only the stub, so removing it really removes it" eq "$_a" absent
+
+# tc: egress and ingress are two qdiscs on two devices, and they must not
+# answer with the same number.
+t "tc: the egress qdisc of a device reports its own drops" eq "$(tc -s qdisc show dev eth2 | sed -n 's/.*dropped \([0-9]*\),.*/\1/p' | head -1)" 12
+t "tc: SQM's ingress device is another qdisc with another number" eq "$(tc -s qdisc show dev ifb4eth2 | sed -n 's/.*dropped \([0-9]*\),.*/\1/p' | head -1)" 34
+# ethtool: the two names the mvneta driver accumulates ring drops into sit
+# among two dozen others; another driver has neither.
+t "ethtool: rx_discard and rx_overrun are in the MIB (5 and 2)" eq "$(ethtool -S eth2 | awk '/rx_discard:|rx_overrun:/ { s += $2 } END { print s }')" 7
+t "ethtool: another driver names neither counter" eq "$(BK_STUB_ETHTOOL=other ethtool -S eth2 | grep -c 'rx_discard:\|rx_overrun:')" 0
+# The split: every name its own number (overrun 2, discard 5, CRC 3, MAC
+# receive 1, refill 4, oversize a measured 0), each exactly once, with the
+# neighbours a parser could slip onto; a partial driver has the ring names only.
+t "ethtool: the six split names, each once, with their own numbers" eq "$(ethtool -S eth2 | awk '$1 ~ /^(rx_overrun|rx_discard|bad_crc_event|mac_receive_error|refill_errors|oversize_received):$/ { printf "%s%s ", $1, $2 }')" "oversize_received:0 mac_receive_error:1 bad_crc_event:3 rx_discard:5 rx_overrun:2 refill_errors:4 "
+t "ethtool: skb_alloc_errors, bad_frames_received and jabber_received sit beside them" eq "$(ethtool -S eth2 | grep -c 'skb_alloc_errors: 0\|bad_frames_received: 11\|jabber_received: 6')" 3
+t "ethtool: a partial driver has the two ring names and none of the other four" eq "$(BK_STUB_ETHTOOL=partial ethtool -S eth2 | grep -c 'rx_discard: 5\|rx_overrun: 2'),$(BK_STUB_ETHTOOL=partial ethtool -S eth2 | grep -c 'bad_crc_event\|mac_receive_error\|refill_errors\|oversize_received')" "2,0"
+# uci: an option that is not set exits 1 with no output, which is a different
+# answer from "no uci at all".
+uci -q get network.@globals[0].packet_steering > $T/o 2>&1; _rc=$?
+t "uci: an unset option exits 1 and prints nothing" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9)" "1,0"
+t "uci: the stale sqm section on the LAN conduit is disabled, the WAN one is not" eq "$(uci -q show sqm | grep -c \'1\')" 1
+# The ubus device dump is the real capture: an empty array over three lines
+# and a speed that is a string with the duplex letter on it.
+t "ubus: the device dump prints an empty array over three lines (12 of them)" eq "$(ubus call network.device status | grep -c '^			$')" 12
+t "ubus: lan0 is a dsa port behind the conduit eth1, linked at 1000F" eq "$(ubus call network.device status | grep -c '"conduit": "eth1"')" 5
+
+# nft: three rulesets, and the difference between them is the whole of G20.
+t "nft: the default ruleset holds the fw4 table" eq "$(nft list ruleset | grep -c 'table inet fw4')" 1
+t "nft: the foreign ruleset holds mwan3 and no fw4 at all" eq "$(BK_STUB_NFT=foreign nft list ruleset | grep -c 'inet fw4')" 0
+BK_STUB_NFT=empty nft list ruleset > $T/o 2>&1; _rc=$?
+t "nft: an empty kernel answers 0 and prints nothing" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9)" "0,0"
+# bridge: the forwarding database. Every kind of row the owner's router
+# prints is in the default answer, and only the learnt ones may be counted.
+t "bridge: an unknown bridge is refused, not answered empty" sh -c '! bridge fdb show br br-nope 2>/dev/null'
+t "bridge: the default answer holds 14 learnt rows, 7 of them on wired ports" eq "$(bridge fdb show br br-lan | grep -c 'master br-lan$'),$(bridge fdb show br br-lan | grep 'master br-lan$' | grep -c ' dev lan')" "14,7"
+t "bridge: lan0 carries the same MAC in two VLANs" eq "$(bridge fdb show br br-lan | grep -c '^02:00:00:00:0a:01 ')" 2
+t "bridge: one vlan 4095 row is NOT permanent, so its own rule has to drop it" eq "$(bridge fdb show br br-lan | grep -c 'vlan 4095 self$')" 1
+t "bridge: BK_STUB_FDB=empty keeps the noise and drops every learnt row" eq "$(BK_STUB_FDB=empty bridge fdb show br br-lan | grep -c 'master br-lan$')" 0
+t "bridge: BK_STUB_FDB=empty still prints the permanent and multicast rows" eq "$(BK_STUB_FDB=empty bridge fdb show br br-lan | wc -l | tr -cd 0-9)" 17
+t "bridge: three multicast/broadcast rows carry no 'permanent', so only their own rule can drop them" eq "$(bridge fdb show br br-lan | grep -Ec '^(33:33|01:00:5e|ff:ff:ff:ff:ff:ff).* self$')" 3
+t "bridge: every call is logged" grep -qx "fdb show br br-lan" $OUT/bridge_calls.log
+
+# nslookup: the two answers G41 needs, and the refusal really is instant.
+nslookup example.com 127.0.0.1 > $T/o 2> $T/e; _rc=$?
+t "nslookup: the resolver answers - exit 0" eq "$_rc" 0
+BK_STUB_DNS=fail nslookup example.com 127.0.0.1 > $T/o 2> $T/e; _rc=$?
+t "nslookup: a refusal exits 1 and says so on stderr, with nothing on stdout" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9),$(grep -c refused $T/e)" "1,0,1"
+# logread: the one call every full run makes is where the fake router's clock
+# moves; without the variable it may not move at all.
+cp $F/proc/uptime $T/uptime.keep
+logread > /dev/null 2>&1
+t "logread: without the variable the uptime stays where it was" eq "$(cat $F/proc/uptime)" "$(cat $T/uptime.keep)"
+BK_STUB_UPTIME_BUMP=1 logread > /dev/null 2>&1
+t "logread: with BK_STUB_UPTIME_BUMP=1 the uptime moves 4.20 s forward" eq "$(awk -v a="$(awk '{print $1}' $T/uptime.keep)" -v b="$(awk '{print $1}' $F/proc/uptime)" 'BEGIN { printf "%.2f", b - a }')" "4.20"
+cp $T/uptime.keep $F/proc/uptime
+# W1-C3: a mask can only be proven on a log that HAS something to leak. The
+# pii fixture must serve every identifier raw, the long pair must put its
+# address across the 200-character cut, and the non-ASCII bytes must be there.
+BK_STUB_LOG=pii logread > $T/pii 2>/dev/null
+t "logread pii: every planted identifier is served raw" sh -c "for s in 192.0.2.44 198.51.100.23 192.0.2.61 02:5e:10:aa:bb:01 02-5e-10-aa-bb-02 fe80::1c2:3ff:fe44:5566 2001:db8:42::17 000100012b3c4d5e025e10aabb04 jana.novakova@example.org novakovi-ntb novakovi-nas.lan Janas-iPhone DESKTOP-7QK2M9A Galaxy-S23-Jana; do grep -qF \"\$s\" $T/pii || exit 1; done"
+t "logread pii: the address of the long pair starts at character 191 of the message" eq "$(grep -F 192.0.2.44 $T/pii | sed 's/.*dnsmasq\[124\]: //' | awk '{ print index($0, "192.0.2.44") }')" 191
+t "logread pii: a UTF-8 letter and a lone 0xff byte are in the kresd line" eq "$(grep -F kresd $T/pii | od -An -tx1 | tr -s ' \n' '  ' | grep -c 'c3 a9 20 ff')" 1
+t "logread formats: ten lines, one of them without a date" eq "$(BK_STUB_LOG=formats logread | wc -l | tr -cd 0-9),$(BK_STUB_LOG=formats logread | grep -c '^    error:')" "10,1"
+rm -f $OUT/logread_now.log
+
+# wget, the HiLink modem: what each BK_STUB_HILINK_MODE answers. A token
+# firmware has to refuse a session it never handed out (125003) differently
+# from no session at all (125002), or the replacement of a stale one is not
+# tested; a login-protected one refuses even the session it handed out.
+H=http://192.168.8.1/api
+t "wget: canonical answers all four endpoints" eq "$(for _e in monitoring/status pin/status device/signal net/current-plmn; do wget -q -O - $H/$_e; done | grep -c '^<response>')" 4
+BK_STUB_HILINK_MODE=token wget -q -O - $H/webserver/SesTokInfo > $T/ses
+_ses=$(sed -n 's/.*<SesInfo>\([^<]*\)<.*/\1/p' $T/ses); _tok=$(sed -n 's/.*<TokInfo>\([^<]*\)<.*/\1/p' $T/ses)
+t "wget: SesTokInfo hands out a session and a token" sh -c "[ -n '$_ses' ] && [ -n '$_tok' ]"
+t "wget: token refuses a GET without a session (125002)" eq "$(BK_STUB_HILINK_MODE=token wget -q -O - $H/device/signal | grep -c '<code>125002</code>')" 1
+t "wget: token refuses a session it never handed out (125003)" eq "$(BK_STUB_HILINK_MODE=token wget -q -O - --header 'Cookie: SessionID=gone' --header '__RequestVerificationToken: gone' $H/device/signal | grep -c '<code>125003</code>')" 1
+t "wget: token answers with the session it handed out" eq "$(BK_STUB_HILINK_MODE=token wget -q -O - --header "Cookie: $_ses" --header "__RequestVerificationToken: $_tok" $H/device/signal | grep -c '<rsrp>-85dBm</rsrp>')" 1
+t "wget: login refuses even that session (100003)" eq "$(BK_STUB_HILINK_MODE=login wget -q -O - --header "Cookie: $_ses" --header "__RequestVerificationToken: $_tok" $H/device/signal | grep -c '<code>100003</code>')" 1
+t "wget: noplmn refuses current-plmn alone" eq "$(BK_STUB_HILINK_MODE=noplmn wget -q -O - $H/net/current-plmn | grep -c '<error>'),$(BK_STUB_HILINK_MODE=noplmn wget -q -O - $H/device/signal | grep -c '<response>')" "1,1"
+t "wget: cut breaks off status, pin and current-plmn before </response>, signal is whole" eq "$(for _e in monitoring/status pin/status net/current-plmn device/signal; do BK_STUB_HILINK_MODE=cut wget -q -O - $H/$_e; echo; done | grep -c '</response>'),$(for _e in monitoring/status pin/status net/current-plmn; do BK_STUB_HILINK_MODE=cut wget -q -O - $H/$_e; echo; done | grep -c '^<response>.*</[A-Za-z]*><[A-Za-z]*$')" "1,3"
+BK_STUB_HILINK_MODE=dead wget -q -O - $H/monitoring/status > $T/o 2>&1; _rc=$?
+t "wget: dead prints nothing and exits 1" eq "$_rc,$(wc -c < $T/o | tr -cd 0-9)" "1,0"
+t "wget: a call with the session is logged with tok in front, the URL last" eq "$(grep -c "^tok $H/device/signal\$" $OUT/hilink_calls.log)" 3
+
+# logger: one line per call, "TAG: MESSAGE", in the order of the calls.
+logger -t bk-agent "one two"; logger -t bk-agent three
+t "logger: -t TAG MESSAGE lands as 'TAG: MESSAGE', one line per call" eq "$(tr '\n' '|' < $OUT/logger.log)" "bk-agent: one two|bk-agent: three|"
+# BK_STUB_LOGGER=hang: filed with its PID, nothing in logger.log, and still
+# running a second later, until a signal ends it.
+BK_STUB_LOGGER=hang logger -t bk-agent stuck &
+_lp=$!
+_n=0; while [ ! -s $OUT/logger_hung.log ] && [ $_n -lt 50 ]; do sleep 0.1; _n=$((_n + 1)); done
+sleep 1
+read -r _ls 2>/dev/null < /proc/$_lp/stat || _ls=""
+_ls=${_ls##*") "}
+t "logger: hang files 'PID TAG: MESSAGE', writes no logger.log line and has not returned after 1 s" eq "$(cat $OUT/logger_hung.log),$(wc -l < $OUT/logger.log | tr -cd 0-9),${_ls%% *}" "$_lp bk-agent: stuck,2,S"
+kill -9 $_lp 2>/dev/null; wait $_lp 2>/dev/null
+
+rm -rf $T
+rm -f $OUT/*_calls.log $OUT/iwinfo_scan.log /tmp/bk-stub-iw.*.count $OUT/logger.log $OUT/logger_hung.log

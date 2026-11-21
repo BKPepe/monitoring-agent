@@ -1,0 +1,20 @@
+02:00:00:00:00:01  -47 dBm / -92 dBm (SNR 45)  10 ms ago
+	RX: 864.8 MBit/s, HE-MCS 8, 80MHz, HE-NSS 2, HE-GI 0, HE-DCM 0   2679158 Pkts.
+	TX: 1020.6 MBit/s, HE-MCS 10, 80MHz, HE-NSS 2, HE-GI 1, HE-DCM 0  15918433 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:02  -75 dBm / -92 dBm (SNR 17)  5700 ms ago
+	RX: 6.0 MBit/s                                  5402 Pkts.
+	TX: 135.0 MBit/s, MCS 6, 40MHz                  5696 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:03  -41 dBm / -92 dBm (SNR 51)  4100 ms ago
+	RX: 24.0 MBit/s                                19991 Pkts.
+	TX: 975.0 MBit/s, VHT-MCS 7, 80MHz, VHT-NSS 3     22611 Pkts.
+	expected throughput: unknown
+
+02:00:00:00:00:04  -60 dBm / -92 dBm (SNR 32)  4160 ms ago
+	RX: 6.0 MBit/s                                106445 Pkts.
+	TX: 816.7 MBit/s, HE-MCS 8, 80MHz, HE-NSS 2, HE-GI 1, HE-DCM 0    107800 Pkts.
+	expected throughput: unknown
+

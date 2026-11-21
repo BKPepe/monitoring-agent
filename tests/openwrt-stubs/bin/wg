@@ -1,0 +1,5 @@
+#!/bin/sh
+[ "$1 $2 $3" = "show all dump" ] || exit 1
+printf 'wg0\tPRIVKEYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=\tSERVERPUBxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=\t51820\toff\n'
+printf 'wg0\tPEERONEpubkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\t(none)\t203.0.113.5:51820\t10.0.0.2/32\t1725000000\t12345\t67890\t25\n'
+printf 'wg0\tPEERTWOpubkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\t(none)\t[2001:db8::1]:51820\t10.0.0.3/32\t0\t0\t0\toff\n'

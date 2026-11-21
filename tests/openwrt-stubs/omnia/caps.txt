@@ -1,0 +1,5 @@
+HT20 HT40 VHT20 VHT40 VHT80 VHT160 HE20 HE40 HE80 HE160 
+  2.412 GHz (Band: 2.4 GHz, Channel 1) 
+  2.437 GHz (Band: 2.4 GHz, Channel 6) 
+* 5.180 GHz (Band: 5 GHz, Channel 36) 
+  5.200 GHz (Band: 5 GHz, Channel 40) 

@@ -1,0 +1,11 @@
+#!/bin/sh
+cat <<'M'
+Interface status:
+ interface wan is online and tracking is active
+ interface wwan is offline and tracking is active
+
+Current ipv4 policies:
+balanced:
+ wan (100%)
+
+M

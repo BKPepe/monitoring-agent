@@ -1,0 +1,934 @@
+# Monitoring Agents
+
+Two different kinds of agent live in this repo, because they measure two different
+things and run in two different places. Both report back to the same self-hosted
+[status dashboard](https://github.com/BKPepe/monitoring) (see `apps/status/`), but
+through separate API endpoints.
+
+## 1. Distributed HTTP probes (this directory)
+
+Check whether a **web/HTTP(S) target is reachable from the outside**, from a
+network other than the hosting's own — the "is my site up, or is only the hosting
+unable to reach it?" question. One probe, configured once in GitHub:
+
+| Agent | Trigger | Tests |
+|-------|---------|-------|
+| Cloudflare Worker (`cloudflare-agent.js`) | every 5 min (cron) | HTTP/HTTPS |
+
+It posts results to `node_api.php` (the "Distributed Node API" on the status
+dashboard) and detects its own location from Cloudflare's trace, so the dashboard
+can show latency per region next to the hosting's own checks.
+
+A second probe on a GitHub Actions schedule (`monitor.yml`) was dropped: GitHub ran
+its 5-minute schedule only every 4-6 hours, so it added a handful of points a day.
+
+### Setup (one-time)
+
+Add these secrets under **Settings → Secrets and variables → Actions**:
+
+| Secret | Description |
+|--------|-------------|
+| `API_URL` | Node API endpoint, e.g. `https://example.com/node_api.php` |
+| `API_KEY` | Authentication key from the monitoring admin panel |
+| `CLOUDFLARE_API_TOKEN` | CF API token with **Workers Scripts:Edit** permission |
+| `CLOUDFLARE_ACCOUNT_ID` | Your Cloudflare account ID |
+
+On every push to `main`, the `deploy-worker.yml` workflow automatically deploys the
+Cloudflare Worker and pushes `API_URL` / `API_KEY` to it as Worker secrets.
+No manual `wrangler` commands needed.
+
+**Limitation:** only `web` type monitors (HTTP/HTTPS) are supported here - see below
+for TCP ports, game servers, and host-level metrics.
+
+## 2. VPS host-metrics agents (`vps-agent/`)
+
+Run **inside** a server you own and report **its own** CPU/RAM/disk usage, uptime,
+listening ports, running processes and (optionally) game-server/process health -
+things an outside HTTP probe can't see. Pick whichever fits the host:
+
+| Agent | Runtime | Notes |
+|-------|---------|-------|
+| `agent.py` | Python 3, no dependencies | Cron every 5 min; supports self-update |
+| `agent.sh` | Bash/sh, no dependencies | Same as above, for hosts without Python |
+| `agent.ps1` | PowerShell 5.1+ | Windows, via Task Scheduler |
+| `docker-compose.agent.yml` | Docker | Runs `agent.py` with `pid: host` so it reports the **host's** metrics, not the container's |
+
+All four report to `agent_api.php` (a different endpoint than the HTTP probes
+above), authenticated with a per-monitor `AGENT_KEY` issued by the dashboard's
+admin panel. See `apps/status/README.md` for full installation instructions for
+each variant, and the "Self-Updates" section for how the opt-in auto-update flow
+(checksum-verified, atomic replace) works across all four.
+
+### Self-update and remote actions: the rules all four agents share
+
+A release reaches every self-updating agent within minutes, so the updater
+checks the file itself, not only how it arrived, before it replaces anything.
+In this order:
+
+1. **Forward only.** The offered `latest_version` must be plain dotted digits
+   and strictly newer than the running `AGENT_VERSION`. Anything else is
+   skipped quietly: a reverted or duplicate deploy no longer downgrades the
+   fleet. A rollback on purpose is a new, higher version.
+2. **sha256** of the download equals the server's `update_sha256`, as before.
+3. **End line.** The last line of the file must be exactly
+   `# bk-agent-end <offered version>`. A download cut short can still parse
+   (a truncated OpenWrt agent did, and installed itself), but it cannot end
+   with this line.
+4. **Parse:** `bash -n`, `sh -n`, `py_compile`, PowerShell's parser.
+5. **Self-check.** The download is run with `--selfcheck` (`-SelfCheck` in
+   PowerShell) and `BK_UPDATE_SELFCHECK=1`, under a time limit. It must exit 0
+   and print one JSON object whose `agent_type` is this agent's and whose
+   `agent_version` is the offered version. Without the variable the flag
+   exits 2 and does nothing else, so it cannot turn an installed agent into
+   one that quietly stopped reporting. `agent.sh`, `agent.py` and `agent.ps1`
+   collect and build their payload in it (state writes off, nothing sent;
+   `agent.ps1` allows 60 s for Windows PowerShell and CIM; `agent.sh` hands
+   it a copy of its SMART/discovery cache, so slow disks cannot use up the
+   minute); the OpenWrt agent answers with its identity only, because a full
+   collection needs its run lock.
+6. **Room, flush, swap.** The new file is written in the script's own
+   directory (free space checked first; `agent.ps1` wants twice its own
+   size) and flushed to disk. The old file is kept as `<script>.prev`, and a rename in the same
+   directory puts the new one in place. On Windows this is `ReplaceFile`,
+   which also keeps the old file's ACL on the new one.
+
+A refusal at any step leaves the running script byte-identical. A file
+refused for what its bytes are (end line, parse, a failed or hung self-check)
+is never fetched again: its sha256 goes on a short list next to the agent
+(the last 8, newest last), with no expiry, so a server that keeps offering a
+bad file no longer has every host download it again each day. A file with
+another sha is tried as usual, even under the same version. A sha mismatch is
+retried on the next run.
+
+**Probation and rollback.** The updater writes a probation marker just before
+the swap. Every run of the new version counts. Its first report the server
+accepts (HTTP 2xx) writes the last-ok stamp (`<version> <unix time>`) and
+ends the probation. If the server refused (HTTP 4xx) three of the new
+version's reports, or 30 runs passed without one accepted, the next run puts
+`.prev` back and exits. That file goes on the same list and is never taken
+again; a fixed file published under the same version has another sha256 and
+is taken at once. A network outage alone does not roll back after a few
+minutes, but one that lasts the whole probation (30 runs) does, and the
+list then holds a good file. To lift such a verdict, publish the file again
+with other bytes (any change gives another sha), or delete the list on the
+host. A marker naming another version than the running one (a swap undone by
+hand) is dropped. `agent.ps1` keeps this state next to itself as
+`agent.ps1.prev`, `.probation` (JSON), `.last-ok`, `.rejected` and
+`.nonces`; `agent.sh` and `agent.py` keep similar files next to the script,
+the list as `.refused` (their header comments list them). The OpenWrt agent
+keeps its counters in its private directory (tmpfs) and, next to `.prev` on
+the flash, `agent_openwrt.sh.probation` (a reboot inside the probation
+restarts the count instead of ending it) and the list
+`agent_openwrt.sh.refused` (a reboot does not forget a verdict).
+
+**Remote actions**, whatever the agent:
+
+- `action_id` and `timestamp` must be 1 to 18 ASCII digits before either is
+  used. Anything else is ignored and not answered, and the rest of the run
+  goes on. In `agent.sh` the timestamp reached shell arithmetic before the
+  signature was checked, where it could run a command (SEC-01). A leading
+  zero is no number the server writes: the OpenWrt agent refuses it (ash
+  reads `089` as a broken octal number and ended the run), `agent.sh` reads
+  it as decimal.
+- Then the 30 s time window, then the HMAC. Only a correctly signed action is
+  checked further, so an unsigned answer learns nothing about the allow-list.
+- Single use: the nonce is remembered for 60 s, the whole time a timestamp
+  can be valid, and is stored before the action runs. An action whose nonce
+  cannot be stored is refused.
+- `ALLOWED_ACTIONS` is enforced, then the service name of `restart_service`
+  must match `^[A-Za-z0-9_][A-Za-z0-9_.@$-]{0,127}$`: a letter, digit or `_`
+  first (no option injection, no `..`), no path separator, no space and none
+  of `* ? [ ]` (`Restart-Service -Name *` restarts everything); `$` is there
+  for Windows instance names such as `MSSQL$SQLEXPRESS`, `@` for systemd
+  templates. `agent.ps1` used to accept a space, which this rule refuses.
+  `agent.sh` and `agent.py` also refuse a systemd unit of another type
+  (`.target`, `.mount`, `.socket`, `.timer` and the like): `restart_service`
+  restarts a service, and `poweroff.target` is not one.
+
+A refused action is reported to the dashboard as failed, with the reason.
+
+**Releasing.** Bump `AGENT_VERSION` and the file's last line together; CI
+(`test.yml`) fails a push where they differ. The first release built from
+this code is the first one carrying the end line: agents already in the field
+do not look for it and take that release like any other, and from then on
+every agent accepts only files that have it. How a release reaches the
+hosting, and the one-time canary it needs: "Releasing and deployment" below.
+
+### Optional packages on OpenWrt, and what each one unlocks
+
+The OpenWrt agent runs on a stock image and asks for nothing. Three packages
+are not installed by default, and each one turns a group of values from
+`null` into a measurement - never from `0` into a measurement, because what
+cannot be read is reported as unknown:
+
+| Package | Command | What it unlocks |
+|---|---|---|
+| `hostapd-utils` | `hostapd_cli` | per-station facts of every AP radio: the Wi-Fi generation mix (4/5/6/7), the 6 GHz operating classes behind `clients_6ghz_capable`, the WPA2 / WPA3 split and the weakest client's generation. Without it those come from `ubus` at best (no generation 7, no AKM, no operating classes) and are `null` otherwise |
+| `smartmontools` | `smartctl` | the whole `smart` block of every disk: health verdict, temperature, power-on hours, unclean shutdowns, reallocated and pending sectors, wear and bytes written. The companion `smartmontools-drivedb` is what makes the vendor-specific attributes (wear, unsafe shutdowns, runtime bad blocks) readable at all |
+| `iw` | `iw dev <radio> survey dump` | `busy_pct` and `busy_other_pct`, how much of the channel time was in use in the last minute and how much of it was somebody else's. Without the package the state is `not_installed` |
+
+```sh
+opkg update && opkg install hostapd-utils smartmontools smartmontools-drivedb iw
+# on images whose package manager is apk (OpenWrt 24.10 and newer):
+# apk add hostapd-utils smartmontools smartmontools-drivedb iw
+```
+
+`agent_tools` in every report says which of them the router has, so the
+dashboard can name the missing package instead of warning about a value
+nobody can measure.
+
+### Wi-Fi 6E support of the clients (OpenWrt)
+
+From 0.1.6 each Wi-Fi radio also reports `clients_6ghz_capable` and
+`clients_caps_known`: how many connected stations list a 6 GHz operating class
+(131-137, i.e. Wi-Fi 6E) and how many sent their list of operating classes at
+all. The list comes from `hostapd_cli all_sta`, which ships in the
+`hostapd-utils` package and is not installed on OpenWrt by default:
+
+```sh
+opkg update && opkg install hostapd-utils
+```
+
+Without it both values are `null` (unknown), never `0`. A station that sent no
+list is left out of `clients_caps_known`, so "not capable" and "did not say"
+stay apart.
+
+From 0.1.7 the AP's own mode is taken into account, because hostapd only marks
+a station `[HE]` while the AP itself runs HE (Wi-Fi 6) or newer: on such a radio
+a station WITHOUT `[HE]` cannot be a 6 GHz client and is counted as known and
+not capable, while on an older AP the same station stays unknown unless it sent
+its operating classes. The list is read only up to the first `00` or `82`
+delimiter byte - what follows is another band's history, not this station's
+ability.
+
+### What else every radio reports from 0.1.7 (OpenWrt)
+
+The band comes from the frequency alone (2.4 / 5 / 6 GHz), never from a channel
+number or a list of hardware modes, and it is `null` on a radio that reports no
+frequency. Next to it: the HT mode as the card prints it (`HE80`, `VHT40`,
+`NOHT`), the encryption class, the median and weakest signal of the connected
+stations, the weakest signal-to-noise ratio, how many stations are at or below
+-75 dBm, the mean transmit rate of the last frames, the generation mix
+(Wi-Fi 4/5/6/7) and, with `hostapd-utils`, how many stations authenticate with
+WPA2 and how many with WPA3.
+
+The WPA2 / WPA3 count normally comes from the `AKMSuiteSelector` line of
+`hostapd_cli all_sta`. Builds that do not print it are not counted as zero: on a
+WPA2 or WPA2/WPA3 personal network a station that associated WITHOUT [MFP]
+cannot be using SAE (WPA3 requires management frame protection), so it is
+counted as WPA2; a station with [MFP] stays unknown, and on a mixed WPA/WPA2
+network nothing is inferred at all, because there a station without [MFP] may
+just as well be a WPA version 1 one.
+
+Two values need a package of their own:
+
+- `busy_pct` (how much of the channel time was in use) is a delta between two
+  `iw dev <radio> survey dump` samples one run apart. The first run after a
+  start, a channel change or a counter reset reports `busy_state:
+  "warming_up"` and no number; a driver that reports no survey data for its own
+  frequency reports `unsupported`; without the `iw` package, `not_installed`.
+  It is never a zero that was not measured.
+- `snr_min` is sent only for stations whose noise floor the driver knows.
+  `iwinfo` prints `signal - noise` even when the noise is unknown, with a zero
+  in its place, and that number is arithmetic, not a measurement.
+
+### Disks and SMART (OpenWrt)
+
+From 0.1.7 the agent reports the physical disks themselves, not only how full
+a mount point is: the name, how the disk is attached (SATA, USB, NVMe, eMMC,
+SD), the port, the sysfs model, the size, whether it spins, whether it is
+removable, and its partitions joined to the `df` output by device. `loop*`,
+`zram*`, `mtdblock*` and the eMMC boot and RPMB areas are not disks and never
+appear. No serial number, WWN or CID is sent - the sysfs files that hold them
+(`serial`, `wwid`, `vpd_pg80`, `cid`) are never opened, and `smartctl` is
+always called with `-q noserial`. An eMMC additionally reports its wear levels
+(`life_a`, `life_b`, `pre_eol`), which the card exposes as 1-11 and 1-3; the
+code 0x00 means "not reported" and stays `null`.
+
+The disk list is rebuilt only when it changes - a fingerprint of name and size
+read with shell builtins - or once an hour, so an ordinary minute costs one
+`awk` and no drive access at all.
+
+With `smartmontools` installed every disk also carries a `smart` block:
+temperature, power-on hours, power cycles, unclean shutdowns, reallocated,
+pending and uncorrectable sectors, CRC errors, wear, bytes written and the
+error and self-test log counts. What is deliberately NOT there matters as
+much:
+
+- Values whose meaning lives in the drive database - wear (231, 169, 202, 233,
+  177), unclean shutdowns (174, 192), runtime bad blocks (183) - are sent only
+  with `smartmontools-drivedb` installed AND when the attribute really carries
+  that name. Without the database OpenWrt's smartctl calls attribute 241
+  `Total_LBAs_Written` and 231 `Temperature_Celsius` whatever the drive counts
+  there, and 183 is `SATA_Downshift_Count` on most drives.
+- Attribute 241 is converted by its NAME (GiB, MiB, 32 MiB blocks or LBAs);
+  device statistics are exact and win over it, and an NVMe reports its own
+  counter. A fixed x 512 would turn 420 GiB written into 215 kB.
+- The temperature is `temperature.current`, never the packed raw of attribute
+  194 (on the owner's disk that number is 292058955843).
+- An attribute the drive does not have is `null`, never 0.
+
+The reading itself never happens inside the minute run. The run only decides
+which disks are due and hands them to a detached `--smart-refresh` child,
+which takes a lock of its own, reads one disk at a time and writes the cache
+the next run merges. So the report never waits for a drive - busybox has no
+`timeout` applet, and a hung USB bridge can hold `smartctl` for minutes. From
+that follow the rules worth knowing:
+
+- A disk is read at most once per `SMART_INTERVAL_MINUTES` (`agent_openwrt.cfg`,
+  default and floor 60).
+- A SPINNING disk that nobody is using is not read at all: waking it every hour
+  is exactly the wear the check exists to watch. Its state is `idle_skipped`
+  until the first minute its counters move, and `smartctl -n standby,3` is a
+  second guard behind that.
+- One `smartctl` may run for `SMART_TIMEOUT_SEC` (default 60, clamped 10-180),
+  then it gets TERM, then KILL. A process that survives both keeps the lock:
+  the disk is reported as `stuck`, nothing new is started against it, and the
+  dashboard shows the hang instead of a silent gap.
+- A disk that answers "in standby", or that cannot be read, keeps its previous
+  values stamped with the time THEY were read. A sleeping disk is not a disk
+  whose temperature suddenly became unknown.
+
+`agent_tools` says what the router can measure at all: `smartctl`,
+`smart_drivedb`, `hostapd_cli`, `iw`, `librespeed_cli`, `ethtool`, `tc`, which
+package manager it has, how old the last SMART probe is and whether one is
+running right now. It is the REASON a value is `null`, which lets the
+dashboard offer an install hint instead of warning about a disk nobody can
+read.
+
+### The WAN port, its counters and the busiest core (OpenWrt)
+
+From 0.1.7 the agent answers two different questions about the uplink instead
+of one, because on a PPPoE or VLAN line they have two different answers.
+
+- **`wan_link_mbit`** is the negotiated rate of the link. A VLAN, bridge or
+  macvlan netdev answers `speed` by passing the question through to its real
+  device, so the first netdev of the chain that answers at all is the right
+  source of the rate - on this router `eth2.848` answers 2500, the same as the
+  SFP port under it. A `-1` or a `0` is an answer too ("link down", "unknown")
+  and the walk stops there: a dead DSA port must never inherit the fixed 1000
+  of the conduit below it. Only when the read *fails* - a ppp netdev has no
+  link settings at all - does the walk go one level down, through a single
+  `lower_*` link, at most four levels.
+- **`wan_link_dev`** is the physical port: the first netdev of that chain with
+  a `device` symlink. Virtual netdevs have none, which is exactly what tells
+  them apart. `wan_rx_errors`, `wan_tx_errors`, `wan_rx_dropped`,
+  `wan_tx_dropped` and `wan_carrier_down_count` are read from THAT port and
+  nowhere else. A bridge over two ports has no single port, so all of them
+  stay null: a VLAN reports `0` dropped frames by construction (its kernel
+  path fills only its own counters), and a zero nobody measured is not data.
+  On a modem protocol (`qmi`, `mbim`, `ncm`, `modemmanager`, `3g`) both the
+  rate and the port are null - a usbnet "speed" is a USB descriptor.
+
+`wan_rx_dropped` is evidence, not an alarm: on this hardware it counts failed
+skb allocations *and* frames of protocols nobody handles (LLDP, foreign VLAN
+tags, PPPoE discovery from the access network), so it is far more often
+benign junk than overload. The counters are sent as totals; the server turns
+two reports into the step between them.
+
+**`wan_rx_mbps` / `wan_tx_mbps`** are measured on the l3 device - the one that
+carries the traffic, on PPPoE the ppp netdev and not the port under it -
+against the previous run, in `wan-rate.state`. The elapsed time comes from the
+uptime in centiseconds, never from the clock, so a router whose time jumps
+cannot report a rate nobody transferred. The device name is part of that
+state: after a failover the WAN device changes and a delta between two
+different counters would charge a whole session to one minute. First run,
+device change or a counter that went backwards: null.
+
+**The busiest core.** `cpu` (the average over all cores) hides exactly the
+case this release is about: one core pinned by the packet path while the other
+idles. Every run collects the aggregate line and every `cpuN` line of
+`/proc/stat` in one builtin loop - no `grep` fork - into `cores.now`, moving
+the previous one to `cores.prev`, and one awk computes both from the same
+snapshot, so `cpu` and `cpu_core_max_pct` can never describe two different
+intervals. Reported: `cpu_cores`, `cpu_core_max_pct`, `cpu_core_max_index` and
+`cpu_core_max_softirq_pct` (irq + softirq of that core; threaded NAPI and the
+mt76 workers are charged to *system*, so the two numbers together are what
+"the packet path is eating this core" looks like). The whole block is null on
+the first run after a boot, when a counter went backwards, and when no core
+moved at all - `cpu_cores` included, because a core count next to four nulls
+reads as a measurement that failed silently.
+
+**conntrack.** `conntrack_insert_failed`, `conntrack_drop` and
+`conntrack_early_drop` are the per-CPU columns 10-12 of
+`/proc/net/stat/nf_conntrack`, summed over the CPUs. They are three different
+things and are never added up: `insert_failed` grows on confirm races and long
+hash chains and is routine on a two-core router with RPS; `early_drop` counts
+entries that were successfully evicted to make room, so nothing was refused;
+only `drop` with a full table is a connection the router turned away. The file
+is hexadecimal without a `0x` prefix and busybox awk cannot read hex, so the
+sum is done in the shell with `$((0x..))`. No file, no numbers - null.
+
+### Speed test results and what a 200 really means (OpenWrt)
+
+The router runs `librespeed-cli` from cron and drops the result into
+`librespeed.client.data_dir` (`/tmp/librespeed-data` when the option is not
+set). `/tmp` is a ramdisk, so those files are gone after every reboot: the
+agent's job is to get them off the router before that happens.
+
+- **Speeds are Mbit/s.** 0.1.6 rescaled anything above 1000 as "bytes per
+  second", which turned a 1850 Mbit/s result into 0.0148 Mbit/s. There is no
+  such heuristic any more, and the server repairs the rows it damaged - which
+  works only because 0.1.7 offers the whole directory again once (it deletes
+  the old `/tmp` state file on the version change instead of migrating it).
+- **The file names are the filter.** The name of a result file IS the
+  measurement time, so one awk decides from the names alone which files are
+  opened at all. At most 50 leave per report and the oldest go first, so a
+  router that was offline for a week catches up in order.
+- **A 200 is not a receipt.** The server wraps its speedtest INSERT in a
+  try/catch so a broken result cannot bring telemetry ingestion down - it logs
+  the failure and still answers 200. The answer therefore carries
+  `speedtests_acked`: the newest item it dealt with (stored, already there, or
+  rejected for good), echoed exactly as it was sent. The agent writes
+  `pending.state` before the POST and advances its mark only up to that
+  timestamp; a 200 without the key, or with a timestamp this report never
+  sent, commits nothing and everything is offered again. The unique key on the
+  server makes that idempotent.
+- **What is sent per result:** the measurement time, the four numbers, the
+  server NAME, the transferred bytes, and `started_by: "turris"`. Never the
+  `client` block (it holds the public address and the ISP), never `share`,
+  never the backend URL with its query string. `tool` is filled only when the
+  file itself proves which program wrote it - a `tls` block is the owner's
+  Rust port; a file without one stays null instead of being guessed.
+  From 0.1.11 also `uplink` / `uplink_evidence` / `iface` (see "What 0.1.11
+  adds") and `proto`, the scheme of the server URL.
+- **`speedtest_active`** is an INTERVAL flag, not an instant one: a report
+  covers the last minute, so a test that ended twenty seconds ago still owns
+  its CPU numbers. It is true when a result is new in this run's listing or
+  `pidof librespeed-cli` answers. The server uses it to keep a test out of CPU
+  alerts and anomaly comparisons.
+
+### The path a packet takes through the router (OpenWrt)
+
+`wan_path` is one object, refreshed once an hour into
+`$BK_PRIVATE_DIR/wan-path.cache` and sent from there on every run: it is
+configuration and switch state, which changes when somebody changes it, not
+from minute to minute. Reading it every minute would cost a uci fork per
+option, a `tc` call per queue and an `ubus` dump of every netdev.
+
+- **Offloading.** `flow_offloading` / `flow_offloading_hw` are what uci says;
+  `flowtable_active` is what the loaded nftables ruleset says, taken from the
+  dump the firewall counters already fetched. Configuration and reality are
+  two answers, and a router can have the first without the second.
+- **Packet steering.** `packet_steering` is the raw uci value, a LABEL and
+  never a boolean: in this tree an unset option means steering is ON and only
+  `0` disables it, while on 22.03/23.05-based systems unset means OFF. The
+  answer the recommendations read is `packet_steering_active`, the runtime
+  mask of EVERY `rx-*/rps_cpus` queue of the WAN port - mvneta has several and
+  the init script fills them all. No queue file, or no physical port, and it
+  is null: unknown is not "switched off".
+- **Ring drops.** `wan_rx_ring_drops` is `rx_discard` + `rx_overrun` from
+  `ethtool -S` on the port. `ethtool` is not in every image (Turris OS ships
+  the small one), and other drivers name those counters differently; without
+  both names the answer is null, never 0.
+- **The port's MIB, split (0.1.13).** The same `ethtool -S` output, read in
+  the same loop, also keeps six names on their own, because neither
+  `wan_rx_errors` nor the ring sum says why a frame was lost (mvneta, the
+  Omnia): `rx_overrun` (the receive FIFO was full: load), `rx_discard`
+  (address filtering or no room), `bad_crc_event` and `mac_receive_error`
+  (damaged frames from the line or the module), `oversize_received` (longer
+  than the port takes: an MTU mismatch) and `refill_errors` (a receive buffer
+  the driver could not refill). `skb_alloc_errors` is not sent: with hardware
+  buffer management it never moves. Totals since boot, which the server
+  steps; a name the driver does not print is null, a measured 0 stays 0.
+- **The SFP module (0.1.13).** From the hwmon the kernel's sfp driver
+  registers for a module with diagnostics (`sfp` on the Omnia), in kernel
+  units: `sfp_temp_mc` with the module's own `sfp_temp_max_mc` /
+  `sfp_temp_crit_mc`, and `sfp_rx_power_uw` with its own
+  `sfp_rx_power_min_uw` / `sfp_rx_power_lcrit_uw`. Sent only when exactly one
+  such hwmon exists, because nothing in sysfs says which cage is the WAN's:
+  this assumes one cage, which is the Omnia. `sfp_phy_hwmon` is true when a
+  PHY inside the module registered a hwmon (`i2csfp11`), which the kernel
+  does only for copper modules; false means none was seen, never "optical";
+  null with no hwmon at all or with more than one cage or PHY. The PHY's die
+  temperature is not the module's and is not read, and neither is anything
+  that identifies the module (EEPROM, serial number). No fork: `read` only.
+- **SQM.** Every ENABLED queue whose `interface` is a device of the WAN chain
+  - the l3 device, every netdev the port walk passed, and the port itself -
+  so a queue configured on `eth2` is found for a WAN that runs over
+  `pppoe-wan`, and the other way round. 0.1.6 read `sqm.@queue[0]`, which is
+  "the first section in the file"; on this router that is a disabled leftover
+  on the LAN conduit. A configured rate of `0` means that direction is not
+  shaped and is null, not 0 kbit/s. Drops come from two qdiscs: the device
+  itself for egress and SQM's `ifb4<device>` for ingress (the kernel cuts that
+  name to 15 bytes, so the lookup does too). `sqm: []` means "checked, no
+  queue on the WAN path"; `sqm: null` means it could not be checked, and
+  `sqm_enabled` is null on a router with no SQM configuration at all.
+- **The LAN side.** One `ubus call network.device status` an hour, parsed with
+  `read` - not with `jsonfilter`, which the image does not carry and which no
+  test here runs. Only members of the LAN bridge with devtype `dsa` or
+  `ethernet` count, so a USB LTE stick that is an "ethernet" device is not a
+  LAN port. `lan_port_max_mbit` is the fastest port linked RIGHT NOW (a lone
+  100 Mbit printer makes it 100); `lan_port_cap_mbit` is what those ports can
+  do at all, taken from netifd's `link-supported` list and never derived from
+  a negotiated rate; `lan_conduits[]` names the DSA conduit they share with
+  its own rate, because five gigabit ports behind one gigabit conduit share
+  1 Gbit between them.
+
+### The LAN switch, port by port (OpenWrt, 0.1.8)
+
+`lan_ports` answers three questions about the wired side: which ports carry a
+link, which are idle, and how many devices sit behind each one. Unlike
+`wan_path` it is read on EVERY run - a cable is pulled and a laptop moves
+between minutes, not between hours - so the one `ubus call network.device
+status` per run serves both, and the hourly block reuses that same walk
+instead of asking again. The whole walk - the 27 kB dump plus the forwarding
+database - measures about 20 ms of shell on x86, so it fits the runtime budget
+several times over on the router's own CPU.
+
+- **Counts only, never identifiers.** A per-port device COUNT is not personal
+  data. MAC addresses, hostnames and IP addresses stay on the router: the
+  MACs are read by an `awk` that prints nothing but `dev count`, and a named
+  device list is a separate, opt-in feature. Nothing here is hashed and sent
+  either - a hashed MAC is still an identifier.
+- **Per port**: `link`, the negotiated `speed_mbit` and `duplex`, `max_mbit`
+  (what the port itself supports, from `link-supported`), `partner_max_mbit`
+  (what the other end advertises) and `clients`. A port with no carrier
+  prints no `speed` at all, so its rate and duplex are null - never 0, which
+  would read as a measurement nobody took. `partner_max_mbit` is what lets the
+  app say that lan1 at 100 Mbit is the other end's limit and not a fault.
+- **`conduits[]`** carries the DSA conduit with its own rate. On this hardware
+  every wired client shares one 1 Gbit link to the CPU, and that, not the
+  port, is the real ceiling.
+- **The counts** come from `bridge fdb show br <bridge>`. Not a client, and
+  dropped: `permanent` rows (the bridge's and the ports' own addresses), the
+  `vlan 4095 ... self` rows DSA keeps for its CPU port, the multicast groups
+  `33:33:*` and `01:00:5e:*` and broadcast. One MAC learnt in several VLANs is
+  one device. Only bridge members with devtype `dsa` are ports: the radios are
+  bridge members too (and their clients are counted per radio elsewhere), and
+  a USB LTE stick is an "ethernet" device that is not in the bridge at all.
+  The number is what the bridge has LEARNT, so the app should word it that way:
+  a port with a link and `clients: 0` holds a device that has not spoken since
+  the bridge last forgot it, not necessarily an empty socket.
+- **Null, never an empty list**, when the router cannot answer: no ubus dump,
+  no LAN bridge, no `bridge` command (`/usr/sbin/bridge` is looked at directly
+  as well, because cron hands a job a PATH without sbin on some builds), or a
+  switch that is not DSA - there the kernel does not say which physical port a
+  frame came in on. An empty list would claim there are no devices anywhere,
+  which is a different statement.
+
+### The error lines behind the log count (OpenWrt, 0.1.8)
+
+`log_errors_24h` counts the error lines among the last 500 lines of the log.
+The name is historic: logd is a ring buffer, and 500 of its lines can be ten
+minutes or three days. From 0.1.8 the report also says what the count covers
+and what it counted:
+
+- **`log_window_secs`**: seconds from the oldest of those lines to now, so the
+  app can say "in the last N hours". Null when no line has a readable time.
+- **`log_errors_recent`**: the newest 5 distinct error lines, newest first, as
+  `{"ts", "prog", "msg", "count"}`. The count's own regex picks them from the
+  same buffer, in ONE `awk` pass that now does the two counts as well (they
+  were two `grep -c` over the same lines). `ts` is epoch seconds: logd and
+  journalctl print local time without a zone, so the router's current offset
+  is applied, while syslog-ng on Turris writes ISO 8601 with its own. `prog`
+  is the program without its pid, null for a line with no date (its layout
+  is unknown), and `count` how often the line repeats in the buffer.
+- **Masked on the router.** A log line is the one thing in the report that can
+  carry what the owner never meant to send, so before it leaves: MAC `<mac>`,
+  IPv6 `<ipv6>`, IPv4 `<ipv4>`, e-mail `<email>`; names under a home domain
+  (`.lan`, `.local`, `.home`, `.internal`, `.localdomain`, `.home.arpa`,
+  `.fritz.box`), names that look like a device (`iphone`, `galaxy`,
+  `desktop-`, ...) and the client name dnsmasq writes after a MAC `<host>`;
+  hex runs of 12 or more (DUIDs, client ids) `<id>`. The mask runs BEFORE the
+  cut to 200 characters, so a cut cannot leave half an address that no mask
+  recognises. Every byte outside printable ASCII becomes `?`: the server
+  refuses invalid UTF-8, and one stray byte must not cost the whole report.
+  Lines are deduplicated on the masked text, so one failure against two
+  addresses is one line with `count: 2`; the kernel's printk stamp
+  (`[ 1234.567890]`) is dropped for the same reason, since `ts` already says
+  when.
+- **Cheap on a router in trouble.** The masks cost per character, and a
+  failing router can fill all 500 lines with errors. So a line is cut to 256
+  characters BEFORE masking - at a space, so no address is split, and marked
+  `...` - the same text is masked once, and a cheap test skips every mask
+  that cannot match. 500 error lines, each with its own address, take about
+  30 ms of busybox `awk` on an arm64 laptop core; a log without errors costs
+  nothing beyond the two counts.
+- **Two switches keep the lines at home; the counts go either way.**
+  `LOG_LINES_ENABLED=0` in `agent_openwrt.cfg` is the owner's, on the router.
+  The monitor's setting is the server's: it answers every report with
+  `"log_lines":true` or `"log_lines":false`, and the agent keeps a `false` as
+  `agent_openwrt.loglines-off` next to the cfg. That is on flash on purpose:
+  in `/var/run` a reboot would forget it and the first report would carry the
+  lines again. A `true` removes the file; an answer without the key (an older
+  server) changes nothing. `log_lines_state` names what applies - `on`,
+  `off_monitor` or `off_router` - so a missing list is never read as "no
+  errors".
+- **Null, never an empty list**, when there is no readable log. `[]` means the
+  log was read and holds no error line.
+
+### What 0.1.13 adds (OpenWrt)
+
+- **Why the WAN port lost frames.** `wan_path` carries the port's own MIB
+  names next to the ring sum (`rx_overrun`, `rx_discard`, `bad_crc_event`,
+  `mac_receive_error`, `refill_errors`, `oversize_received`), so a damaged
+  line, an MTU mismatch and a router that could not keep up are three
+  different answers instead of one `wan_rx_errors`. From the same
+  `ethtool -S` call as before.
+- **The SFP module's own readings.** Temperature and RX power with the
+  module's own limits, and whether a PHY inside it proves a copper module
+  (`sfp_phy_hwmon`); see "The path a packet takes through the router".
+- 13 keys more in `wan_path`, about 300 B on every report; no extra
+  process, no new file.
+
+Needs a server that knows the 13 keys: an older server keeps only the
+`wan_path` keys it knows and drops these without a word.
+
+### What 0.1.12.1 changes (OpenWrt)
+
+A fix release with switches and traces for finding out why a router goes
+silent or reboots. It sends the same keys as 0.1.12; the server needs no
+change.
+
+- **`LTE_API=off` switches the LTE modem's web API off.** With that line in
+  `agent_openwrt.cfg` the agent sends the modem not one request: no
+  `monitoring/status`, `device/signal`, `pin/status` or `net/current-plmn`.
+  What netifd and `/proc/net/dev` say about the link is still reported
+  (`lte_up`, `lte_uptime`, `lte_ipv4`, `net_lte`); signal, SIM and operator
+  are null.
+  Only the exact word `off` switches it off, anything else is the default
+  `auto` (a collector does not go off by a typo). uqmi and mmcli are not the
+  web API and are not affected.
+- **`--dry-run` is not passive, and `--help` now says so.** It runs like a
+  cron run - takes the run lock, asks the modem and the Wi-Fi radios, may
+  read SMART - and skips only the POST, remote actions and the update.
+- **A token firmware's session is kept between runs.** A modem that answers
+  125002 until it gets a session (E3372h-320 and the like) was asked for a
+  new one every minute: four requests a run instead of two. The session is
+  now kept in `hilink.session` (private directory, 0600) for 240 s from the
+  run that got it, for the same LTE device and address only, and replaced
+  when the modem refuses it. A session is asked for at most once a run, so
+  a modem that wants a login (100003) costs 5 requests a run (0.1.12: 6,
+  and 9 after a reboot). The session and its token are never logged.
+- **An error is not an answer.** Only a whole `<response>` body is cached:
+  0.1.12 kept an error XML, or the 404 page of a router that is no modem, as
+  the SIM state for ten minutes and as the operator for a day. A body that
+  breaks off before `</response>` is not kept either.
+- **Syslog lines for the events that left no trace.** Besides the agent's
+  own log in `/tmp`, one line goes to syslog through `logger -t bk-agent`
+  (`logread | grep bk-agent`, or a remote syslog that outlives the router)
+  when:
+  - the modem's web API changes its answer: it stops answering, answers an
+    error code (100003: login required), something that is not the HiLink
+    API answers at its address, or it answers again - once per change,
+    never per run, with the LTE device and without an address or the
+    session (the last verdict is `hilink.state` in the private directory);
+  - a run wedged for 300 s is taken over, and when a process of it survives
+    SIGKILL: its `comm` and `wchan` (the kernel function it is stuck in),
+    read from `/proc` without touching its `cmdline`;
+  - the SMART watchdog sends TERM, then KILL, or leaves its lock to a
+    `smartctl` that survives both: disk, seconds and PID.
+- **A syslog that takes nothing does not stop the agent.** `logger` blocks
+  for as long as the syslog reader does not drain `/dev/log` (logd stopped,
+  syslog-ng writing to a disk that hangs). It runs in the background, gets
+  one second and is then killed, and the agent log says that the line did
+  not reach syslog. The lock takeover writes its line to syslog only after
+  its kills.
+- **No `can't open` on a kernel without conntrack statistics.** 0.1.12 opened
+  `/proc/net/stat/nf_conntrack` before its `2>/dev/null` applied, so a
+  kernel without `CONFIG_NF_CONNTRACK_PROCFS` printed the line every run
+  (cron threw it away; the real-image gate on GitHub's runner did not).
+
+### What 0.1.11 adds (OpenWrt)
+
+- **Which uplink carried each speed test.** Turris runs `librespeed-cli`
+  from cron without binding it to an interface, so at night a test can run
+  over the LTE backup and 0.1.10 reported that as the line's speed. The test
+  is not blocked; each result now carries `uplink` (`wan`, `backup`, `mixed`
+  or null), `uplink_evidence` (`counters`) and `iface`. The evidence is the
+  byte counters of the WAN device and the modem device between a snapshot
+  from before the test and now: background traffic can only add bytes, so
+  the modem covering at least half of the test in both directions means the
+  test went over it. A result nobody saw start (the first run of 0.1.11, a
+  gap in the runs, a counter reset) stays null. The verdict is taken once
+  and kept in `uplink.cache` until the server acknowledges the result.
+- **`proto`** is the scheme of `server.url` (`http` / `https`); the URL
+  itself still never leaves the router.
+- Two small files more in the private directory (`uplink.ring`, five
+  snapshot lines, and `uplink.cache`). No extra process per run.
+
+Needs a server that knows the `uplink`, `uplink_evidence` and `proto` keys;
+an older server ignores them.
+
+### What 0.1.10 fixes (OpenWrt)
+
+0.1.10 sends the same keys as 0.1.9; the server needs no change.
+
+- **Every killed run is counted.** The takeover of a run wedged for 300 s now
+  writes its `k` line at once. 0.1.9 held the count in a variable until the
+  end of the run, so when the same collector hung again and the killer was
+  killed in turn, an hour of hung runs was reported as one.
+- **A manual `--dry-run` leaves the run cost alone.** Typed at a terminal it
+  neither takes the cron run's `agent_prev_cpu_ms` / `agent_prev_total_ms`
+  nor writes its own verbose run as "the previous run".
+- **Control characters no longer void a report.** A TAB or any other
+  0x01-0x1F byte in a value (a modem's operator name, a hand-edited
+  hostname) went into the JSON raw and the server refused the whole report;
+  it now becomes a space, like a newline always did.
+- **Registration keeps the token out of `ps`.** Pass it as
+  `BK_REG_TOKEN=... agent_openwrt.sh --register - URL` or on stdin
+  (`--register -`); the old positional form still works. The request body
+  goes through a root-only file, `agent_openwrt.cfg` is written 0600, the key
+  is no longer echoed, and the output names the two lines for
+  `/etc/sysupgrade.conf` so the agent survives a firmware upgrade.
+
+### What 0.1.9 made lighter (OpenWrt)
+
+0.1.9 sends what 0.1.8 sent plus two keys about the agent itself; the rest of
+the change is what a run costs the router. Measured in the e2e harness
+(busybox in an arm64 container, the installer's cfg):
+
+- **Forks: 502 → 182 per warm run** (hourly 546 → 226, daily 627 → 309, cold
+  after a boot 663 → 366; an OpenWrt rootfs with the real jshn 411 → 177).
+  Config and state files are read with shell builtins, the JSON and HiLink
+  XML escaping no longer starts a program per value, and the interface dump,
+  `nft`, `top`, the DNS chain and mwan3 are each parsed once. `tests/` holds a
+  warm run to a fork budget of 200 and fails when the budget is more than 9
+  above the run, so a saving stays saved.
+- **A wedged run can be taken over**: after 300 s with the run lock it is
+  killed with its children, and the next run goes on. That needs a next run
+  to meet the lock: cronie (Turris OS) starts one every minute, and so does a
+  run started by hand. Stock OpenWrt's busybox crond never starts a line
+  again while its previous job still runs, so there a wedged run still holds
+  the router until it ends or the router reboots, as in 0.1.8.
+- **Less written**: `last-payload.json` (16.9 kB) is no longer written by
+  every run, and a self-update writes the script once, by a rename, with no
+  `.bak`.
+- **Two new keys**: `agent_prev_cpu_ms`, the CPU the previous run used, and
+  `runs_skipped_killed`, the runs the lock takeover stopped since the last
+  accepted report. The self-report paragraph of the next section has their
+  null rules and the waits in detail.
+- **CPU on a real router is not measured yet.** In a shared host's OpenWrt
+  rootfs container a warm run used 0.37-0.55x of 0.1.8's CPU, but that is not
+  a router. `agent_prev_cpu_ms` from the routers is the number to read after
+  the rollout.
+
+Three readings can move a little: timestamps that read the clock a second
+time mid-run now use the run's own clock (`wan_last_reconnect` can sit up to
+one run length earlier); `agent_time` is that clock moved on by the uptime to
+the moment the payload is built, a few seconds later than 0.1.8's mid-run
+reading, so the server's `clock_skew_s` no longer includes the rest of the
+run; and on OpenWrt's integer `sort -n` the `top_*` lists now rank by the
+decimal value (0.1.8 broke ties on the text).
+
+One fix goes with it: busybox 1.37 and later read a backslash in awk's
+`gsub()` replacement text the POSIX way, and the escaper of Wi-Fi SSIDs, mount
+points and process names built on it printed their quotes raw. A quote in any
+of them made the report invalid JSON, which the server refuses whole. 0.1.9
+escapes them character by character, with the same output on busybox 1.36.
+
+### What 0.1.7 stopped claiming, and what it now measures (OpenWrt)
+
+Five fields of 0.1.6 were defaults dressed up as readings. They are null now,
+and the app shows a dash:
+
+- `dns_engine` and `dns_encryption` said "Dnsmasq" and "Nešifrované DNS
+  (UDP/53)" for every router whose resolver the detection chain did not
+  recognise - on Turris that is kresd behind a configuration the agent could
+  not read, so the owner was told their DNS was in the clear when nobody had
+  looked. Both are filled in only from evidence: a running process, a
+  configuration file, or an established connection on port 853. Dnsmasq is now
+  one more branch of that chain (`pidof dnsmasq`), not the fall-through.
+- `dns_servers` no longer ends in "Výchozí poskytovatel (WAN)"; when neither
+  netifd nor `/tmp/resolv.conf.auto` names a server, the agent does not know
+  one.
+- `wan_reconnect_count` started at 0, so a router reported "no reconnects"
+  from its first minute although a reconnect is only VISIBLE as a drop of the
+  WAN uptime between two runs. It is null until two samples have been
+  compared; from then on 0 is a measured zero.
+- `sqm_enabled` is null on a router with no SQM configuration at all (see the
+  path section above), instead of "off".
+
+Three signals were replaced or added:
+
+- **`firewall_enabled` is the fw4 table.** fw4 loads one table, `inet fw4`,
+  and loads it whole, so its presence in `nft list ruleset` (the dump the run
+  already has) is the answer. The three signals 0.1.6 accepted all say
+  something else: any non-empty ruleset is true on a router whose firewall
+  never came up but which runs mwan3 or docker; `/etc/init.d/firewall enabled`
+  says the service MAY start, and a syntax error in the rules leaves it
+  enabled with the network wide open; and legacy `iptables -S` always prints
+  policy lines. Without nft and without iptables the field stays null.
+- **`dns_resolver_ok`** keeps the exit status of the probe that was already
+  being run. Until now only its wall clock was read, so a resolver that
+  refused the query in 3 ms was filed as the fastest DNS on the network.
+  `dns_latency_ms` is null whenever the lookup failed - a refusal and a
+  ten-second timeout are the same failure, and neither is a latency. (While
+  fixing that: busybox has no `time` KEYWORD, `time` is the applet, and it
+  writes its report to the stderr of the command it runs. The `2>&1` that sat
+  on the lookup therefore threw the measurement away, and `dns_latency_ms` was
+  null on every busybox router since the day it was written.)
+- **`agent_time`** is the router's own clock, so the server can compute the
+  distance to its own and warn about a router whose remote actions will start
+  being refused.
+
+Finally, the agent reports on itself (`agent_run_ms`, `agent_prev_total_ms`,
+`agent_prev_cpu_ms`, `runs_skipped_lock`, `runs_skipped_post`,
+`runs_skipped_killed`). The run length is measured from the KERNEL uptime at
+both ends, never from the clock: ntpd steps the clock minutes after boot on a
+router without an RTC, and a run would come out negative or hours long. The
+payload is built before the POST, so a run cannot report its own total - the
+EXIT trap writes it to `run.total` and the NEXT report carries
+it as `agent_prev_total_ms`; the POST is usually what pushes a minute run past
+its minute. The same trap writes the run's CPU to `run.cpu` - user + system
+of the agent shell and every child it waited for, from `/proc/$$/stat`, in
+10 ms ticks - and the next report carries it as `agent_prev_cpu_ms`, so every
+router measures what the agent costs it, the slow ones included. The file is
+emptied as it is read and wiped on a version change: after a run that was
+killed before its trap, and on the first report of a new version, the value
+is null, never an older run's. The detached SMART reader is not in it. A
+minute that produced no report cannot report itself either, so
+a run that meets the lock appends a line to `skipped`, and the next run that
+holds the lock folds those lines (taken by a rename, so a line appended
+meanwhile waits for the run after) into one `skipped.total` line of three
+counters: `l` = the previous run still held the lock, `p` = the POST failed,
+`k` = a run wedged for 5 minutes was killed. An accepted report clears the
+total. Each counter stops at 100,000, the server's range. That is how the
+server tells a router that was switched off from an agent that cannot keep
+up. (Until 0.1.8 every skip stayed a line and every run re-read up to 20,000
+of them.)
+
+The waits are bounded, so one bad minute does not become the next one's:
+
+- **The run lock has a maximum age.** A run holding it for 300 s is taken
+  over: it and every process below it get TERM, then KILL, and the run goes
+  on and reports `runs_skipped_killed`. The lock's `pid` file is what it
+  always was (older agents read it); `info` next to it holds the uptime when
+  the lock was taken and the holder's start time from `/proc/PID/stat`, so a
+  PID that belongs to another process by now is never killed. A process of
+  the tree that survives KILL (stuck in the kernel: usually not the holder
+  but the tool it waits for, `df` on a dead disk) keeps the lock - its PID
+  and start time go into the lock with a fresh age, the lock is marked
+  `killed`, and the run that reclaims it once the process is gone counts the
+  killed run. A second run beside it would only get stuck as well. The run's
+  own ancestors are never signalled. A lock is claimed by renaming it away,
+  so of two runs that judged the same lock only one gets it, and a run
+  removes the lock at its end only while it still names that run.
+  This needs a next run to meet the lock, which busybox crond never starts
+  (see the 0.1.9 notes above): the takeover works under cronie (Turris OS)
+  and for a run started by hand.
+- **The DNS probe** keeps busybox's own 5 s. A resolver that answers in 2-5 s
+  is slow, not dead; a shorter bound would report it as not answering.
+- **The POST has a deadline**: what is left of 58 s after the start, minus
+  5 s for the name lookup that `-T` does not bound, between 5 and 20 s. The
+  service checks and the self-update wait for the next minute when fewer than
+  12 s are left; action results only get shorter limits.
+- **The self-update** downloads to one fixed name in the private directory,
+  copies the verified file next to the script (`dd conv=fsync`, which flushes
+  that file only, never a global `sync` that a hung disk could hold) and
+  renames it over the script, after checking the flash has room for it; a
+  `.new` left by an interrupted swap is removed first. No `.bak` copy
+  (nothing read it), one flash write of the script instead of two, and no
+  moment when cron finds the agent missing or half written, which the old
+  `mv` from `/tmp` (another filesystem, so a copy) allowed.
+
+### What the OpenWrt agent keeps on the router, and remote actions
+
+The agent runs as root on a home gateway, so from 0.1.7 nothing it reads back
+can be written by another local user:
+
+- State the agent trusts lives in a private directory,
+  `/var/run/status-agent-openwrt` (mode 0700, owned by root; on a system
+  without `/var/run` it is `/tmp/status-agent-openwrt-private`, checked for
+  owner and symlinks and replaced when somebody else made it first).
+- The router identity cache is there (`identity.cache`, plain lines read with
+  `read`, 24 h). Before 0.1.7 it was a file in `/tmp` that the agent `eval`'d.
+- The last payload, for "what did the router send?", is
+  `last-payload.json` in the same directory, mode 0600, with `agent_key`
+  blanked. It is written by a plain `--dry-run`, after a POST that failed,
+  and on every run while `last-payload.on` exists in that directory; an
+  accepted report removes it. (Until 0.1.8 every run wrote it: 97 % of the
+  agent's tmpfs writes, about 20 MB a day, for a copy nobody read.) The old
+  `/tmp/status-agent-openwrt-last-payload.json` is removed by the first run
+  of the new version.
+- The first run of a new agent version drops every cache an older version
+  wrote (identity, package and service lists, HiLink, and from 0.1.7 the
+  Wi-Fi, disk, SMART and WAN path caches), so a parser fix shows at the update
+  and not a day later. Counters of work the owner consented to and results
+  not sent yet are not caches and stay.
+
+`--dry-run` prints the payload and sends nothing. Two variables exist for the
+end-to-end tests and are honoured only together with `--dry-run`, so a cron
+run can never be pointed at them: `STATUS_TEST_ROOT=<dir>` puts a fake `/sys`
+and `/proc` in front of the disk, WAN port and per-core collectors, and
+`STATUS_TEST_RESPONSE=<file>` stands in for the server's answer (see
+`tests/README.md`).
+
+Remote actions stay off unless `REMOTE_ACTIONS_ENABLED=1` is in
+`agent_openwrt.cfg`. A correctly signed action must also pass these checks;
+a refused one is reported to the dashboard as failed, with the reason:
+
+- `ALLOWED_ACTIONS` is enforced. Without the line every action is allowed; a
+  line with an empty value allows none. Example:
+  `ALLOWED_ACTIONS=restart_wan,renew_dhcp`.
+- A signed answer is single-use: its nonce is remembered for 60 s, the whole
+  time its timestamp can be valid.
+- `restart_service` takes a plain init script name under the service-name
+  rule all agents share (see "Self-update and remote actions" above), never
+  a path.
+
+### Releasing and deployment
+
+This repo does not upload the agents. The `monitoring` repo is their one
+publisher: it carries this repo as the `agents` submodule, and its
+`deploy-status.yml` copies the four files of the pinned commit to
+`public_html/status/`, where every self-updating agent fetches them. Two
+publishers used to upload the same four files, each after its own checks,
+and whichever ran last decided what the fleet got; now it is exactly the
+gitlink. A release:
+
+1. Bump `AGENT_VERSION` and the last line of every agent that changed, and
+   merge to `main` here. `test.yml` must be green on that commit (on `main`
+   it runs as the first job of `deploy-worker.yml`).
+2. In `monitoring`, move the `agents` gitlink to that commit and push.
+3. Its `deploy-status.yml` uploads `agent.sh`, `agent.py`, `agent.ps1` and
+   `agent_openwrt.sh`; each agent takes the new version with its next
+   accepted report.
+
+**Canary the first release of security wave 1 by hand.** It lands on agents
+that check none of the update rules above: the fielded OpenWrt 0.1.11
+verifies the sha and `sh -n` only, keeps no `.prev` and starts no probation,
+so a broken file would stay broken on every router. Once, before the gitlink
+moves, on the Omnia:
+
+1. Copy the new `agent_openwrt.sh` to a temporary path, run `sh -n` on it,
+   then `BK_UPDATE_SELFCHECK=1 sh <copy> --selfcheck` must print
+   `{"agent_type":"openwrt","agent_version":"<new version>"}`, and
+   `sh <copy> --dry-run` must print a payload.
+2. Put it in place and wait for two or three accepted reports on the
+   dashboard (`agent_run_ms` and the CPU value where 0.1.11 had them).
+3. Then move the gitlink. From this release on, the agents check every later
+   one themselves: end line, self-check, probation and rollback.
+
+This repo's `FTP_*` secrets are no longer used. The Cloudflare Worker is
+still deployed from here: `deploy-worker.yml` runs on every push to `main`,
+calls `.github/workflows/test.yml` and deploys nothing unless it passed
+(`needs: test`). Pull requests and pushes to other branches run the same
+workflow on their own. See "Testing" below.
+
+## Testing
+
+`tests/` runs every agent for real, not just through a parser: `agent.sh` and
+`agent.py` in a Debian container (two runs, so between-run deltas exist),
+`agent_openwrt.sh` in busybox with canned `wg` / `mwan3` / `tc` / `uci` /
+`logread` / `iwinfo` / `hostapd_cli` / `nft` / `ubus` output. Each harness asserts on the JSON
+the agent prints with `--dry-run` - valid JSON, honest `null` on the first run,
+parsers reading the right columns. Needs docker and python3:
+
+```bash
+bash tests/run_linux_e2e.sh
+bash tests/run_openwrt_e2e.sh
+bash tests/run_windows_e2e.sh   # agent.ps1 in PowerShell 7 against a mock API
+```
+
+The same three run in CI (`.github/workflows/test.yml`), next to the syntax
+of all four agents, ShellCheck on the two shell agents, the end-line check,
+the Worker's unit tests, and a `windows-latest` job that runs `agent.ps1
+-SelfCheck` and `-DryRun` under Windows PowerShell 5.1, the engine the
+scheduled task uses. `tests/README.md` lists what each harness covers and
+what it cannot.
+
+Every agent also supports `--dry-run` (PowerShell: `-DryRun`): it collects
+everything and prints the payload instead of sending it, no key needed - the
+way to see what a new host will report before registering it.

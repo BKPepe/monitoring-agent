@@ -1,0 +1,52 @@
+# Cloudflare Worker Deploy
+#
+# Automatically deploys the Worker and syncs secrets from GitHub to Cloudflare
+# on every push to main. No manual wrangler commands needed.
+#
+# Required repository secrets:
+#   API_URL                - Node API endpoint
+#   API_KEY                - API authentication key
+#   CLOUDFLARE_API_TOKEN   - CF API token (Workers Scripts:Edit permission)
+#   CLOUDFLARE_ACCOUNT_ID  - Your Cloudflare account ID
+
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # The repo's whole test gate (test.yml), not only the Worker's units below:
+  # this deploy runs on every push to main.
+  test:
+    uses: ./.github/workflows/test.yml
+
+  deploy:
+    name: Deploy Worker
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The tests import the Worker as an ES module from a plain .js file,
+      # which needs Node's module syntax detection (default from 22.7 on).
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # A failing test stops the deploy: the label the Worker posts is shown
+      # unchanged on the public status page.
+      - name: Unit tests
+        run: node --test tests/*.test.mjs
+
+      - name: Deploy Worker & sync secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler@latest deploy

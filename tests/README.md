@@ -1,0 +1,640 @@
+# Agent end-to-end tests
+
+Syntax checks and lints say a script parses; these say it *works*. Each
+harness runs an agent with `--dry-run` inside a container and asserts on the
+JSON it prints - valid JSON, honest nulls on the first run, deltas on the
+second, parsers reading the right columns.
+
+| Script | What runs | Needs |
+| --- | --- | --- |
+| `run_linux_e2e.sh` | `agent.sh` and `agent.py` in Debian (real `/proc`, real `ps`), twice, the second run under load, against a stand-in TeamSpeak ServerQuery on 10011 (`linux/fake_ts3.py`) - and once more with `python3` made unusable, so the bash agent's `nc` transport is exercised too; a first run in cron's bare environment (`env -i PATH=/usr/bin:/bin`, a stub `/usr/sbin/zerotier-cli`) that must measure what an ordinary run measures; `agent.py`'s unit tests (`test_agent_py.py`); and the security cases (`linux/run-security-cases.sh` against `linux/fake_api.py`, asserted by `linux/assert_security.py`): non-numeric and leading-zero timestamps, bad service names and a systemd target, replayed and unstorable nonces, a bad signature, the `--selfcheck` gate, update refusals (sha, missing end line, truncated, failing self-check, older, same, no room) with the agent byte-identical, an update on a host whose disks hang (the self-check must use the warm SMART cache), a good update and the end of its probation, rollback after three refusals and after 30 silent runs, the rolled-back file still not downloaded two days later, the same version republished as other bytes taken, and the list of refused files (last 8, newest last) from `agent.sh`'s own functions | docker, python3 |
+| `cloudflare-agent.test.mjs` (`node --test tests/*.test.mjs`) | the Worker's cron and `/run` handlers against a stubbed `fetch`: the location it posts takes city and country from the colo, never from the trace's `loc` or the `/run` caller; runs before every Worker deploy | node 22+ |
+| `run_openwrt_e2e.sh` | `agent_openwrt.sh` in busybox (ash, busybox awk/sed) with canned `wg`, `mwan3`, `tc`, `uci`, `logread`, `iwinfo`, `hostapd_cli`, `iw`, `smartctl`, `df`, `nft`, `ubus`, `ping`, `openssl` from `openwrt-stubs/bin` and a fake `/sys` + `/proc` from `openwrt-stubs/mkroot.sh`; six payload runs, then the scenario and hardening runs on canned server answers, including the self-update (end line, self-check, direction, swap, probation, rollback, a reboot inside the probation, the refused-file list on the flash: kept over a reboot, no expiry, a new sha of the same version taken, last 8) and the remote-action gates | docker, python3 |
+| `run_windows_e2e.sh` | `agent.ps1` in PowerShell 7 (Linux container, `windows/`): parser, UTF-8 BOM, end line, PSScriptAnalyzer's Windows PowerShell 5.1 compatibility rules, unit tests of functions cut out of the agent's own syntax tree, then 40-odd agent runs against `windows/mock_api.ps1` - dry run, `-SelfCheck`, remote-action gates, self-update refusals, swap, probation and rollback | docker |
+| `run_openwrt_real.sh [24.10\|master\|all]` | `agent_openwrt.sh` with a plain `--dry-run`, twice, in the official `openwrt/rootfs` x86_64 images (24.10.8 pinned, master floating) with ubus, procd, logd, netifd, fw4 and dnsmasq up (`openwrt-real/boot.sh`), asserted by `assert_real_payload.py` | docker, python3 |
+| `run_linux_distros.sh [ubuntu\|alpine\|rocky\|all]` | `agent.sh` and `agent.py` with a plain `--dry-run`, twice each, on Ubuntu 24.04, Alpine 3.24 (busybox `ps`/`awk`/`df`) and Rocky 9 (Python 3.9), each with only what the agents need installed (`linux-distros/*/Dockerfile`, base images pinned by digest); the same assertions | docker, python3 |
+| `hw_smoke_selftest.sh` | `hw_smoke.sh` (below) against the OpenWrt 24.10.8 image standing in for a router over ssh on 127.0.0.1: a fresh router, a broken agent, a router that runs the agent, not OpenWrt. `hw_smoke.sh root@HOST` itself is for a real router and is never run by CI | docker, ssh, ssh-keygen, python3 |
+
+All of them end through `e2e_cleanup.sh`. The Linux and OpenWrt containers run
+as root, so on a Linux host whose user is not root (CI's runner) what they
+leave in the work directory is root's; the same image hands it back before
+the directory is removed. The PowerShell container runs as the calling user.
+A cleanup problem is a warning: the exit code is the tests' result.
+`BK_E2E_KEEP=<dir>` makes `run_linux_e2e.sh` and `run_openwrt_e2e.sh` copy
+their `out/` (payloads, stderr, call logs) to `<dir>` before the work
+directory goes, whether the run passed or not.
+
+The stub outputs are what the real tools print (`wg show all dump`,
+`mwan3 status`, `tc -s qdisc`, ...); when a tool changes its format, update the
+stub and the assertion together.
+
+### The OpenWrt harness: a real router as the fixture
+
+The Wi-Fi, disk and WAN stubs serve what the owner's Turris Omnia really
+printed (`openwrt-stubs/omnia/`, its `README.md` names the origin of every
+file and what is synthesized). Identifiers are masked and must stay masked.
+Around the real router stand synthetic devices, one for each parser branch it
+cannot show: a sleeping USB disk, an unknown USB bridge, an NVMe with a
+critical warning, a disk without a drive database entry, a 6 GHz radio, an AP
+with nobody on it.
+
+- **Fake root.** `/sys` and `/proc` cannot be stubbed through `PATH`, so the
+  agent has a seam: with `--dry-run` AND `STATUS_TEST_ROOT=<dir>` the
+  collectors that name `BK_SYS` / `BK_PROC` read below `<dir>`.
+  `mkroot.sh DIR [emmc]` builds the tree; the `emmc` variant is a router with
+  eMMC and a disk whose `smartctl` ignores TERM.
+- **No jsonfilter.** The image has none and a stock router need not have one:
+  `smartctl` answers in its flat `--json=g` form and `ubus` output is read
+  line by line, both with awk or `read`. JSON parsing CI never runs is not
+  shipped.
+- **Stubs behave like the tool, including its refusals.** `iwinfo` takes one
+  command per call and answers a batched call the way the real CLI does
+  (stderr, exit 1, nothing on stdout); `hostapd_cli` prints nothing and exits 0
+  for an empty AP and exits 255 without a socket; `smartctl` prints decoy
+  identifiers unless `-q noserial` is given and exits 3 for a sleeping disk
+  only when asked with `-n standby,3`; `nslookup` refuses with no delay at all
+  under `BK_STUB_DNS=fail`, which is the point of the DNS check - three
+  milliseconds are not a latency. A wrong stub makes every parser check
+  built on it wrong too, so `openwrt-stubs/selftest.sh` runs BEFORE the first
+  agent run and pins those refusals and the fake root itself; its result is
+  `out/stub_selftest.txt` and one assertion requires every line to be `ok`.
+- **Runs.** `r1` (first run), 11 s pause and moved disk counters, `r2`
+  (deltas), `r2b`, `r3` (no netifd interface, no `hostapd_cli`, `smartctl`,
+  `iw`), `r4` (eMMC root), `r5` (a SMART lock held by a live process). The 11 s
+  are real: the agent believes a Wi-Fi survey delta only when that much wall
+  clock has passed, and the gate is not loosened for CI. Each radio's survey
+  says something different on purpose: `phy0-ap0` is the real capture and
+  measures 3.5 %, `wlan0` jumps by an impossible 60,000 ms and must stay
+  `warming_up`, `wlan7` was busy for 75 % of its life but only 10 % over the
+  last sample, so a reading of the absolute counters cannot pass as a delta,
+  and `phy3-ap0` answers nothing at all, which is `unsupported`. After `r5` the
+  private directory is removed and the call logs move to `out/core/`: checks
+  that count calls ("asked once, then cached") read `core/`, checks that say
+  "never" read both sets. Every later run (`w...`) starts on a clean private
+  directory; all of them are dry runs.
+- **The WAN walk gets one run per branch.** The Omnia has one uplink and can
+  show one shape of it at a time, so `BK_STUB_WAN` picks which line netifd
+  reports and `mkroot.sh` builds the matching netdev chain: `wpppoe` is the
+  owner's PPPoE over VLAN 848 over `eth2` (the rate is readable on the VLAN,
+  the port is the one below it), `wwalk1` the port itself, `wwalk2` a bridge
+  over ONE port, `wwalk3` a bridge over TWO (no single port: every port
+  counter must be null), `wwalk4` a lone ppp netdev that answers nothing, and
+  `wwalk5` a DSA user port whose carrier is down at `-1` above a conduit at
+  1000 - the number that must never be inherited. `eth2` carries the real byte
+  counters of the capture and four raised error counters, while the VLAN above
+  it drops 174 frames of its own, which is what a reading off the wrong netdev
+  looks like. The flap counter is pinned the same way: `eth2` has seen four
+  carrier losses and the DSA port seven, while every virtual netdev above them
+  stays at 0, so the step metric `wan_link_flaps` cannot quietly be fed from
+  the device that only carries the traffic.
+- **What the 11 s between `r1` and `r2` move.** Not only the disk counters:
+  the second `/proc/stat` sample (core 0 drowning in softirq, so the busiest
+  core is 98.2 % while the average of the same snapshot is 52.4 %), the busy
+  conntrack copy, the uptime from `1000.00` to `1011.00` - the rate is
+  measured against THAT, never against the clock - and 15.4 MB received plus
+  2.2 MB sent on the WAN device, which is the 11.2 / 1.6 Mbit/s the payload
+  has to show. `r2b` follows with nothing moved at all, and every one of those
+  values has to go back to null.
+- **conntrack in three files.** `proc/net/stat/nf_conntrack` is the real capture
+  of the owner's router, where columns 10-12 are all zero - a measured zero,
+  which is not the same as null. Its busy copy carries 3 / 1 / `0x12` over two
+  CPUs plus a non-zero `insert` and `icmp_error` beside them, so a column read
+  one to the side or a decimal reading of the hex (12 instead of 18) both
+  show. `r3` runs with the file moved away: null, never zero, and the
+  `wwalk` runs get a third file whose header names other counters in
+  another order (no `insert_failed` at all): its hex is not read at all,
+  because the header line is what says where the three columns are.
+- **What each disk pins.** `sda` is the owner's Kingston SSD and carries the
+  real SMART capture (67 C, 24,750 h, 227 unclean shutdowns, 420 GiB written
+  through attribute 241, wear 0 from 231, no attribute 198 - so that field must
+  come back `null`, not 0). `sdb` is a rotating USB disk that is asleep: in `r1`
+  nobody may touch it (`idle_skipped`), in `r2` its counters move and it is
+  probed, and `-n standby,3` gets exit 3 back. `sdc` hides behind a USB bridge
+  smartctl does not know (`unsupported`). `sdd` is the same SSD WITHOUT a drive
+  database entry, where 241 and 231 carry generic names that must not be
+  interpreted. `nvme0n1` reports a critical warning (`failing`). `sde`, in the
+  eMMC root only, ignores TERM, so the watchdog has to reach for KILL. The
+  mount of `sdb1` has a space, a `#` and quotes in it, because a mount point is
+  a name a person chose and it has to survive into valid JSON.
+- **Two SMART scenarios after the payload runs.** `wsmart` plants a two-hour-old
+  reading for `sdb` and disk counters that say it is working, so it really is
+  probed and really answers "standby": the previous values and their time must
+  survive. `wlock` plants a lock held by a live process and an empty cache, so
+  every disk is due - and not one `smartctl` may start.
+- **Speed test results and the ack.** `/srv/speed` (what the `uci` stub reports
+  as `librespeed.client.data_dir`) holds four result files: the Go client's
+  1850.23 Mbit/s with a `client` block, a public address and a `share` link
+  inside it; the owner's Rust port, whose `tls` block is the only evidence in
+  a file of which tool wrote it; a half-finished measurement with no `upload`;
+  and a failed run with no speed at all, which is not a result. The hard-coded
+  default `/tmp/librespeed-data` holds one file that only a run whose `uci`
+  cannot answer may ever send, and `/srv/speed60` holds sixty, of which fifty
+  leave per report. The addresses in the fixtures are from RFC 5737's
+  documentation ranges and are there on purpose: "the client block never
+  leaves the router" is only provable when there is something to leak.
+  `wack1..wack6` drive the hand-over through the response seam - a report that
+  never arrived, a bare 200, an ack naming the second of three items, an ack
+  for a timestamp that was never sent, and the one that finally commits.
+- **The path state.** `wpath1..wpath8` each start on an empty private
+  directory, because the answer is cached for an hour and a second run would
+  only read the cache back: the owner's line with `ethtool` present, a driver
+  whose MIB names neither ring counter, offloading configured off with no
+  flowtable and the uci label `0`, an image with no `nft`, `tc` or `ethtool`,
+  a router without `/etc/config/sqm`, one whose `ubus` answers nothing at
+  all, one whose two gigabit cables are out, and one (`BK_STUB_SQM=off`)
+  whose SQM queue names the WAN port itself and is switched off - the
+  `enabled` flag is what the other runs cannot pin, because there the stale
+  section sits on another device anyway. The cables-out run
+  (`BK_STUB_UBUS_DEV=lan1only`, the same capture with `lan0` and `lan4` left
+  without carrier and without a `speed` line) is what tells a capability from
+  a current state: the fastest LINKED port is then `lan1` at 100 while every
+  port still SUPPORTS 1000. On the capture as it was taken the two answers
+  agree, so a `lan_port_cap_mbit` read off `speed` would look right.
+  The payload runs prove the other half: six runs, one `uci` read of each
+  option and one `ubus` device dump between them. `tc` and `ethtool` are NOT
+  applets of this image, so removing the stub really removes the tool. The
+  payload runs keep `ethtool` out to pin the null path; the owner's router
+  has it (Turris OS ships the small ethtool, and its ring drops reach the
+  server).
+- **The port's MIB split and the SFP module (`wpath9..wpath12`, 0.1.13).**
+  The `ethtool` stub serves mvneta's names in the driver's order, each split
+  counter with its own number (overrun 2, discard 5, CRC 3, MAC receive 1,
+  refill 4, oversize a measured 0) next to the neighbours a parser could slip
+  onto (`bad_frames_received`, `jabber_received`, `skb_alloc_errors`), so
+  `wpath1` pins every one of them and a ring that is still 5 + 2. The fake
+  root carries the capture's `sfp` hwmon (49 C against the module's own
+  70 / 75 limits, no RX power: the owner's module is copper) and the PHY
+  inside it, `i2csfp11`, whose die temperature must never be sent. `wpath9`
+  is a driver with the two ring names only (`BK_STUB_ETHTOOL=partial`: the
+  other four null), `wpath10` an optical-like module (RX power 350 uW
+  against its own 50 / 20, `i2csfp11` moved away: the PHY flag is false,
+  which is "none seen", never "optical"), `wpath11` a router with neither
+  hwmon, and `wpath12` one with a second cage (`sfp1`), where nothing says
+  which module is the WAN's and every module value is null. The stub logs
+  its calls: one `-S` per hourly read, never a second one for the split.
+- **The gap runs `wfw1..3`, `wdns1`/`wdns3`, `wrun1..7`.** What "the firewall
+  is up" is read from: the `nft` stub serves three rulesets - fw4 (every other
+  run), `BK_STUB_NFT=foreign` (mwan3's table and nothing else) and
+  `BK_STUB_NFT=empty` (nft answers, the kernel is empty) - plus a run with no
+  `nft` at all, where the image also has no `iptables` applet. A
+  `/etc/init.d/firewall` stub answers `enabled` in ALL of them, on purpose: a
+  fall-back to it would be visible as a `true` where the rules are not loaded.
+  The agent lists the ruleset once, with `nft -t`, which leaves the elements
+  of named sets out; the fw4 ruleset carries a counted set that only the
+  plain listing prints, and `BK_STUB_NFT_NOTERSE=1` (on `wdns1`) is an nft
+  that refuses `-t`, so the agent must list again without it and still read
+  the same sums. Every call lands in `nft_calls.log`.
+  The DNS probe: the `nslookup` stub resolves by default and refuses instantly
+  with `BK_STUB_DNS=fail`, and `wdns3` removes the stub AND busybox's own
+  applet, because "no resolver client" cannot be built while `/bin/nslookup`
+  exists. The agent's own clock: `wrun1` meets a `run.lock` held by a live
+  process and writes no payload at all; `wrun2`/`wrun3`/`wrun4` go through the
+  response seam (`000`, then two 200s) and show the skip counters rise and
+  then clear; `wrun5` runs with `BK_STUB_UPTIME_BUMP=1`, where the `logread`
+  stub - the one command a full run makes exactly once, between the two uptime
+  reads - moves the fake router's uptime 4.20 s forward, so `agent_run_ms` is
+  exactly 4200; `wrun6` reads that same number back as `agent_prev_total_ms`
+  from the EXIT trap, and `wrun7` runs with no `proc/uptime` at all.
+- **Waits and writes (`wtake*`, `wskip*`, `wlp*`, `wdl*`, `wupd*`).**
+  `wtake1..5` plant a `run.lock` whose `info` names a real
+  process: a shell with a child 400 s old (both killed, the run reports
+  `runs_skipped_killed`), one 30 s old (left alone), a PID whose start time
+  is not the holder's (taken, nothing killed), a zombie (taken) and PID 1 of
+  the container standing in for a holder that survives SIGKILL (the lock
+  stays). `wtake6` hangs a real run in its first `df` (`BK_STUB_DF_HOLD` on
+  the `df` stub) and takes it over: the next report has no previous run's
+  numbers. `wtake7` hands a running run's lock to another PID: its EXIT trap
+  must leave it. `wtake8` reclaims a lock marked `killed` and counts it. A
+  child that survives SIGKILL (D state) cannot be made without a privileged
+  container, so that half of the takeover is not in this harness. `wskip1`
+  folds 25,000 queued skips while 200 more are appended and checks that
+  every line is counted exactly once; `wskip2` saturates the counters at
+  100,000. `wlp1..3` show the debug copy kept after a failed POST,
+  removed after an accepted one and kept by `last-payload.on`. `wdl0..2`
+  reach the POST 0, 40 and 50 s late (`BK_STUB_UPTIME_ADD` on the `logread`
+  stub) and read the POST limit and the skipped service checks from the log.
+  `wsc1` plants `proc/net/tcp`, `tcp6`, `udp` and `udp6` with one listening
+  socket each, plus port numbers that only stand as a TIME_WAIT's remote end,
+  a CLOSE_WAIT, an outgoing TCP session and a connected UDP socket: the
+  service checks and Service Discovery may count only the local end in LISTEN
+  (TCP) or bound without a peer (UDP).
+  Every payload run's `nslookup` call must come without `-timeout`: a
+  resolver that answers in 2-5 s is slow, not dead.
+  `wupd1/2` run the self-update swap, taken out of the agent by name, across
+  two filesystems while a poller watches the target, and with a full flash
+  (`BK_STUB_DF_AVAIL` on the `df` stub) and a `.new` left by an interrupted
+  swap.
+- **Cost and budget (`wbud0..6`, W1-7).** `wbud1` and `wbud2` are warm runs
+  under busybox `time`: their forks are the PID namespace's last-PID delta,
+  their CPU and largest process come from `wait4()`. `wbud2` must report
+  `wbud1`'s CPU as `agent_prev_cpu_ms` (within the tick rounding), and both
+  must stay within `FORK_BUDGET` and `MAX_RSS_KB`; the private directory
+  they leave is held to `PRIV_MAX_PAGES` (tmpfs pages), and `wbud6`, whose
+  shell's `RssAnon` is sampled every 20 ms, to `SHELL_ANON_KB`. The numbers
+  and their margins are explained in `assert_openwrt_payload.py`. `wbud3`
+  hangs on a `wg` that sleeps and is killed by SIGKILL, so `wbud4` must say
+  null; `wbud5` runs under another version's stamp and must
+  say null too. A change that saves forks lowers the budget in the same
+  commit: a budget more than `FORK_SLACK` (9) above the measured run fails
+  as well, so room cannot be bought by raising it.
+- **One check reads the agent's source**, not a payload: no awk `sub()` or
+  `gsub()` may carry a backslash in its replacement text. Busybox 1.37 reads
+  it differently from the 1.36 this harness runs, so an escaper built on it
+  passes every payload check here and breaks the JSON on a newer router.
+- **The log runs `wlog1..8` (W1-C3).** The payload runs read the plain
+  `logread` stub (two error lines, a fixed date). `BK_STUB_LOG=pii` and
+  `BK_STUB_LOG=formats` serve a log written relative to the stub's own clock,
+  which it notes in `logread_now.log`, so every `ts` and the window are
+  checked to the second. `pii` plants every identifier the masks exist for -
+  made-up MACs and names, addresses from the documentation ranges, a DUID, an
+  e-mail, a UTF-8 letter and a lone 0xff byte, and a pair of lines whose
+  address sits across the 200-character cut - and the checks require that
+  none of them is in ANY report or in the kept last payload, while the lines
+  arrive with their tags. The selftest pins that the fixture really serves
+  them raw. `formats` has every date layout (logd, ISO 8601 with `Z` and
+  with `+02:00`, BSD without a year, a line with no date) and runs in CEST,
+  so a zone-less time read without the router's offset would be two hours
+  off. `wlog3` sets `LOG_LINES_ENABLED=0`; `wlog4..7` walk the server's
+  switch through the response seam (`false`, a fresh private directory and
+  an answer without the key, `"log_lines": true`, back on); `wlog8` has no
+  log at all.
+- **The LTE modem (`wlte*`, `whl*`, `wlogin*`, `wnoplmn*`, `wcut*`,
+  `wdead`).** The `wget` stub is the HiLink modem, and
+  `BK_STUB_HILINK_MODE` picks which one: `canonical` answers every GET;
+  `token` refuses a GET without the session `/api/webserver/SesTokInfo`
+  hands out (125002) and one it never handed out (125003); `login` refuses
+  everything with 100003; `noplmn` refuses only `current-plmn`; `cut` breaks
+  off status, pin and operator before `</response>`; `dead` answers nothing.
+  Each run files its modem calls between `# TAG` and `# end` in
+  `hilink_calls.log`, a call that carried the session with `tok ` in front.
+  `wlte1` sets `LTE_API=off` (not one call, the link still reported),
+  `wlte2` a junk value (auto). `whl1..5` keep, expire (241 s), replace
+  (125003) and drop (another LTE device) the session; `wlogin1..2` ask for
+  one session a run and cache nothing; `wnoplmn1..2` do not cache an error
+  as the operator, `wcut1..2` no answer cut short. No file the runs leave
+  may hold the stub's session or token.
+- **Syslog (`bin/logger`).** Every call lands in `logger.log` as
+  `TAG: MESSAGE`, filed by `# TAG` lines like the modem calls. `wst1..3`
+  (the modem answers, goes silent, answers again) are exactly two lines and
+  leave `hilink.state` at none, `silent`, `ok`; `wlogin1` names the error
+  code once and `wlogin2` repeats nothing; `r4` holds the SMART watchdog's
+  TERM and KILL lines for `sde`, `wtake1` the takeover and `wtake5` the
+  holder that survives SIGKILL (PID 1, `comm sh`). A `smartctl` that
+  survives KILL, and so the line that leaves it the SMART lock, cannot be
+  made in a container. `BK_STUB_LOGGER=hang` is a syslog that takes nothing:
+  the call files `PID TAG: MESSAGE` in `logger_hung.log` and never returns.
+  `wtake9` is `wtake1` with it: the holder and its child are killed, the run
+  has the lock within 15 s (timed by its first `df`) and reports, the agent
+  log says the line did not reach syslog, and the logger is not left
+  running.
+- **Pending checks.** `assert_openwrt_payload.py` may list checks in `PENDING`
+  while the collector that satisfies them is not merged yet. A pending check
+  that passes fails the run, and `BK_E2E_STRICT=1` fails every pending check;
+  a release needs the list empty.
+
+### Hardening runs
+
+After the payload runs the OpenWrt harness goes on with the hardening runs
+(`openwrt-stubs/runs-g28.sh`): a planted identity cache must run nothing, the
+kept last payload must be 0600 and carry no key, and remote actions must be
+allow-listed, single-use and path-safe. Remote actions come from the server's
+answer, and a dry run stops before the POST, so the agent has one test seam:
+with `--dry-run` AND `STATUS_TEST_RESPONSE=<file>` (line 1 = HTTP code, the
+rest = body) it prints the payload and then runs its normal after-the-answer
+path on that file. Nothing is ever POSTed: action results go to
+`<file>.results`. The `openssl` stub answers the HMAC with the digest the
+harness chose (`BK_STUB_HMAC`) and logs what it was asked to sign; the action
+targets (`/sbin/ifdown`, `/sbin/reboot`, `/etc/init.d/dnsmasq`, ...) are
+copies of `openwrt-stubs/action-target.sh` that only log the call. Without
+`--dry-run` the variable is ignored; one assertion greps the agent for that.
+
+### The PowerShell harness
+
+`run_windows_e2e.sh` builds a PowerShell 7 image with PSScriptAnalyzer
+(`windows/Dockerfile`; Ubuntu on x86_64, Azure Linux on arm64, where the
+Ubuntu image does not exist) and runs `windows/agent_ps1_tests.ps1` against a
+copy of `agent.ps1`. There is no seam in the agent: every run goes over real
+HTTP to `windows/mock_api.ps1` on 127.0.0.1, which answers reports with
+`response.txt` (line 1 = HTTP code, the rest = body), answers action results
+with `{}`, serves update files from `files/`, and logs every POST body and
+every download, so a test sees what the agent sent and whether it fetched
+anything at all. Each case runs in its own sandbox directory with its own
+`agent.cfg`.
+
+- **Remote actions.** `action_id` / `timestamp` that are not plain digits (a
+  command substitution, hex, an exponent, a trailing newline, letters, a minus)
+  get no answer and run nothing, and the run completes; bad service names
+  (`*`, a space, `-rf`, `..`, a newline) are refused, good ones (`MSSQL$SQLEXPRESS`,
+  `getty@tty1`) are restarted; the same signed answer twice restarts the
+  service once; a nonce store that cannot be written, a missing nonce, a bad
+  signature (no nonce burnt), an expired timestamp and an action off the list
+  are each refused. Linux pwsh has no `Get-Service`, so
+  `windows/stubs/BkWindowsStubs` stands in for `Get-Service` and
+  `Restart-Service` through module auto-loading and logs every restart:
+  that log is how "executed once" is counted. `reboot_server` is never
+  allowed in a test - `Restart-Computer` exists on Linux pwsh.
+- **Self-update.** Update files are made from the agent under test with
+  another version. Refused, each with the script byte-identical and no
+  `.prev`, marker or download left: a sha mismatch (retried next run), no end
+  line (not fetched again), a file cut in half that still parses, an end line
+  of another version, a self-check that throws, prints more than one object,
+  reports another version or hangs (killed at 60 s), exits but leaves a
+  process holding its stdout (refused after 5 s, not waited for), a file without
+  `-SelfCheck` (today's release), and an offered version that is older, equal
+  or not a version (never downloaded). Applied: the good file with LF and
+  with CRLF line ends, the old one kept as `.prev`, the marker written; the
+  first accepted report ends the probation. Rolled back: after three 4xx
+  answers, and at run 31 without an accepted report; the same sha is then
+  not taken again, not even two days later, a fixed file of the same version
+  is. A hung self-check is remembered like any refusal, and the list itself
+  (the last 8, newest last, a damaged line) is unit-tested.
+- **Not covered here:** Windows PowerShell 5.1 at run time (the CI job
+  `windows-ps51` runs `-SelfCheck` and `-DryRun` under it, nothing more), the
+  CIM/WMI metrics (null on Linux), NTFS ACLs of `C:\bloodkings` and what
+  `ReplaceFile` does on NTFS (.NET maps `File.Replace` to a rename on Linux),
+  and the free-space refusal (no way to fill a volume from the test).
+
+### The real images
+
+The stub harness proves the parsers against what the tools print; it cannot
+show that the tools are there, answer the way the stubs say, and that nothing
+leaks to stderr on a stock system. `run_openwrt_real.sh` runs the agent in the
+official OpenWrt root file systems, x86_64, so GitHub's runner runs them
+natively (an arm64 host emulates them: `--platform linux/amd64` is always
+passed, because the 24.10.8 image has no other platform).
+
+- **Images.** `openwrt/rootfs:x86-64-24.10.8`, pinned by digest, and
+  `openwrt/rootfs:x86-64-master`, floating on purpose: OpenWrt work is tested on
+  master, and a red run there is news. The run prints the snapshot
+  (`DISTRIB_REVISION` and the image digest); when upstream breaks, pin a
+  last-good digest with `BK_OWRT_MASTER_IMAGE` in the workflow, never
+  `continue-on-error`. A local run uses the master image docker already has;
+  `docker pull --platform linux/amd64 openwrt/rootfs:x86-64-master` refreshes
+  it.
+- **Boot (`openwrt-real/boot.sh`).** The image is a router without its boot:
+  the directories `/etc/init.d/boot` makes, then `ubusd`, `procd` (not PID 1,
+  but it serves `system` and `service`), `logd`, `netifd` with a static WAN on
+  the container's own `eth0` (address, gateway and resolver as docker gave
+  them) and an empty `br-lan` on `10.231.0.1/24`, `fw4` (needs
+  `--cap-add NET_ADMIN`, which reaches only the container's namespace) and
+  `dnsmasq`. `ujail` is moved aside: procd cannot clone namespaces in an
+  unprivileged container and dnsmasq never starts jailed. One ping to the
+  gateway is the traffic a router has had by then: without it the agent's
+  IPv4/IPv6 rates have no state to start from. Nothing is installed; the
+  stock userland is the point. `VER_env.txt` keeps the release, the board,
+  `ubus list`, the nft tables and which services did not come up; one that
+  did not (`VER_boot_fail.txt`) fails the run.
+- **Runs.** `r1`, 5 s, `r2`, both a plain `--dry-run` with no `STATUS_TEST_*`
+  seam, as the owner would type it.
+- **What stays null, honestly.** No radio (`wifi_*`), no modem (`lte_*`),
+  no `smartctl`, `iw`, `hostapd_cli`, `ethtool`, `tc`, `wg`, `mwan3` or SQM
+  package, an empty bridge (`lan_ports`), `eth0` is a veth with no port below
+  it (`wan_link_dev`, the WAN error counters), no `/tmp/sysinfo` (`model`,
+  `board_name`), a busybox `df` without `-i` (`inode_usage`), and 24.10 has
+  no downloaded package lists (`upgradable_packages`). Each is a `NULL_OK`
+  entry with its reason (below); every other key must be measured.
+
+`assert_real_payload.py PROFILE DIR` checks every run and prints one line per
+check:
+
+- exit 0; stdout is exactly one JSON object with no key twice (a heredoc key
+  written twice is valid JSON, and PHP keeps only the last value); the right
+  `agent_type` and the `AGENT_VERSION` of the source; no value is the string
+  `"null"`.
+- **stderr** holds only the agent's own log lines
+  (`YYYY-MM-DD HH:MM:SS - ...`) and none of them carries an error marker
+  (`CHYBA`, `VAROV`, `Traceback`, `not found`, `cannot`, `failed`, ...): raw
+  tool stderr that leaked past a missing `2>/dev/null` fails the run. An
+  exception goes into `real/stderr_allow.txt` as `<scope> <regex>  # why`
+  (scope: a profile or a glob such as `openwrt-*`); an entry that matches no
+  line fails as stale. The list is empty.
+- **`r1`** has no delta yet: `cpu` and `net` are null.
+- **`r2`** measures the CORE set: the numbers (`cpu`, `cpu_cores`, `ram`,
+  `hdd`, `load1`, `uptime`, `boot_time`, `agent_time`, `agent_run_ms`, ...),
+  `os`, `hostname`, `kernel`, `installed_packages` > 0, `interfaces` and
+  `filesystems`, the package manager (`opkg` on 24.10, `apk` on master), and
+  what `boot.sh` set up: WAN up, `static`, on `eth0`, `lan_subnet`
+  `10.231.0.1/24`, the firewall on with a counted `fw_accepted`, `dns_engine`
+  `Dnsmasq`, log lines `on`. `wan_internet` and `dns_resolver_ok` depend on
+  the runner's network (ICMP is often blocked there) and are checked as
+  true, false or null only.
+- **Every other key of `r2`** must be measured too: not null, `[]`, `{}` or
+  `""`. The exceptions are two lists in `assert_real_payload.py`, each entry
+  a scope (`openwrt-24.10`, `openwrt-master`, `ubuntu/sh`, ...), a key glob
+  and the reason. `NULL_OK` is what the image or `boot.sh` does not give the
+  agent: such a key that gets measured fails as stale, and so does an entry
+  that names no key any more. `VARIES` is what depends on the runner (its
+  network, disks, thermal zones, DMI) or on timing: `wan_latency_ms`,
+  `dns_latency_ms`, `disk_devices`, `temperature`, `top_io_processes`, the
+  log counts, master's `upgradable_packages`. Either way passes, and
+  `golden.py` still checks the type. A collector that goes null or empty
+  fails here; each run prints what the two lists excused.
+- **`/proc/net/stat/nf_conntrack`**, the only source of
+  `conntrack_insert_failed`, `conntrack_drop` and `conntrack_early_drop`, is
+  the kernel's, not the image's: it needs `CONFIG_NF_CONNTRACK_PROCFS` and
+  `nf_conntrack` loaded. OpenWrt's kernels and Docker Desktop's have it,
+  GitHub's runner kernel does not. `run-in-container.sh` asks the container
+  and prints the answer (`VER_nf_stat.txt`; no answer fails). Present: the
+  three are measured like every other key, and any stderr line naming the
+  file fails. Absent: they must be null in both runs - a number would be
+  invented. Known gap: agent 0.1.12 opens the file before its `2>/dev/null`
+  applies and prints `agent_openwrt.sh: line 1922: can't open
+  /proc/net/stat/nf_conntrack: no such file`; that line passes only when the
+  file is absent and the payload is 0.1.12; 0.1.12.1 swapped the order, and
+  no later version may print it.
+  `assert_real_payload.py selftest` (in `lint`) walks both paths.
+- Values that vary between runs are checked by type only.
+
+`run_linux_distros.sh` does the same for the Linux agents on Ubuntu 24.04,
+Alpine 3.24 and Rocky 9 (Debian is `run_linux_e2e.sh`'s): `sh1`, 3 s, `sh2`,
+then `py1`, `py2`. Each image gets only what a stock server of that
+distribution has and the agents need - no `procps` on Alpine on purpose, busybox
+`ps`, `awk` and `df` are what it is there for. CORE for `sh2`/`py2`: `os`,
+`hostname`, `kernel`, the numbers (`cpu`, `ram`, `hdd`, `load1`, `uptime`,
+`boot_time`, `net`, `fork_rate`, `zombie_count`), `processes`, and for
+`agent.sh` `filesystems`; every other key must be measured, as in the OpenWrt
+images. `NULL_OK` there: no TeamSpeak, tailscale, zerotier or UPS, nothing
+listening and no service running in the container, no `systemd-detect-virt`,
+`reboot_required` off Debian, Alpine's `timezone`, and no `nslookup` on
+Ubuntu and Rocky (`agent.sh`'s `dns_latency_ms`). `VARIES`: `temperature`,
+`cloud_provider` (the runner's DMI: Azure on GitHub), the resolver's
+latency, and `agent.py`'s `top_cpu_processes` (what used CPU in its sample).
+
+A CORE key one scope does not measure is a gap: a `NULL_OK` entry on a CORE
+key, stale when the CORE check passes. There is one:
+
+- **Alpine, `agent.sh`: `processes` and the top lists are `[]`, `zombie_count`
+  null.** Busybox `ps` has no `-o %cpu`, so
+  `ps -eo pid=,ppid=,stat=,%cpu=,rss=,comm=` fails and the agent sends empty
+  lists. `[]` is not an honest "unknown": on an Alpine host with monitored
+  processes the server would report every one of them as not running. It
+  should be null or be read from `/proc`; that is an open finding for the
+  agent, not something this harness hides.
+
+### A real router: `hw_smoke.sh`
+
+CI has containers; the owner has routers. `tests/hw_smoke.sh root@HOST`
+checks the agent of this checkout on one of them without installing
+anything, and says what it measured there:
+
+```
+tests/hw_smoke.sh [-p PORT] [-i KEY] [-o SSH_OPTION]... [--agent FILE]
+                  [--interval SECONDS] [--coexist] [--keep DIR] root@HOST
+```
+
+1. **Preflight** over ssh (`BatchMode`, 5 s connect timeout, keep-alives):
+   `/etc/openwrt_release`, `ubus`, `jshn.sh`, 1 MB free in `/tmp`. Not
+   OpenWrt is exit 3. It also asks whether the router has
+   `/proc/net/stat/nf_conntrack` and prints the answer (a router without
+   `kmod-nf-conntrack` has none); the rules are the real images'.
+2. **What is there already:** every agent path (`/tmp/status-agent-*`,
+   `/var/run/status-agent-openwrt`) with its checksum, and the crontab lines
+   naming the agent. Anything there without `--coexist` is exit 3: a dry run
+   shares that state.
+3. **Upload** to `mktemp -d /tmp/bk-hwsmoke.XXXXXX` with `ssh 'cat > ...'` -
+   the OpenWrt root file system has no `sftp-server` and today's `scp` speaks
+   SFTP - and the checksum compared on both sides (`sha256sum`, or `md5sum`
+   where busybox has no other).
+4. **Run** `--dry-run` twice, `--interval` seconds apart (11 by default, 0 =
+   once), each under a 120 s watchdog on the router (busybox 24.10 and macOS
+   have no `timeout`), and every ssh call under one on this host. The agent's
+   stderr is a file on the router, fetched on its own: ssh's own warnings
+   never reach the stderr check.
+5. **Clean up before validating:** the work directory and every agent path
+   the runs created are removed, and the router is listed again - anything
+   that differs from step 2 is exit 4. No `opkg`/`apk`, no cron edit, nothing
+   outside `/tmp`.
+6. **Validate** on this host: `assert_real_payload.py hw` (the per-run checks
+   of the real images and the CORE set of a router: numbers, identity
+   including `model` and `board_name`, packages, interfaces, filesystems -
+   types, not the container's values; not the every-key rule, since a router
+   measures what it has) and `golden.py check openwrt`.
+7. **Summary:** release and model, agent version, run times and exit codes,
+   keys measured and null, the keys the router measures that no CI run pins
+   (golden null), stderr lines, CPU/RAM/disk, WAN, radios, disks, package
+   manager, the clean-up, `PASS`.
+
+Exit: 0 passed, 1 validation failed, 2 usage or ssh error, 3 refused, 4
+clean-up not verified. The host side runs under macOS's `/bin/bash` 3.2 and
+the host's `python3` (3.9 on macOS).
+
+**`--coexist`, a router that runs the agent.** A dry run writes what the
+installed agent reads: the rate state, the CPU cost of the last cron run
+(`run.cpu`/`run.total`), the caches and `last-payload.json` in its private
+directory, the version stamp (another version wipes every cache, SMART
+included) and the run lock. With `--coexist` the installed agent (the file its
+crontab line names) must be the tested version, or it is exit 3; the run is
+one (its deltas come from the installed agent's state) with
+`STATUS_TEST_TTY=1`, so the cron run's cost stays; it starts between seconds 5
+and 35 of a minute with no run lock held; `last-payload.json` is put back;
+and only the paths it created are removed. The crontab, the version stamp,
+`run.cpu`/`run.total` and `last-payload.json` must be as they were, and no
+path may be more or less (exit 4 otherwise). What stays: the rate and cache
+files the dry run refreshed, so the installed agent's next report measures
+its rates over a shorter window.
+
+`hw_smoke_selftest.sh` runs it against the 24.10.8 image standing in for a
+router (`openwrt-real/router.sh`: `boot.sh`, one fw4 rule that lets ssh in on
+its WAN, the model and board name a router's preinit writes to `/tmp/sysinfo`,
+dropbear with a throwaway key, ssh published on 127.0.0.1 only): a fresh
+router (exit 0, nothing left), an agent that prints `sh: foo: not found` and
+one with a JSON typo (exit 1, cleaned up anyway), a router running the agent
+(exit 3 and untouched without `--coexist`, exit 0 with it, a different
+installed version exit 3) and one without `/etc/openwrt_release` (exit 3). It
+never touches a real router. It runs `hw_smoke.sh` under `/bin/bash`, which on
+macOS holds it to bash 3.2.
+
+### Golden payloads
+
+`golden/openwrt.json`, `golden/linux-bash.json` and `golden/linux-python.json`
+pin the shape of what each agent prints: one plain payload each, as the agent
+prints it, with identifiers masked (`agent_key` empty, `hostname`
+`golden-openwrt`/`golden-linux`, `kernel` `6.6.0`, WAN addresses from
+192.0.2.0/24, fixed epoch times). The monitoring repo POSTs them to its real
+API as they are, so a key the server would drop, or a value it would refuse,
+shows there as well. `golden.py` does the work:
+
+- **`check`**: every payload run of a harness against its agent's golden
+  file. The top-level keys must be exactly the golden's: a new key or a
+  missing one fails, and the message names the update command. Types are
+  JSON types (an int and a float are both a number). **Only null means null**:
+  null passes wherever a value is pinned (an unmeasured value is null), and a
+  golden null pins no type - such keys are listed as unpinned, not failed.
+  `[]`, `{}` and `""` are values like any other. An object outside an array
+  keeps the golden object's keys unless it is a dynamic map (`MAPS` in
+  `golden.py`: `service_restarts`, whose keys are service names); an array item
+  is compared with all golden items at that path merged (a SATA and an NVMe
+  disk carry different SMART keys).
+- **Which files.** Each harness lists its payloads in `out/payload_runs.txt`
+  (`AGENT TAG`, or `AGENT -TAG` for a run that must print nothing: a lock held,
+  a rollback). The stub harness writes it with `pl TAG` before each run. There
+  is no glob: `out/` holds kept copies and planted files too, and a listed
+  payload that does not parse fails.
+- It runs at the end of `run_openwrt_e2e.sh`, `run_linux_e2e.sh`,
+  `run_openwrt_real.sh` and `run_linux_distros.sh`, and in `hw_smoke.sh`;
+  `golden.py selftest` (the rules on their own samples) runs in `lint`.
+
+The shape check and the real-image checks catch different things: a
+collector that silently goes null passes the shape (null is allowed) and fails
+the real images, where every key must be measured unless `NULL_OK` or
+`VARIES` names it; a value that changes type or a key that disappears fails
+the shape.
+
+**When an agent change adds, removes or retypes a key**, renew the golden
+files and commit their diff with the agent change:
+
+```
+bash tests/update_golden.sh openwrt     # the stub harness, then the real images (~12 min)
+bash tests/update_golden.sh linux       # Debian, then the three distros (~6 min)
+bash tests/update_golden.sh linux --accept KEY    # KEY retyped or dropped on purpose
+python3 tests/golden.py update openwrt DIR...   # from passed runs already kept (BK_E2E_KEEP)
+```
+
+The harnesses must still pass everything else (`BK_GOLDEN_CHECK=0` skips only
+the golden check). Each writes `out/.passed` once its own checks passed -
+before the golden check, since a new key fails that one and is the very run to
+renew from - and `BK_E2E_KEEP` drops an older `.passed` before it copies.
+`update` refuses a kept directory without it, and a payload file unless
+`--unverified`. `update` takes the sources in the order given, and a
+harness's list in its own order (second runs first): all of them must print
+the same keys, or it stops and names the difference. A golden value still
+compatible with every source is kept, so the file does not churn; a golden
+null takes the first measured value, `version` follows the agent, a new or
+retyped key takes the first non-null value, arrays take items from later
+sources that add item keys (up to 6), and a key no longer printed goes. It
+prints `added / changed / retyped / dropped / unpinned` for the review
+(`changed` is `version` and golden nulls or arrays that got a value). A
+retyped or dropped key is refused, and the golden file left alone, unless
+`--accept KEY` names it: `--accept` says the agent change intends it, and the
+golden diff goes into that same commit. It never writes a public address into
+the repo.
+
+### CI
+
+`.github/workflows/test.yml` runs on pull requests, on pushes to branches
+other than `main`, and on `main` as the first job of `deploy-worker.yml`
+(`needs: test`), so the Worker is not deployed from a red run. The agents are
+published by the monitoring repo from its submodule gitlink, and a release is
+a commit on `main` that passed this workflow. Four jobs:
+
+- `lint`: `bash -n agent.sh`, `dash -n agent_openwrt.sh`, `py_compile
+  agent.py`, PowerShell's parser on `agent.ps1`; `golden.py selftest`; ShellCheck 0.11.0 (pinned
+  image) at warning level on exactly the two shell agents, both clean today
+  (fewer files found fails the step instead of passing on nothing); every
+  agent's last line equals `# bk-agent-end <AGENT_VERSION>`;
+  `agent.ps1` still starts with a UTF-8 BOM; `node --test tests/*.test.mjs`;
+  `assert_real_payload.py selftest`.
+- `e2e`: the three harnesses above, one after another in one job - the
+  account's 20 concurrent jobs are shared with the OpenWrt builds.
+- `real`: `run_openwrt_real.sh all`, `hw_smoke_selftest.sh` and
+  `run_linux_distros.sh all` (the real images above), beside `e2e`, so the
+  workflow takes no longer.
+- `windows-ps51`: `agent.ps1 -SelfCheck` and `-DryRun` on `windows-latest`
+  under Windows PowerShell 5.1, the engine the scheduled task runs.
+
+On `main` it runs once per push, from `deploy-worker.yml`.
+
+The TeamSpeak stub earns its keep: that query had never been run by any test.
+The first run of it showed the bash agent asking over bash's socket redirection
+(a hosting malware scanner quarantined the whole file for that shape) and the
+Python agent assuming the server's greeting arrives in exactly two packets.

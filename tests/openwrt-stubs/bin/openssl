@@ -1,0 +1,13 @@
+#!/bin/sh
+# busybox:1.36 has no openssl, a router with remote actions does. Answers
+# `dgst -sha256 -hmac KEY` in openssl's own format with the digest the harness
+# chose (BK_STUB_HMAC), and logs the string it was given to sign, so the test
+# can tell WHAT the agent signed. The key (argv) is deliberately not logged.
+case "$1 $2 $3" in
+  "dgst -sha256 -hmac")
+    cat >> /work/out/openssl_calls.log
+    echo >> /work/out/openssl_calls.log
+    echo "SHA2-256(stdin)= ${BK_STUB_HMAC:-0}"
+    ;;
+  *) exit 1 ;;
+esac

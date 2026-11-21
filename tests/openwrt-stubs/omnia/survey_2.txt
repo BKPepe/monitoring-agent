@@ -1,0 +1,18 @@
+Survey data from phy0-ap0
+	frequency:			2437 MHz [in use]
+	noise:				-40 dBm
+	channel active time:		1012000 ms
+	channel busy time:		1001900 ms
+	channel receive time:		505000 ms
+	channel BSS receive time:	404000 ms
+	channel transmit time:		496900 ms
+Survey data from phy0-ap0
+	frequency:			5180 MHz [in use]
+	noise:				-92 dBm
+	channel active time:		35041953 ms
+	channel busy time:		1224796 ms
+	channel receive time:		578573 ms
+	channel BSS receive time:	199224 ms
+	channel transmit time:		605510 ms
+Survey data from phy0-ap0
+	frequency:			5200 MHz

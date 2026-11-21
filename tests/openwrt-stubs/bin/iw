@@ -1,0 +1,34 @@
+#!/bin/sh
+# iw dev <if> survey dump. The counters are cumulative, so busy % needs two
+# samples: the first call per interface serves sample 1, every later call
+# sample 2 (BK_STUB_SURVEY=1|2 picks one outright).
+#   phy0-ap0: the real in-use block of the Omnia; sample 2 is +12,000 ms of
+#             active time with the real ratios (busy 3.5 %, foreign 1.2 %).
+#             A decoy [in use] block on 2437 MHz with absurd counters comes
+#             first: the block must be chosen by the radio's own frequency.
+#   wlan0:    sample 2 is +60,000 ms within the harness's 11 s - impossible,
+#             so it must stay "warming_up" rather than become a percentage.
+#   wlan7:    a radio that has been up for ages on a channel that WAS busy:
+#             75 % of its lifetime active time is busy, but the last 12,000 ms
+#             only 10 % (and 5 % foreign). A reading taken from the absolute
+#             counters would report 74 % / 12.4 % - the two are far apart on
+#             purpose, because on phy0-ap0 the real ratios agree to one
+#             decimal and cannot tell the two parsers apart.
+#   phy3-ap0 and the rest: NOTHING, exit 0. That is the real answer of the
+#             owner's USB adapter: its driver has no survey data at all.
+D=/work/stubs/omnia
+echo "$*" >> /work/out/iw_calls.log
+[ "$1" = "dev" ] && [ "$3 $4" = "survey dump" ] || exit 1
+case "$2" in
+    phy0-ap0) _f=survey ;;
+    wlan0) _f=survey_wlan0 ;;
+    wlan7) _f=survey_wlan7 ;;
+    wlan1|wlan6|phy3-ap0) exit 0 ;;
+    *) echo "command failed: No such device (-19)" >&2; exit 237 ;;
+esac
+_n="$BK_STUB_SURVEY"
+if [ -z "$_n" ]; then
+    _c="/tmp/bk-stub-iw.$2.count"
+    if [ -f "$_c" ]; then _n=2; else _n=1; : > "$_c"; fi
+fi
+cat "$D/${_f}_$_n.txt"

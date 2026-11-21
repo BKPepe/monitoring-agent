@@ -1,0 +1,23 @@
+#!/bin/sh
+# logger, as the agent calls busybox's applet: `logger -t TAG MESSAGE`. What
+# would go to syslog lands in /work/out/logger.log as "TAG: MESSAGE", one
+# line per call, so a test can count the lines an event writes.
+# BK_STUB_LOGGER=hang is a syslog that takes nothing (logd stopped, syslog-ng
+# on a disk that hangs: the real logger blocks in its send() to /dev/log).
+# The call is filed in logger_hung.log as "PID TAG: MESSAGE" and never
+# returns - the PID becomes a sleep that only a signal ends.
+tag=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t) tag=$2; shift 2 ;;
+        -p) shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+if [ "$BK_STUB_LOGGER" = hang ]; then
+    echo "$$ ${tag:-root}: $*" >> /work/out/logger_hung.log
+    exec sleep 86400
+fi
+echo "${tag:-root}: $*" >> /work/out/logger.log

@@ -1,0 +1,25 @@
+#!/bin/sh
+# nslookup stub for the DNS probe of G41.
+#
+#   (default)            the local resolver answers; exit 0
+#   BK_STUB_DNS=fail     the resolver refuses in no time at all; exit 1
+#
+# Without it the probe would ask 127.0.0.1 in a container that has no
+# resolver at all: a failure the harness cannot aim, and never a success.
+# The address below is from the documentation range of RFC 5737 - nothing in
+# this repository points at a real host.
+echo "$*" >> /work/out/nslookup_calls.log 2>/dev/null
+if [ "$BK_STUB_DNS" = fail ]; then
+    # A refusal is instant, which is the whole point of e2e 15: three
+    # milliseconds of wall clock are not a latency.
+    echo "nslookup: write to '127.0.0.1': Connection refused" >&2
+    exit 1
+fi
+cat <<'M'
+Server:		127.0.0.1
+Address:	127.0.0.1:53
+
+Name:	example.com
+Address: 203.0.113.10
+M
+exit 0

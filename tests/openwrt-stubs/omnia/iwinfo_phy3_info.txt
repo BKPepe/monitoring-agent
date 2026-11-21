@@ -1,0 +1,14 @@
+phy3-ap0  ESSID: "Domov"
+          Access Point: 02:00:00:00:00:30
+          Mode: Master  Channel: 5 (2.432 GHz)  HT Mode: HT20
+          Center Channel 1: 5 2: unknown
+          Tx-Power: 20 dBm  Link Quality: 48/70
+          Signal: -62 dBm  Noise: unknown
+          Bit Rate: 70.9 MBit/s
+          Encryption: mixed WPA2/WPA3 PSK/SAE (CCMP)
+          Type: nl80211  HW Mode(s): 802.11ac/b/g/n
+          Hardware: USB 2357:011F [Generic MAC80211]
+          TX power offset: unknown
+          Frequency offset: unknown
+          Supports VAPs: no  PHY name: phy3
+          MLO Capabilities: 0
